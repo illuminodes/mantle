@@ -1,6 +1,6 @@
 # Validation Architecture
 
-Status: **partially implemented.** Stages 1, 2 and 3 exist in `crates/consensus/src/validation/`, and Stage 3 runs full script verification. Stage 3 is missing several consensus rules; see §"Known gaps" before relying on it. Subject to revision as implementation continues.
+Status: **implemented, not yet cross-checked against Core.** Stages 1, 2 and 3 exist in `crates/consensus/src/validation/`, including script verification, the witness commitment, lock-time finality, BIP68 sequence locks and BIP141 sigop cost. Remaining gaps are listed in §"Known gaps". Subject to revision as implementation continues.
 
 This document covers the consensus-validation subsystem: how blocks and transactions are validated, how the validator interacts with the storage layer via `ChainView`, the script-verification strategy, and the cryptographic concerns specific to using `k256` instead of `libsecp256k1`. It does *not* cover mempool *policy* (relay rules, fee filters) — those are a separate layer above consensus.
 
@@ -62,7 +62,7 @@ Checks the block is well-formed in isolation:
 - Merkle root in the header matches the computed root of the transaction list.
 - Header proof-of-work satisfies the *claimed* `nBits` (whether `nBits` is *correct* requires context; that's stage 2).
 
-**Not implemented:** the BIP141 witness commitment check, and the matching rejection of witness data in blocks without a commitment. `Transaction` now carries witness data, so nothing blocks this.
+The BIP141 witness commitment, and the rejection of witness data in blocks without one, are enforced in Stage 2 (`validation/witness_commitment.rs`) because they need the block height.
 
 These checks need no chain state. They run on raw bytes. They are the first line of defense against malformed/garbage blocks from peers.
 
@@ -88,7 +88,7 @@ This stage does not touch the UTXO set. It runs against the header chain only, s
 
 ### Stage 3: Connect (needs UTXO set)
 
-**Status: partially implemented** — `validation::connect_block` in `crates/consensus/src/validation/connect.rs`. Implemented: input existence, coinbase maturity, BIP30 (vout-0 probe only), legacy sigop count, script verification per input, fee math, coinbase reward. Missing: see §"Known gaps". Undo data is not produced.
+**Status: implemented** — `validation::connect_block` in `crates/consensus/src/validation/connect.rs`. Checks input existence (including same-block spends in block order and rejection of in-block double spends), coinbase maturity, BIP30 (vout-0 probe), BIP141 sigop cost (`sigop_cost.rs`), BIP68 sequence locks (`sequence_locks.rs`), script verification per input, fee math and coinbase reward. Lock-time finality (`IsFinalTx`) runs in Stage 2 (`tx_finality.rs`). Undo data is not produced.
 
 Inputs: the block + chain index + the live UTXO set at the parent block.
 
@@ -350,13 +350,10 @@ Things this document does *not* commit to:
 
 ## Known gaps
 
-Consensus rules Core enforces that `connect_block` / Stage 1 do not yet check. Each is a way for Mantle to accept a block Core rejects.
+Rules that differ from Core or are unverified. None of the block-level rules has been compared against Core on real chain data yet; see `conformance.md` §"Current coverage".
 
-- **Witness commitment** (BIP141): coinbase commitment to the witness merkle root; blocks with witness data and no commitment.
-- **Sigop cost** (BIP141): only legacy sigops are counted, against 20,000. P2SH redeem-script sigops and witness sigops are not counted, and the post-segwit budget is 80,000 weighted sigop cost.
-- **Transaction finality**: `nLockTime` against height and median-time-past (`IsFinalTx`, BIP113).
-- **Relative lock-time** (BIP68): `nSequence` locks are only checked at script level via `OP_CHECKSEQUENCEVERIFY`, not at block level.
 - **BIP30**: probes only output 0 of each txid, and does not use the BIP34 shortcut that lets Core skip the check after the BIP34 height.
+- **Block weight**: Stage 1 computes weight from the owned `Block`; the zero-copy `validate_block_wire` path counts base size only.
 - **Network parameters**: soft-fork activation heights (`ScriptFlags::for_height`, BIP34/65/66 in `pow.rs`) are mainnet values. `mantle-replay` accepts testnet and signet, where these are wrong.
 - **BIP9/BIP8 deployment state** is not evaluated.
 

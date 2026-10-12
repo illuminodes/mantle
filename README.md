@@ -5,10 +5,10 @@ Bitcoin Core; consensus rules are derived from the BIPs and checked against
 Core's behaviour with differential fuzzing.
 
 **Status: experimental. Do not use Mantle to decide whether you have received
-bitcoin.** Stage 3 validation is missing consensus rules (witness commitment,
-sigop cost, lock-time finality, BIP68), and nothing yet compares Mantle's UTXO
-set against Core. See `docs/architecture/validation.md` §"Known gaps" and
-`docs/architecture/conformance.md` §"Current coverage".
+bitcoin.** Block validation implements the consensus rules but has not been
+compared against Bitcoin Core on real chain data, and nothing yet compares
+Mantle's UTXO set against Core's. See `docs/architecture/validation.md`
+§"Known gaps" and `docs/architecture/conformance.md` §"Current coverage".
 
 Linux only: storage and networking use io_uring.
 
