@@ -91,7 +91,7 @@ Each milestone is a shippable PR. Each one ends with a stricter `fuzz_script_dif
 - `OP_CHECKSIG` / `OP_CHECKSIGVERIFY` / `OP_CHECKMULTISIG` / `OP_CHECKMULTISIGVERIFY`. `CHECKMULTISIG` reproduces the off-by-one "OP_0 padding" requirement (`SCRIPT_VERIFY_NULLDUMMY` flag-gated).
 - BIP16 P2SH redeemScript dance: when scriptPubKey matches the P2SH pattern, take the last push from scriptSig as the redeem script, evaluate that against the remainder of the stack.
 - `verify_script(...)` as the public entry point. Wired into `connect_block` as a fourth per-input check, after coin lookup but before fee math (script failure rejects the tx whether or not the value math would have).
-- Per-input script flags computed via `flags_for_height(height)`, parity with `bitcoinconsensus::height_to_flags` for legacy bits. Witness/taproot bits are off in M1.
+- Per-input script flags computed via `ScriptFlags::for_height(height)`, compared with `bitcoinconsensus::height_to_flags` in `conformance/tests/proptest.rs`.
 
 **What does *not* ship in M1.**
 - Witness program detection. Pre-segwit-activation blocks have no witness programs in scriptPubKey by consensus, so the parser may simply fail-closed on those byte patterns — they do not appear in M1's test corpus.

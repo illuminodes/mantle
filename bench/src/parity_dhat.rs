@@ -72,8 +72,6 @@ fn build_jobs() -> Vec<Job> {
             eprintln!("missing block {h}, stopping at prefix already loaded");
             break;
         };
-        // ScriptFlags::for_height is verified to match bitcoinconsensus's
-        // height_to_flags via the M4 proptest in mantle-consensus.
         let flags = ScriptFlags::for_height(BlockHeight::new(h));
 
         for tx in &block.transactions {

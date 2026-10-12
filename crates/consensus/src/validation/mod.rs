@@ -132,3 +132,5 @@ mod tests_bip30;
 mod tests_block_rules;
 #[cfg(test)]
 mod tests_script_cache;
+#[cfg(test)]
+mod tests_script_flag_history;

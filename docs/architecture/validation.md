@@ -353,8 +353,10 @@ Things this document does *not* commit to:
 Rules that differ from Core or are unverified. None of the block-level rules has been compared against Core on real chain data yet; see `conformance.md` §"Current coverage".
 
 - **Block weight**: Stage 1 computes weight from the owned `Block`; the zero-copy `validate_block_wire` path counts base size only.
-- **Network parameters**: soft-fork activation heights (`ScriptFlags::for_height`, BIP34/65/66 in `pow.rs`) are mainnet values. `mantle-replay` accepts testnet and signet, where these are wrong.
-- **BIP9/BIP8 deployment state** is not evaluated.
+- **Network parameters**: soft-fork activation heights (`ScriptFlags::for_height`, BIP34/65/66 in `pow.rs`) are mainnet values. `mantle-replay` refuses to validate testnet and signet until per-network parameters exist.
+- **BIP9/BIP8 deployment state** is not evaluated; activations are fixed heights.
+
+Script flags are by height rather than Core's "on from genesis, minus two exempt blocks". On mainnet both give the same flags for every block: the two exempt blocks (170,060 and 692,261) are below the P2SH and taproot activation heights. `tests_script_flag_history` checks both exempt spends.
 
 ---
 

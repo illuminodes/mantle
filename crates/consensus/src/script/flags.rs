@@ -82,15 +82,17 @@ impl ScriptFlags {
     /// Mainnet activation heights, in chronological order. Each entry adds
     /// flag bits at the named height; flags are cumulative.
     ///
-    /// Source: BIP activation heights as documented; cross-checked against
-    /// `bitcoinconsensus::height_to_flags` by the differential fuzzer.
+    /// Core instead enables P2SH, WITNESS and TAPROOT from genesis and exempts
+    /// two blocks (`…9c22` at 170,060 and `…95ad` at 692,261). Both lie below
+    /// the activation heights here, so the two schemes agree on the mainnet
+    /// chain; `tests_script_flag_history` checks the two exempt spends.
     const ACTIVATIONS: &'static [(u32, Self)] = &[
-        (173_805, Self::P2SH.union(Self::const_self_or(Self::NONE))), // BIP16
-        (363_725, Self::DERSIG),                                      // BIP66
-        (388_381, Self::CHECKLOCKTIMEVERIFY),                         // BIP65
-        (419_328, Self::CHECKSEQUENCEVERIFY),                         // BIP112/68/113
-        (481_824, Self::WITNESS.union(Self::NULLDUMMY)),              // BIP141/143/147
-        (709_633, Self::TAPROOT), // BIP341/342 (Core uses > 709632)
+        (173_805, Self::P2SH),                           // BIP16
+        (363_725, Self::DERSIG),                         // BIP66
+        (388_381, Self::CHECKLOCKTIMEVERIFY),            // BIP65
+        (419_328, Self::CHECKSEQUENCEVERIFY),            // BIP112/68/113
+        (481_824, Self::WITNESS.union(Self::NULLDUMMY)), // BIP141/143/147
+        (709_633, Self::TAPROOT),                        // BIP341/342
     ];
 
     /// Construct from raw bits — for fuzzer parity. Prefer the named constants.
@@ -121,18 +123,9 @@ impl ScriptFlags {
         Self(self.0 | other.0)
     }
 
-    /// Identity helper for the activation table — works around the lack of
-    /// `const` `BitOr` while keeping the table a single expression.
-    #[inline]
-    #[must_use]
-    const fn const_self_or(self) -> Self {
-        self
-    }
-
     /// Mainnet flag set active at `height`, matching Core's behaviour.
     ///
-    /// The differential fuzzer asserts parity with `bitcoinconsensus::height_to_flags`
-    /// across every mainnet height in M4.
+    /// The conformance tests compare this against `bitcoinconsensus::height_to_flags`.
     #[must_use]
     pub fn for_height(height: BlockHeight) -> Self {
         let h = height.to_u32();
