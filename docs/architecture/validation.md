@@ -1,6 +1,6 @@
 # Validation Architecture
 
-Status: **partially implemented** — Stage 1 (structural) and Stage 2 (contextual) validation are complete in `crates/consensus`. Stage 3 (UTXO connect) and the script interpreter are not yet written. Subject to revision as implementation continues.
+Status: **partially implemented.** Stages 1, 2 and 3 exist in `crates/consensus/src/validation/`, and Stage 3 runs full script verification. Stage 3 is missing several consensus rules; see §"Known gaps" before relying on it. Subject to revision as implementation continues.
 
 This document covers the consensus-validation subsystem: how blocks and transactions are validated, how the validator interacts with the storage layer via `ChainView`, the script-verification strategy, and the cryptographic concerns specific to using `k256` instead of `libsecp256k1`. It does *not* cover mempool *policy* (relay rules, fee filters) — those are a separate layer above consensus.
 
@@ -49,7 +49,7 @@ A block does not get one big `validate(block) -> Result<()>` function. It moves 
 
 ### Stage 1: Structural (stateless)
 
-**Status: implemented** — `validation::validate_block_structure` in `crates/consensus/src/validation.rs`.
+**Status: implemented** — `validation::validate_block_structure` and the zero-copy `validate_block_wire` in `crates/consensus/src/validation/structure.rs`.
 
 Inputs: the block itself.
 
@@ -62,7 +62,7 @@ Checks the block is well-formed in isolation:
 - Merkle root in the header matches the computed root of the transaction list.
 - Header proof-of-work satisfies the *claimed* `nBits` (whether `nBits` is *correct* requires context; that's stage 2).
 
-Witness commitment check is deferred until the `Transaction` type carries witness data.
+**Not implemented:** the BIP141 witness commitment check, and the matching rejection of witness data in blocks without a commitment. `Transaction` now carries witness data, so nothing blocks this.
 
 These checks need no chain state. They run on raw bytes. They are the first line of defense against malformed/garbage blocks from peers.
 
@@ -70,7 +70,7 @@ These checks need no chain state. They run on raw bytes. They are the first line
 
 ### Stage 2: Contextual (needs headers / chain index)
 
-**Status: implemented** — `validation::validate_block_context` in `crates/consensus/src/validation.rs`.
+**Status: implemented** — `validation::validate_block_context` in `crates/consensus/src/validation/mod.rs`.
 
 Inputs: the block + its predecessor header chain + difficulty/time history (via `ChainView`).
 
@@ -88,7 +88,7 @@ This stage does not touch the UTXO set. It runs against the header chain only, s
 
 ### Stage 3: Connect (needs UTXO set)
 
-**Status: not yet implemented.**
+**Status: partially implemented** — `validation::connect_block` in `crates/consensus/src/validation/connect.rs`. Implemented: input existence, coinbase maturity, BIP30 (vout-0 probe only), legacy sigop count, script verification per input, fee math, coinbase reward. Missing: see §"Known gaps". Undo data is not produced.
 
 Inputs: the block + chain index + the live UTXO set at the parent block.
 
@@ -147,9 +147,9 @@ pub trait ChainView {
 **The ChainView trait is the only interface validation has into storage.** It is *not* an `&dyn ChainView` from the validator's perspective at runtime — it's a concrete handle that wraps the request/response ring buffers — but the *trait* exists to make every other ChainView pluggable for tests:
 
 - `MemoryChainView` — **implemented**; in-memory, used by unit tests, fuzzers, and BIP vector tests.
-- `CoreBackedChainView` — not yet implemented; wraps a running Core node's RPC for differential testing.
-- `ReplayChainView` — not yet implemented; reads from a static snapshot for benchmarking.
-- The production `StorageChainView` — not yet implemented; backed by the storage thread.
+- `PrefetchedView` — **implemented** in `crates/validator`; serves the coins a block needs after one batched storage lookup, plus a `HeaderSnapshot`. This is what replay uses.
+- `CoreBackedChainView` — not implemented; would wrap a running Core node's RPC for differential testing.
+- `ReplayChainView` — not implemented; would read from a static snapshot for benchmarking.
 
 This abstraction is non-negotiable. It's what lets the validator be tested without bringing up the entire stack.
 
@@ -263,7 +263,7 @@ Script verification dominates IBD cost. Caching is not optional.
 
 ### Script-execution cache
 
-Keyed on `(scriptSig, scriptPubKey, witness, amount, flags)` → `accept/reject`. Hits when:
+Keyed on `(wtxid, input index, spent amount, spent scriptPubKey, flags)`; stores successes only. The spending transaction must be part of the key: signatures commit to it, so a key without it lets a signature from one transaction validate another. Hits when:
 - A tx is validated in mempool, then mined into a block (block validation hits the cache).
 - A tx is validated as part of one block, then a near-identical block is also considered (rare on tip but happens during forks).
 
@@ -348,9 +348,23 @@ Things this document does *not* commit to:
 
 ---
 
+## Known gaps
+
+Consensus rules Core enforces that `connect_block` / Stage 1 do not yet check. Each is a way for Mantle to accept a block Core rejects.
+
+- **Witness commitment** (BIP141): coinbase commitment to the witness merkle root; blocks with witness data and no commitment.
+- **Sigop cost** (BIP141): only legacy sigops are counted, against 20,000. P2SH redeem-script sigops and witness sigops are not counted, and the post-segwit budget is 80,000 weighted sigop cost.
+- **Transaction finality**: `nLockTime` against height and median-time-past (`IsFinalTx`, BIP113).
+- **Relative lock-time** (BIP68): `nSequence` locks are only checked at script level via `OP_CHECKSEQUENCEVERIFY`, not at block level.
+- **BIP30**: probes only output 0 of each txid, and does not use the BIP34 shortcut that lets Core skip the check after the BIP34 height.
+- **Network parameters**: soft-fork activation heights (`ScriptFlags::for_height`, BIP34/65/66 in `pow.rs`) are mainnet values. `mantle-replay` accepts testnet and signet, where these are wrong.
+- **BIP9/BIP8 deployment state** is not evaluated.
+
+---
+
 ## Cross-references
 
 - The storage seam is specified in `persistence.md` (this directory). Validator never bypasses `ChainView`.
-- The conformance test infrastructure is specified in `conformance.md`. The `mantle-conformance` crate is implemented; the differential script fuzzer is scaffolded (`fuzz_script_differential`). *We do not write production script code before the differential fuzzer can run* — the scaffold is ready to activate when the interpreter exists.
+- The conformance test infrastructure is specified in `conformance.md`. The `mantle-conformance` crate and the script differential fuzzer (`fuzz_script_differential`) are both active.
 - Architectural principles: `principles.md` (this directory).
 - `mantle` has the codecs, header types, and primitive types this design assumes. The validator lives in the `consensus` crate, which imports `mantle` without circular dependencies.

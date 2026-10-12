@@ -1,6 +1,6 @@
 # Script Interpreter
 
-Status: **not yet implemented.** This document is the design and staging plan; it commits to *what* and *in what order*, not yet to code. Subject to revision as implementation proceeds.
+Status: **implemented through M5.** The interpreter, legacy/BIP143/BIP341 sighash, segwit v0, taproot and tapscript live in `crates/consensus/src/script/`, and `connect_block` verifies every input. This document remains the design and staging record; the milestone sections below describe the plan as it was written. Deviations from that plan are listed in §"Current state".
 
 The script interpreter is the highest-risk subsystem in Mantle. It is the load-bearing reason `mantle-conformance` exists, the dominant cost during IBD, and the surface where every clean-room Bitcoin implementation that has ever shipped — libbitcoin, btcd — has produced a consensus divergence. We treat it accordingly: no production script code is written ahead of differential coverage for that code; every milestone activates more of `fuzz_script_differential`, never less.
 
@@ -24,7 +24,7 @@ From `validation.md` §"Script strategy":
 
 From `conformance.md`:
 - Every consensus-critical function has a differential fuzz target. The script interpreter is the most important one.
-- BIP66/BIP143/BIP340/BIP341/BIP342 vectors are inline in `crates/consensus/src/tests_bip_vectors.rs` once the interpreter exists.
+- BIP65/66/112/143/340/341/342 vectors are inline in `conformance/tests/bip_vectors/`.
 - Stage 3 of historical replay (full validation including script) is the long-running confidence signal.
 
 From the project state:
@@ -74,7 +74,7 @@ This matches the shape of `bitcoinconsensus::verify_with_flags` so the different
 
 ## Milestones
 
-Each milestone is a shippable PR. Each one ends with a stricter `fuzz_script_differential` assertion and more BIP vectors in `tests_bip_vectors.rs`. We do not skip ahead.
+Each milestone is a shippable PR. Each one ends with a stricter `fuzz_script_differential` assertion and more BIP vectors in `conformance/tests/bip_vectors/`. We do not skip ahead.
 
 ### M1 — Legacy script verification end-to-end
 
@@ -104,7 +104,7 @@ Each milestone is a shippable PR. Each one ends with a stricter `fuzz_script_dif
 - The corpus seeds for the fuzzer are: every `script_tests.json` entry that touches only the M1 flag set (mined into the corpus directory at the start of M1), plus a small hand-rolled set of P2PKH/P2SH/CHECKMULTISIG cases.
 
 **BIP vectors added.**
-- BIP66 strict-DER vectors in `tests_bip_vectors.rs`. Both the well-known accept set and the rejected pre-BIP66 grandfathering corpus.
+- BIP66 strict-DER vectors in `conformance/tests/bip_vectors/bip66.rs`. Both the well-known accept set and the rejected pre-BIP66 grandfathering corpus.
 - A handful of legacy script-verify positive/negative pairs (P2PKH, bare multisig, P2SH-wrapped multisig).
 - The 2010 value-overflow incident's precursor block in raw form, with assertion that script verification *passes* on the now-impossible tx (the bug was that the tx encoded outputs summing past `MAX_MONEY`, not that script verification rejected it; the structural Stage-1 check now rejects it. A test asserts both behaviors.)
 
@@ -132,7 +132,7 @@ Each milestone is a shippable PR. Each one ends with a stricter `fuzz_script_dif
 - Block weight calculation updates: base size × 3 + total size × 1, replacing the current "× 4" placeholder.
 - Witness commitment (BIP141) is verified on the coinbase: the last output of the coinbase contains a commitment to the witness merkle root.
 
-These are wire-format and structural changes; they touch `crates/core/primitives.rs` and `crates/consensus/validation.rs`. They are part of M2 even though M2 is nominally "the script interpreter" — segwit doesn't make sense without them.
+These are wire-format and structural changes; they touch `crates/mantle/src/tx/` and `crates/consensus/src/validation/`. They are part of M2 even though M2 is nominally "the script interpreter" — segwit doesn't make sense without them.
 
 **What ships.**
 - BIP143 sighash: `SIGHASH_ALL/NONE/SINGLE` over the segwit-v0 sighash preimage (`hashPrevouts`, `hashSequence`, `outpoint`, `scriptCode`, `amount`, `nSequence`, `hashOutputs`, `nLocktime`, `sighashType`). The three `hashPrevouts/hashSequence/hashOutputs` precomputations are cached on `TransactionRef` for the duration of one tx's verification (a hashed-preimage cache, not the full script-execution cache).
@@ -239,9 +239,9 @@ These are wire-format and structural changes; they touch `crates/core/primitives
 **Scope.** Performance, not correctness. Lands after M4 because cache bugs are easier to debug when the underlying interpreter is known-good.
 
 **What ships.**
-- `ScriptExecutionCache`: keyed on `(scriptSig_hash, scriptPubKey_hash, witness_hash, amount, flags)`, value is `accept` or `reject`. Bounded LRU. Living under `crates/consensus/src/script/cache.rs`.
+- `ScriptExecutionCache`: keyed on `(wtxid, input index, spent amount, spent scriptPubKey, flags)`; stores successes only. Bounded FIFO. Living under `crates/consensus/src/script/cache.rs`. (The original key design omitted the spending transaction, which let a replayed signature hit the cache for a different transaction; see §"Current state".)
 - `SignatureCache`: keyed on `(sighash, signature, pubkey)`, value is verdict. Smaller, simpler, hits a strict subset of script-cache hits but also helps when the same signature is reused across scripts.
-- `verify_script` becomes `verify_script_cached`, taking a `&ScriptExecutionCache` parameter; the uncached entry is preserved for tests and the fuzzer.
+- `ScriptVerifier::verify_cached` takes the transaction's wtxid and a `&mut ScriptExecutionCache`; the uncached `verify` is preserved for tests and the fuzzer.
 - Cache hit/miss counters exposed via a tiny telemetry hook (no global state; the cache owns its counters).
 - Property test: any input that produced a verdict on a cold cache produces the same verdict via the cache.
 - Differential fuzzer learns to compare cached vs. uncached: a tx with N identical inputs verified once cold, N-1 cached, must match a tx with N inputs verified all-cold.
@@ -255,7 +255,7 @@ These are wire-format and structural changes; they touch `crates/core/primitives
 - Cache hit rate is non-zero on real workload (sanity check, not a hard threshold).
 
 **Risks / known traps.**
-- A wrong cache key (forgetting to include `flags` or `amount`) is a silent consensus bug — the cache returns a valid prior verdict for a different actual input. The key must include *every* input that affects the verdict.
+- A wrong cache key (forgetting to include `flags`, `amount`, or the spending transaction itself) is a silent consensus bug — the cache returns a valid prior verdict for a different actual input. The key must include *every* input that affects the verdict.
 - Hash collision on the cache key would be a consensus bug; we use double-SHA256 of the concatenation, not a fast hash, for the key — a 256-bit key in a HashMap is the conservative choice.
 
 ---
@@ -348,11 +348,23 @@ We do *not* pull in `bitflags`, `thiserror`, `anyhow`, `bytes`, `arrayvec`, `num
 
 ---
 
+## Current state
+
+Implemented: M1–M5 as staged above. Deviations and known gaps:
+
+- **Execution cache key.** Fixed in `58a8867`. The original key `(scriptSig, scriptPubKey, witness, amount, flags)` omitted the spending transaction and had no length prefixes, so a valid scriptSig copied into a second transaction spending an identically scripted output of equal value was accepted from cache without a signature check. The key is now `(wtxid, n_in, amount, len(spk), spk, flags)` and only successes are cached. Regression tests: `crates/consensus/src/validation/tests_script_cache.rs`.
+- **BIP341 spent outputs in `connect_block`.** Fixed in `58a8867`. `connect_block` now builds the per-transaction spent-output table whenever an input spends a P2TR output; previously every multi-input taproot spend failed with `TaprootMissingSpentOutputs`.
+- **`SignatureCache`** is implemented and exported but not wired into the interpreter.
+- **Activation heights** are mainnet-only (`ScriptFlags::for_height`). Other networks need their own table before replay on them is meaningful.
+- **Differential coverage** compares accept/reject verdicts only, not error kinds; the fuzzer reaches signature-valid paths rarely because inputs are unstructured bytes.
+
+---
+
 ## Cross-references
 
 - `principles.md` §1, §3, §4 — clean-room, minimal deps, fuzzing-first. The disciplines section above is the operational form of these.
 - `validation.md` §"Script strategy", §"Cryptographic concerns" — the requirements this document plans against.
 - `conformance.md` Layer 2 — the differential fuzzer this document is gated on.
-- `fuzz/fuzz_targets/fuzz_script_differential.rs` — the live scaffold whose assertion is activated incrementally as the milestones land.
-- `crates/consensus/src/validation.rs::connect_block` — where `verify_script` is wired in during M1.
-- `crates/conformance/` — the `bitcoinconsensus` v26 FFI bridge that ground-truths every milestone.
+- `fuzz/fuzz_targets/fuzz_script_differential.rs` and `fuzz/src/lib.rs` — the script differential fuzzer.
+- `crates/consensus/src/validation/connect.rs::connect_block` and `validation/tx_script_context.rs` — where script verification is wired into Stage 3.
+- `conformance/` — the `bitcoinconsensus` v26 FFI bridge that ground-truths every milestone.

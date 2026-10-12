@@ -1,6 +1,6 @@
 # Replay Architecture
 
-Status: **design** — no code written yet. The companion to `persistence.md`:
+Status: **implemented (v1)** in `crates/storage`, `crates/validator` and `replay/`. Not implemented: `--assume-valid` (parsed, ignored), UTXO-set hash comparison, reorg handling, and per-network consensus parameters (activation heights are mainnet values). Blocks come from P2P peers via `crates/fetcher`. The text below is the original design. The companion to `persistence.md`:
 where `persistence.md` specifies the storage thread in isolation,
 this document specifies the three-crate seam (`storage` / `validator` /
 `replay`) that closes the M5 gate by running Stage 3 historical replay end
@@ -94,7 +94,7 @@ Threads are bare `std::thread`; no `tokio`, no `crossbeam`.
 - **Per-token waiting.** v1 issues one outstanding request at a time. The
   replay thread parks by reading the response ring directly, or by blocking
   on the response-ring eventfd via its own small `IoUring` — mirroring the
-  `Node::poll_or_timeout` pattern in `crates/core/src/peer.rs`. No
+  peer event loop in `crates/transport`. No
   condvars, no parking-lot in v1.
 
 ### Topology revision to `persistence.md`
@@ -321,9 +321,9 @@ for height in start..=target:
     )?
 ```
 
-The header chain is seeded on first run via the existing `getheaders`
-flow in `crates/node/src/main.rs` and stored in `headers.bin`. Subsequent
-runs read headers from storage.
+The header chain is seeded on first run via the `getheaders` flow in
+`crates/fetcher` and stored in `headers.bin`. Subsequent runs read
+headers from storage.
 
 CLI flags: `--data-dir`, `--peer`, `--skip-script`, `--assume-valid
 <hash>`, `--stop-height <N>`. The script flags map to `connect_block`'s
@@ -338,7 +338,7 @@ existing `skip_script` parameter.
 ```toml
 "crates/storage",
 "crates/validator",
-"crates/replay",
+"replay",
 ```
 
 `[workspace.dependencies]` already has `ququmatz` and `quetzalcoatl`. No
@@ -398,5 +398,5 @@ implementation closes M5.
   three-thread topology.
 - `crates/consensus/src/validation/connect.rs` — `connect_block` is
   called unmodified.
-- `crates/core/src/peer.rs` — template for the storage thread event loop
-  and the response-ring eventfd park.
+- `crates/transport` — template for the storage thread event loop and
+  the response-ring eventfd park.

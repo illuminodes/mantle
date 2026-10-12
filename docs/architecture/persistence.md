@@ -1,6 +1,6 @@
 # Persistence Architecture
 
-Status: **design** — no code written yet. Subject to revision when implementation surfaces issues this doc didn't anticipate.
+Status: **implemented (v1).** The storage thread, ring-buffer handle and message types live in `crates/storage`. The engines are `RobinHoodEngine` (on-disk Robin Hood hash table with io_uring batching, used by `mantle-replay`) and `FlatEngine` (simple append log, used by tests and `StorageHandle::open`). Four superseded engine experiments are kept for reference in `archive/storage-engines`. This document is the original design; undo data and reorg support are not implemented.
 
 This document covers the storage subsystem's architecture: the io_uring-driven storage thread, the inter-thread message types between it and the validator, and the constraints these decisions create. It does *not* cover the storage *engine* (the on-disk layout, UTXO representation, indexing) — that's a Phase 2 decision deliberately deferred until the message API is stable. See §"Deferred decisions" at the end.
 
@@ -438,7 +438,7 @@ Things this document does *not* commit to. Phase 2 work.
 
 ## Cross-references
 
-- Crates underpinning this design: `ququmatz` (`/home/cuarentaydos/Code/tooling/ququmatz`), `quetzalcoatl` (`/home/cuarentaydos/Code/tooling/quetzalcoatl`).
+- Crates underpinning this design: `ququmatz` (io_uring bindings) and `quetzalcoatl` (lock-free ring buffers).
 - The networking subsystem in `mantle::peer` is the structural template — same shape (one io_uring per thread, two ring buffers for ICC, eventfd-style wakeup is the upgrade path).
-- Validation pillar: separate doc, to be written.
+- Validation pillar: `validation.md`.
 - Architectural principles: `principles.md` in this directory.

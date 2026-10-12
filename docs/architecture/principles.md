@@ -14,7 +14,7 @@ Mantle is a from-scratch implementation of the Bitcoin protocol. It shares no co
 - Soft-fork archaeology — BIP66, BIP65, BIP68/112/113, BIP141, BIP341/342, etc. — must be reproduced exactly, including activation heights and transition-block edge cases.
 
 **What this does *not* commit us to:**
-- Refusing to depend on Core *for testing*. Differential fuzzing against `libbitcoinconsensus` is the only honest way to validate clean-room consensus code; the shipped node has zero Core deps, the test harness uses Core as ground truth. (See `validation.md` when written.)
+- Refusing to depend on Core *for testing*. Differential fuzzing against `libbitcoinconsensus` is the only honest way to validate clean-room consensus code; the shipped node has zero Core deps, the test harness uses Core as ground truth. (See `validation.md` and `conformance.md`.)
 
 ## 2. Conformance over novelty on the wire
 

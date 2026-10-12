@@ -17,8 +17,7 @@
 //! ```
 //!
 //! CLI: `mantle-replay [--data-dir DIR] [--network NAME] [--peer HOST:PORT]…
-//!                    [--skip-script] [--assume-valid HEX]
-//!                    [--start-height N] [--stop-height N] [--help]`.
+//!                    [--skip-script] [--start-height N] [--stop-height N] [--help]`.
 
 mod report;
 
@@ -62,12 +61,6 @@ struct Args {
     extra_peers: Vec<SocketAddrV4>,
     skip_script: bool,
     download_only: bool,
-    /// Stop validating once `block.hash() == this` is committed (then exit OK).
-    /// Phase 1 deliberately does *not* implement Bitcoin Core's "skip script
-    /// for ancestors of assume-valid"; a future commit can wire that to
-    /// `skip_script = true` for height ≤ found.
-    #[allow(dead_code)]
-    assume_valid: Option<Hash256>,
     /// First height to validate. Defaults to `storage.tip().height + 1`.
     start_height: Option<BlockHeight>,
     /// Last height to validate (inclusive). Defaults to whatever the peer
@@ -98,10 +91,9 @@ Options:
                           https://testnet4.achownodes.xyz/seeds.txt.gz.
     --skip-script         Skip script verification (Stage 2; faster bring-up).
     --download-only       Fetch and cache blocks, without replaying or mutating
-                          validated chain state.
-    --assume-valid HEX    Assume the chain leading to this block hash is
-                          valid; runs script for descendants only.
-                          (Phase 1: parsed but not yet honoured.)
+                          validated chain state. The only mode allowed on
+                          networks other than mainnet, whose consensus
+                          parameters are not implemented yet.
     --start-height N      First height to validate. Default: storage tip + 1.
     --stop-height N       Last height to validate (inclusive).
                           Default: peer tip from one getheaders call.
@@ -118,7 +110,6 @@ fn parse_args() -> Result<Args, String> {
     let mut extra_peers: Vec<SocketAddrV4> = Vec::new();
     let mut skip_script = false;
     let mut download_only = false;
-    let mut assume_valid: Option<Hash256> = None;
     let mut start_height: Option<BlockHeight> = None;
     let mut stop_height: Option<BlockHeight> = None;
     let mut locator_hash: Option<Hash256> = None;
@@ -194,11 +185,9 @@ fn parse_args() -> Result<Args, String> {
                 download_only = true;
             }
             "--assume-valid" => {
-                i += 1;
-                let v = raw.get(i).ok_or("--assume-valid requires a hex hash")?;
-                assume_valid = Some(
-                    Hash256::from_display_hex(v)
-                        .map_err(|e| format!("invalid --assume-valid {v}: {e}"))?,
+                return Err(
+                    "--assume-valid is not implemented; use --skip-script to skip all scripts"
+                        .to_string(),
                 );
             }
             "--start-height" => {
@@ -222,6 +211,14 @@ fn parse_args() -> Result<Args, String> {
         i += 1;
     }
 
+    if !download_only && network != Network::Mainnet {
+        return Err(format!(
+            "validation on {} is not supported: activation heights are mainnet-only; \
+             use --download-only",
+            network.name()
+        ));
+    }
+
     let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(format!("./data/{}", network.name())));
 
     Ok(Args {
@@ -231,7 +228,6 @@ fn parse_args() -> Result<Args, String> {
         extra_peers,
         skip_script,
         download_only,
-        assume_valid,
         start_height,
         stop_height,
         locator_hash,

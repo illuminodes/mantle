@@ -1,6 +1,6 @@
 # Conformance and Test Infrastructure
 
-Status: **partially implemented** — Layers 1–4 are complete. Layer 5 (historical replay) and the `mantle-blkdat` / `mantle-replay` crates are not yet written. Subject to revision as implementation continues.
+Status: **partially implemented.** Layers 1–4 exist. Layer 5 exists only as `mantle-replay` validating blocks fetched from peers; it compares nothing against Core. `mantle-blkdat`, UTXO snapshot diffing, reorg replay and the regression block corpus are not implemented. §"Current coverage" lists what is compared against Core today. Subject to revision as implementation continues.
 
 This document specifies the test infrastructure that makes Mantle's clean-room consensus implementation viable. It is the operationalization of `principles.md` §4 ("Fuzzing and historical replay as first-class infrastructure") and the precondition that `validation.md` names: *we do not write production script code before the differential fuzzer can run.*
 
@@ -23,6 +23,25 @@ Mantle commits to all three, up front. Without them, our implementation strategy
 
 ---
 
+## Current coverage
+
+What is checked against Bitcoin Core today, and what is not.
+
+| Surface | Compared against Core | How |
+|---|---|---|
+| Script verification, per input | Yes, accept/reject only | `fuzz_script_differential` vs `bitcoinconsensus` 0.106 (Core v26) |
+| Script flag activation heights (mainnet) | Yes | proptest vs `bitcoinconsensus::height_to_flags` |
+| CSV edge cases | Yes | `fuzz/tests/csv_oracle_probe.rs` matrix |
+| Known fuzzer crashes | Yes, replayed | `fuzz/tests/regression.rs` over `fuzz/tests/regression/` |
+| BIP vectors | Against BIP-published expectations, not Core | `conformance/tests/bip_vectors/` |
+| Block structure, context, connect | No | — |
+| UTXO set after replay | No | — |
+| Error kinds | No | — |
+
+Limits of the current reference: `libbitcoinconsensus` was removed from Core in v28, so the `bitcoinconsensus` crate is frozen at v26 and covers only script verification. Block-level and UTXO-level comparison needs a different reference, for example `libbitcoinkernel` or UTXO-set hashes taken from a Core node (`gettxoutsetinfo muhash`).
+
+---
+
 ## Layered test strategy
 
 Five layers, in order of cost and depth.
@@ -42,26 +61,26 @@ The load-bearing layer. For each consensus-critical function, a fuzz target that
 4. Asserts identical accept/reject verdicts.
 
 Targets in priority order:
-- **Script interpreter** (every opcode, every flag combination) — not yet implemented; blocked on script interpreter.
-- **Signature validation** (all sighash variants, BIP143/BIP341, low-S, strict DER) — not yet implemented.
-- **Transaction/block validation** (`CheckTransaction`-equivalents, merkle, weight, difficulty arithmetic) — **implemented** in `fuzz/fuzz_targets/fuzz_script_differential.rs`. Parses transactions via Mantle's codec, re-encodes, wraps in a minimal block, runs `validate_block_structure` (Stage 1), then calls `conformance::verify_script` per input. The script-interpreter assertion is scaffolded and will activate once the interpreter exists.
-- BIP9/BIP8 deployment-state evaluation — not yet implemented.
+- **Script interpreter and signature validation** — **implemented** in `fuzz/fuzz_targets/fuzz_script_differential.rs` (logic in `fuzz/src/lib.rs`). Decodes an arbitrary transaction, takes arbitrary spent outputs and flags masked to the consensus set, and asserts Mantle and `bitcoinconsensus` agree on accept/reject for every input. Both sides receive the same spent-output table, so taproot is compared when the table covers every input. Error kinds are not compared.
+- **Transaction/block validation** (`CheckTransaction`-equivalents, merkle, weight, difficulty arithmetic) — not compared against Core. `libbitcoinconsensus` exposes only script verification.
+- BIP9/BIP8 deployment-state evaluation — not implemented.
 
 **Constraint:** any divergence is a P0 bug. The fuzzer must be running continuously somewhere with corpus persistence; CI runs a time-boxed sample of the corpus on every commit.
 
 ### Layer 3: Property-based tests
 
-`proptest` for things with algebraic properties. **Implemented** in `crates/consensus/src/tests_proptest.rs`:
+`proptest` for things with algebraic properties. **Implemented** in `conformance/tests/proptest.rs`:
 - Codec roundtrip: `decode(encode(x)) == x` for `VarInt`, `BlockHeader`, `Transaction`, `Block`.
 - `VarInt` canonicality: re-encoding a decoded value produces identical bytes; `encoded_len` matches actual byte count.
 - Merkle tree: determinism, single-tx identity root, empty-slice returns `None`, odd-length duplicate invariant (≥ 3 txids).
-- Sighash determinism — deferred until the script interpreter exists.
+- `flags_for_height` agrees with `bitcoinconsensus::height_to_flags` across heights 0..=900,000.
+- The cached script verifier returns the same result as the uncached one, cold and warm.
 
 `proptest` over `cargo-fuzz` here because shrinking matters and the time budget is bounded (these run every CI invocation, not continuously).
 
 ### Layer 4: BIP test vectors and adversarial corpus
 
-Static test corpora hand-encoded as constants in the test binary — no runtime file I/O. **Implemented** in `crates/consensus/src/tests_bip_vectors.rs`:
+Static test corpora hand-encoded as constants in the test binary — no runtime file I/O. **Implemented** in `conformance/tests/bip_vectors/`:
 - Genesis block decode, hash, and txid match against known-good constants.
 - Stage 1 rejection vectors: empty block, missing coinbase, null outpoint in non-coinbase tx, coinbase scriptSig length bounds, output value over `MAX_MONEY`, duplicate inputs, merkle root mismatch, invalid nBits, insufficient PoW.
 - Stage 2 rejection vectors: unknown parent, unexpected difficulty, timestamp ≤ MTP, BIP34 height missing, block version too low.
@@ -70,7 +89,7 @@ Static test corpora hand-encoded as constants in the test binary — no runtime 
 - Sequence-field codec fidelity across all boundary values.
 - `MemoryChainView` UTXO lifecycle (insert, lookup, spend, coinbase flag).
 
-BIP66/BIP143/BIP340/BIP341/BIP342 script-level vectors — deferred until the script interpreter exists.
+- Script-level vectors for BIP65, BIP66, BIP112, BIP143, BIP340, BIP341 and BIP342, including multi-input taproot and a real mainnet `SIGHASH_SINGLE|ANYONECANPAY` spend from block 767,434.
 
 The design-era mention of consuming `tx_valid.json` / `tx_invalid.json` at runtime is superseded: vectors are inline constants, which is simpler and has no file-system dependency.
 
@@ -88,7 +107,7 @@ Three new crates, each with a tightly scoped responsibility. All three are dev-o
 
 ### `mantle-conformance`
 
-**Status: implemented** at `crates/conformance/`.
+**Status: implemented** at `conformance/`.
 
 The differential-test glue. Uses the `bitcoinconsensus = "0.106.0"` crate, which bundles the Bitcoin Core v26 C++ source and builds it as part of `cargo build` — no system library dependency, pinned to a specific Core version, reproducible on any machine.
 
@@ -129,11 +148,11 @@ pub mod conformance {
 
 **Note on build approach:** the design document anticipated two options (pinned source build vs. system library). The `bitcoinconsensus` crate eliminates this choice — it always builds from its bundled pinned source. This is strictly better than the system-library option and simpler than a custom build-script.
 
-**Constraint:** this crate is never in the dependency tree of the production node. It appears only as a dependency of the `mantle-fuzz` crate and future `mantle-replay` / integration test crates. It is never a dependency of `mantle-node`, `mantle`, or `consensus`.
+**Constraint:** this crate is never in the dependency tree of the production node. It appears only as a dependency of `mantle-fuzz`, `mantle-bench` (dev) and its own tests. It is never a dependency of `mantle`, `mantle-consensus`, `mantle-validator` or `mantle-replay`.
 
 ### `mantle-blkdat`
 
-**Status: not yet implemented.** Design below is unchanged.
+**Status: not implemented.** `mantle-replay` fetches blocks over P2P instead (`crates/fetcher`, `crates/block-io`). Design below is unchanged.
 
 A reader for Bitcoin Core's `blocks/blk*.dat` files. The format is documented and stable; we parse it directly, not via a Core RPC call.
 
@@ -161,7 +180,7 @@ impl BlockDirReader {
 
 ### `mantle-replay`
 
-**Status: not yet implemented.** Design below is unchanged.
+**Status: implemented differently.** `replay/` is a binary, not a library harness. It fetches blocks from P2P peers, runs Stage 1, Stage 2 and `connect_block`, and commits to `RobinHoodEngine` storage. It has no stage selection, no snapshot diffing, and no comparison against Core; `--assume-valid` is parsed but ignored. The sketch below is the original design.
 
 The harness that drives the historical-replay pipeline. Consumes `mantle-blkdat`'s block iterator, drives Mantle's validator through each stage, optionally compares against Core via `mantle-conformance` and via UTXO snapshots.
 
@@ -277,7 +296,7 @@ A static, version-controlled corpus of historically-significant blocks and trans
 
 ### Initial population
 
-- **BIP66 activation block (block 363,731).** Strict-DER signatures activated. Some pre-activation blocks contain non-canonical signatures.
+- **BIP66 activation block (block 363,725).** Strict-DER signatures activated. Some pre-activation blocks contain non-canonical signatures.
 - **BIP16 (P2SH) activation block (block 173,805).** Has historical edge cases around grandfathering.
 - **BIP141 (segwit) activation block (block 481,824).** Witness commitment validation begins.
 - **BIP341 (taproot) activation block (block 709,632).** Schnorr signatures, x-only pubkeys.
@@ -321,11 +340,11 @@ Public surface: `push_header`, `insert_coin`, `spend_coin`. Read access through 
 
 ### `ReplayChainView`
 
-**Status: not yet implemented.** Reads from a static UTXO snapshot file plus a header chain file. Used by `mantle-replay` to drive validation against a known-good prior state without bringing up the full storage subsystem.
+**Status: not implemented.** Reads from a static UTXO snapshot file plus a header chain file. Used by `mantle-replay` to drive validation against a known-good prior state without bringing up the full storage subsystem.
 
 ### `CoreBackedChainView` *(optional, advanced)*
 
-**Status: not yet implemented.** Stretch goal; not blocking initial validator development.
+**Status: not implemented.** Stretch goal; not blocking initial validator development.
 
 Wraps a running Core node's RPC. Used in differential testing: validate a block against Mantle and against Core, comparing not just the verdict but every intermediate state transition.
 
@@ -408,9 +427,9 @@ Things this document does *not* commit to:
 ## Cross-references
 
 - `principles.md` §4 — the principle this document operationalizes.
-- `validation.md` — the validator design that depends on this infrastructure. Stage 1 and Stage 2 are implemented; the commitment that *no production script code is written before the differential fuzzer can run* is satisfied — `fuzz_script_differential` is running.
+- `validation.md` — the validator design that depends on this infrastructure, including its §"Known gaps".
 - `persistence.md` — the storage seam that `ChainView` test implementations stand in for.
 - `fuzz/` — Layer 1 and the Layer 2 differential target (`fuzz_script_differential`) live here.
-- `crates/consensus/` — home of Stage 1/2 validation, `ChainView`, `MemoryChainView`, and the Layer 3/4 test modules.
-- `crates/conformance/` — implemented; the FFI bridge to `bitcoinconsensus` v26.
-- `mantle-blkdat` and `mantle-replay` — not yet added to the workspace; needed for Layer 5.
+- `crates/consensus/` — Stage 1/2/3 validation, `ChainView`, `MemoryChainView`.
+- `conformance/` — the FFI bridge to `bitcoinconsensus` v26 and the Layer 3/4 tests.
+- `replay/` — the replay binary; `mantle-blkdat` does not exist.

@@ -1,7 +1,7 @@
 #!/usr/bin/env fish
 
 set timeout 600  # 10 minutes in seconds
-set targets fuzz_varint fuzz_primitives fuzz_network
+set targets fuzz_varint fuzz_primitives fuzz_network fuzz_script_differential
 set pids
 
 for target in $targets
