@@ -88,7 +88,7 @@ This stage does not touch the UTXO set. It runs against the header chain only, s
 
 ### Stage 3: Connect (needs UTXO set)
 
-**Status: implemented** — `validation::connect_block` in `crates/consensus/src/validation/connect.rs`. Checks input existence (including same-block spends in block order and rejection of in-block double spends), coinbase maturity, BIP30 (vout-0 probe), BIP141 sigop cost (`sigop_cost.rs`), BIP68 sequence locks (`sequence_locks.rs`), script verification per input, fee math and coinbase reward. Lock-time finality (`IsFinalTx`) runs in Stage 2 (`tx_finality.rs`). Undo data is not produced.
+**Status: implemented** — `validation::connect_block` in `crates/consensus/src/validation/connect.rs`. Checks input existence (including same-block spends in block order and rejection of in-block double spends), coinbase maturity, BIP30 (every output, with Core's BIP34 shortcut and the two exempt blocks), BIP141 sigop cost (`sigop_cost.rs`), BIP68 sequence locks (`sequence_locks.rs`), script verification per input, fee math and coinbase reward. Lock-time finality (`IsFinalTx`) runs in Stage 2 (`tx_finality.rs`). Undo data is not produced.
 
 Inputs: the block + chain index + the live UTXO set at the parent block.
 
@@ -352,7 +352,6 @@ Things this document does *not* commit to:
 
 Rules that differ from Core or are unverified. None of the block-level rules has been compared against Core on real chain data yet; see `conformance.md` §"Current coverage".
 
-- **BIP30**: probes only output 0 of each txid, and does not use the BIP34 shortcut that lets Core skip the check after the BIP34 height.
 - **Block weight**: Stage 1 computes weight from the owned `Block`; the zero-copy `validate_block_wire` path counts base size only.
 - **Network parameters**: soft-fork activation heights (`ScriptFlags::for_height`, BIP34/65/66 in `pow.rs`) are mainnet values. `mantle-replay` accepts testnet and signet, where these are wrong.
 - **BIP9/BIP8 deployment state** is not evaluated.
