@@ -172,6 +172,7 @@ pub fn commit(
             exec_cache: Some(cache),
             durability: Durability::Memory,
             token: ReqToken(token),
+            utxo_hash: None,
         },
     )
     .unwrap_or_else(|e| panic!("commit at height {}: {e}", height.to_u32()));

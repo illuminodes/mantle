@@ -806,6 +806,7 @@ dependencies = [
  "mantle-fetcher",
  "mantle-storage",
  "mantle-transport",
+ "mantle-utxo-hash",
  "mantle-validator",
  "quetzalcoatl",
  "ququmatz",
@@ -848,6 +849,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mantle-utxo-hash"
+version = "0.1.0"
+dependencies = [
+ "mantle",
+ "sha2",
+]
+
+[[package]]
 name = "mantle-utxo-set"
 version = "0.1.0"
 dependencies = [
@@ -863,6 +872,7 @@ dependencies = [
  "mantle",
  "mantle-consensus",
  "mantle-storage",
+ "mantle-utxo-hash",
 ]
 
 [[package]]

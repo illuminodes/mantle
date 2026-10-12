@@ -1,6 +1,6 @@
 # Replay Architecture
 
-Status: **implemented (v1)** in `crates/storage`, `crates/validator` and `replay/`. Not implemented: `--assume-valid` (parsed, ignored), UTXO-set hash comparison, reorg handling, and per-network consensus parameters (activation heights are mainnet values). Blocks come from P2P peers via `crates/fetcher`. The text below is the original design. The companion to `persistence.md`:
+Status: **implemented (v1)** in `crates/storage`, `crates/validator` and `replay/`. UTXO-set MuHash comparison against Core values is available with `--utxo-hash-file` (see `conformance.md` Stage 4). Not implemented: `--assume-valid` (refused), reorg handling, and per-network consensus parameters (activation heights are mainnet values). Blocks come from P2P peers via `crates/fetcher`. The text below is the original design. The companion to `persistence.md`:
 where `persistence.md` specifies the storage thread in isolation,
 this document specifies the three-crate seam (`storage` / `validator` /
 `replay`) that closes the M5 gate by running Stage 3 historical replay end

@@ -7,8 +7,10 @@ use mantle_consensus::tx_view::BlockView;
 use mantle_consensus::validation::{Bip30, connect_block};
 use mantle_storage::ops::StorageOps;
 use mantle_storage::types::{CommitBlockReq, CommittedResp, Durability, ReqToken, StorageError};
+use mantle_utxo_hash::UtxoSetHash;
 
 use crate::prefetched_view::{HeaderSnapshot, PrefetchedView};
+use crate::utxo_hash_update::UtxoHashUpdate;
 
 /// Per-block pipeline options: script policy and storage commit parameters.
 pub struct PipelineOpts<'a> {
@@ -16,6 +18,8 @@ pub struct PipelineOpts<'a> {
     pub exec_cache: Option<&'a mut ScriptExecutionCache>,
     pub durability: Durability,
     pub token: ReqToken,
+    /// Updated with the block's UTXO delta once the block is committed.
+    pub utxo_hash: Option<&'a mut UtxoSetHash>,
 }
 
 /// Block-identity fields needed when committing a previously validated result.
@@ -44,6 +48,7 @@ pub struct ReplayBufs {
     coins: PrehashedMap<OutPoint, Option<Coin>>,
     txid_scratch: Vec<u8>,
     connect_scratch: ConnectScratch,
+    utxo_hash_update: UtxoHashUpdate,
 }
 
 impl ReplayBufs {
@@ -60,6 +65,7 @@ impl ReplayBufs {
             coins: PrehashedMap::with_hasher(BuildPrehashedHasher),
             txid_scratch: Vec::new(),
             connect_scratch: ConnectScratch::new(),
+            utxo_hash_update: UtxoHashUpdate::new(),
         }
     }
 
@@ -256,6 +262,16 @@ impl ReplayBufs {
             block_bytes: None,
             durability: opts.durability,
         })?;
+
+        if let Some(utxo_hash) = opts.utxo_hash {
+            self.utxo_hash_update.apply(
+                utxo_hash,
+                (height, hash),
+                &result.created,
+                &result.spent,
+                &self.coins,
+            );
+        }
 
         Ok(resp)
     }

@@ -1,6 +1,6 @@
 # Conformance and Test Infrastructure
 
-Status: **partially implemented.** Layers 1–4 exist. Layer 5 exists only as `mantle-replay` validating blocks fetched from peers; it compares nothing against Core. `mantle-blkdat`, UTXO snapshot diffing, reorg replay and the regression block corpus are not implemented. §"Current coverage" lists what is compared against Core today. Subject to revision as implementation continues.
+Status: **partially implemented.** Layers 1–4 exist. Layer 5 exists as `mantle-replay` validating blocks fetched from peers, with UTXO-set MuHash comparison against Core values supplied by the operator (Stage 4 below). No reference values are committed to the repo yet. `mantle-blkdat`, reorg replay and the regression block corpus are not implemented. §"Current coverage" lists what is compared against Core today. Subject to revision as implementation continues.
 
 This document specifies the test infrastructure that makes Mantle's clean-room consensus implementation viable. It is the operationalization of `principles.md` §4 ("Fuzzing and historical replay as first-class infrastructure") and the precondition that `validation.md` names: *we do not write production script code before the differential fuzzer can run.*
 
@@ -34,11 +34,12 @@ What is checked against Bitcoin Core today, and what is not.
 | CSV edge cases | Yes | `fuzz/tests/csv_oracle_probe.rs` matrix |
 | Known fuzzer crashes | Yes, replayed | `fuzz/tests/regression.rs` over `fuzz/tests/regression/` |
 | BIP vectors | Against BIP-published expectations, not Core | `conformance/tests/bip_vectors/` |
-| Block structure, context, connect | No | — |
-| UTXO set after replay | No | — |
+| MuHash3072 algorithm | Yes | Core's `crypto_tests` vectors in `crates/utxo-hash` |
+| UTXO set after replay | When reference values are supplied | `mantle-replay --utxo-hash-file`, against `gettxoutsetinfo muhash <height>` |
+| Block structure, context, connect | Only through the UTXO hash | — |
 | Error kinds | No | — |
 
-Limits of the current reference: `libbitcoinconsensus` was removed from Core in v28, so the `bitcoinconsensus` crate is frozen at v26 and covers only script verification. Block-level and UTXO-level comparison needs a different reference, for example `libbitcoinkernel` or UTXO-set hashes taken from a Core node (`gettxoutsetinfo muhash`).
+Limits of the current reference: `libbitcoinconsensus` was removed from Core in v28, so the `bitcoinconsensus` crate is frozen at v26 and covers only script verification. The UTXO-set hash covers the result of every block rule, but only for blocks Core accepted: it cannot show that Mantle rejects an invalid block. `libbitcoinkernel` would cover that.
 
 ---
 
@@ -260,9 +261,9 @@ Stage 2 + every script verification. This is the big one.
 
 ### Stage 4: UTXO snapshot diffing
 
-At fixed heights (every 50,000 blocks, say), Mantle computes a UTXO-set hash. The hash is compared against a hash computed by Core at the same height (precomputed checkpoint set, committed to the repo).
+**Implemented:** `crates/utxo-hash` (`MuHash3072`, `UtxoSetHash`), applied per block by `UtxoHashUpdate` in `crates/validator`, checked by `mantle-replay --utxo-hash-file PATH`. The hash is maintained incrementally from genesis exactly as Core's coinstats index maintains it: unspendable outputs are skipped, coins created and spent in one block never enter, and the coinbases of blocks 91,722 and 91,812 (`IsBIP30Unspendable`) are left out. The reference file holds `<height> <muhash>` lines from `bitcoin-cli gettxoutsetinfo muhash <height>` on a node running `-coinstatsindex`. A mismatch is reported as a `utxo-hash` consensus failure. Tracking stops after a keep-going forced commit, because that block's prior coins are unknown. Not yet done: a committed reference set, and resuming the hash across replay restarts (`--utxo-hash-*` requires `--start-height 1`).
 
-**Hash format:** matches Core's `gettxoutsetinfo` output, specifically `muhash` (multiplicative hash) for incremental computation. `hash_serialized_3` is also documented for cross-check.
+**Hash format:** matches Core's `gettxoutsetinfo muhash`. `hash_serialized_3` is not implemented; Core only reports it for the current tip, so it cannot serve as a per-height reference.
 
 **Why this catches bugs Stage 3 doesn't:**
 - A silent UTXO-state corruption that doesn't trip a validation error.

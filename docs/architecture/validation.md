@@ -350,7 +350,7 @@ Things this document does *not* commit to:
 
 ## Known gaps
 
-Rules that differ from Core or are unverified. None of the block-level rules has been compared against Core on real chain data yet; see `conformance.md` §"Current coverage".
+Rules that differ from Core or are unverified. `mantle-replay --utxo-hash-file` can compare the UTXO set against Core's MuHash on real chain data, but no such run has been recorded yet; see `conformance.md` §"Current coverage".
 
 - **Block weight**: Stage 1 computes weight from the owned `Block`; the zero-copy `validate_block_wire` path counts base size only.
 - **Network parameters**: soft-fork activation heights (`ScriptFlags::for_height`, BIP34/65/66 in `pow.rs`) are mainnet values. `mantle-replay` refuses to validate testnet and signet until per-network parameters exist.

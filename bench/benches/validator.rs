@@ -115,6 +115,7 @@ fn commit(
         exec_cache: Some(cache),
         durability: Durability::Memory,
         token: ReqToken(token),
+        utxo_hash: None,
     }).unwrap_or_else(|e| panic!("commit at height {}: {e}", height.to_u32()));
 }
 
@@ -337,6 +338,7 @@ mod pipeline {
                         exec_cache: Some(&mut cache),
                         durability: Durability::Memory,
                         token: ReqToken(i as u64),
+                        utxo_hash: None,
                     },
                 ).expect("validate_and_commit");
             }
