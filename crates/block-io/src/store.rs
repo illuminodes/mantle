@@ -83,9 +83,14 @@ impl FileStore {
     }
 
     pub fn truncate_and_write(&mut self, ring: &mut IoUring, data: &[u8]) -> io::Result<()> {
+        self.truncate()?;
+        self.append(ring, data)?;
+        Ok(())
+    }
+
+    pub fn truncate(&mut self) -> io::Result<()> {
         self.file.set_len(0)?;
         self.write_offset = 0;
-        self.append(ring, data)?;
         Ok(())
     }
 }
@@ -164,6 +169,12 @@ impl BlockStore {
 
     pub fn flush_index(&self, data_dir: &Path) -> io::Result<()> {
         save_blocks_index(&data_dir.join("blocks.idx"), &self.index)
+    }
+
+    pub fn discard_all(&mut self, data_dir: &Path) -> io::Result<()> {
+        self.store.truncate()?;
+        self.index.clear();
+        self.flush_index(data_dir)
     }
 }
 

@@ -46,6 +46,7 @@ pub enum FileReq {
         start: BlockHeight,
     },
     FlushBlockIndex,
+    DiscardBlocks,
     ReleaseSlab {
         slot: u16,
     },
@@ -181,6 +182,17 @@ where
     pub fn flush_block_index(&mut self) -> io::Result<()> {
         self.tx
             .push(FileReq::FlushBlockIndex)
+            .map_err(|_| io::Error::other("file-io ring full"))?;
+        match self.rx.pop_block() {
+            Some(FileResp::Ok) => Ok(()),
+            Some(FileResp::Err(e)) => Err(e),
+            _ => Err(io::Error::other("file-io unexpected response")),
+        }
+    }
+
+    pub fn discard_blocks(&mut self) -> io::Result<()> {
+        self.tx
+            .push(FileReq::DiscardBlocks)
             .map_err(|_| io::Error::other("file-io ring full"))?;
         match self.rx.pop_block() {
             Some(FileResp::Ok) => Ok(()),
@@ -339,6 +351,7 @@ where
                 FileReq::AppendHeaders { data } => self.handle_append_headers(&data),
                 FileReq::LoadCachedHeaders { start } => self.handle_load_cached_headers(start),
                 FileReq::FlushBlockIndex => self.handle_flush_block_index(),
+                FileReq::DiscardBlocks => self.handle_discard_blocks(&mut writes_since_flush),
                 FileReq::ReleaseSlab { slot } => {
                     self.slab_writer.release(slot);
                     continue;
@@ -511,6 +524,14 @@ where
 
     fn handle_flush_block_index(&mut self) -> FileResp {
         match self.blocks.flush_index(&self.data_dir) {
+            Ok(()) => FileResp::Ok,
+            Err(e) => FileResp::Err(e),
+        }
+    }
+
+    fn handle_discard_blocks(&mut self, writes_since_flush: &mut u64) -> FileResp {
+        *writes_since_flush = 0;
+        match self.blocks.discard_all(&self.data_dir) {
             Ok(()) => FileResp::Ok,
             Err(e) => FileResp::Err(e),
         }
@@ -753,6 +774,33 @@ mod tests {
                 .write_block(BlockHeight::ZERO, encoded)
                 .expect("write_block");
             handle.flush_block_index().expect("flush_block_index");
+        });
+        assert!(result.is_ok());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn discard_blocks_empties_cache_and_frees_disk() {
+        let dir = test_data_dir();
+        let block = sample_block();
+        let mut encoded = Vec::new();
+        block.encode(&mut encoded).expect("encode block");
+        let refill = encoded.clone();
+
+        let result = with_file_io(&dir, |handle, _slab_reader| {
+            handle
+                .write_block(BlockHeight::new(7), encoded)
+                .expect("write_block");
+            handle.discard_blocks().expect("discard_blocks");
+            assert!(!handle.has_block(BlockHeight::new(7)));
+            assert_eq!(std::fs::metadata(dir.join("blocks.bin")).unwrap().len(), 0);
+            handle
+                .write_block(BlockHeight::new(8), refill.clone())
+                .expect("write after discard");
+            assert_eq!(
+                handle.read_block(BlockHeight::new(8)).expect("read"),
+                refill
+            );
         });
         assert!(result.is_ok());
         cleanup(&dir);

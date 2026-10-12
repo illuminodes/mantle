@@ -469,6 +469,14 @@ where
         Ok(())
     }
 
+    /// Drop every cached block and truncate the block file, keeping headers.
+    ///
+    /// # Errors
+    /// Returns an error if the block file cannot be truncated.
+    pub fn discard_cached_blocks(&mut self) -> io::Result<()> {
+        self.file_io.discard_blocks()
+    }
+
     // ── headers session ────────────────────────────────────────────────
 
     #[allow(clippy::too_many_lines)]
