@@ -1,0 +1,53 @@
+stages:
+  - verify
+
+variables:
+  CARGO_TARGET_DIR: "$CI_PROJECT_DIR/target"
+  VERIFY_DIR: "$CI_PROJECT_DIR/verify-run"
+  VERIFY_STOP_HEIGHT: ""
+  VERIFY_WINDOW: "1000"
+  VERIFY_PROGRESS_SECS: "300"
+
+full-chain-verify:
+  stage: verify
+  tags:
+    - ansibler
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $FULL_CHAIN_VERIFY == "1"'
+  timeout: 7d
+  before_script:
+    - export PATH="$HOME/.cargo/bin:$PATH"
+    - command -v cargo >/dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+    - test "$(cat /proc/sys/kernel/io_uring_disabled)" != 2 || { echo "io_uring is disabled on this host"; exit 1; }
+    - rm -rf "$VERIFY_DIR" && mkdir -p "$VERIFY_DIR"
+  script:
+    - set -o pipefail
+    - cargo build --release -p mantle-replay --bins
+    - BIN="$CARGO_TARGET_DIR/release"
+    - $BIN/discover-peers --network mainnet --seconds 90 --out "$VERIFY_DIR/peers.raw.txt"
+    - $BIN/rank-peers --network mainnet --peer-file "$VERIFY_DIR/peers.raw.txt" --top 128 --out "$VERIFY_DIR/peers.txt"
+    - STOP_ARGS=""; [ -n "$VERIFY_STOP_HEIGHT" ] && STOP_ARGS="--stop-height $VERIFY_STOP_HEIGHT"
+    - >
+      $BIN/mantle-replay
+      --network mainnet
+      --data-dir "$VERIFY_DIR/chain"
+      --peer-file "$VERIFY_DIR/peers.txt"
+      --ephemeral
+      --keep-going
+      --failures-file "$VERIFY_DIR/failures.tsv"
+      --failure-blocks-dir "$VERIFY_DIR/failed-blocks"
+      --window "$VERIFY_WINDOW"
+      --progress-secs "$VERIFY_PROGRESS_SECS"
+      $STOP_ARGS
+      2>&1 | tee "$VERIFY_DIR/replay.log"
+      | grep --line-buffered -E 'CONSENSUS FAILURE|^ *\[ *[0-9]+/|fatal|complete|consensus failures|^  (structure|context|connect) |removed ephemeral|saved failing block'
+  after_script:
+    - rm -rf "$CI_PROJECT_DIR/verify-run/chain"
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - verify-run/failures.tsv
+      - verify-run/replay.log
+      - verify-run/failed-blocks/
