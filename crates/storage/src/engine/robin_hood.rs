@@ -348,6 +348,17 @@ impl RobinHoodTable {
         }
     }
 
+    /// Queue a read whose completion the caller must see. Returns `false` when
+    /// the submission queue is full; the caller leaves the entry for the next
+    /// round instead of draining completions it still needs.
+    fn try_push_read(&self, ring: &mut ququmatz::IoUring, sqe: ququmatz::Sqe) -> io::Result<bool> {
+        match ring.push(self.apply_fd_flags(sqe)) {
+            Ok(()) => Ok(true),
+            Err(ququmatz::Error::Submit(ququmatz::SubmitError::QueueFull)) => Ok(false),
+            Err(e) => Err(uring_err(e)),
+        }
+    }
+
     // ── Public API ───────────────────────────────────────────────────────────
 
     /// # Errors
@@ -539,9 +550,8 @@ impl RobinHoodTable {
             return Ok(());
         }
 
-        if (self.live_count + u64::try_from(pairs.len()).expect("batch fits u64")) * LOAD_FACTOR_DEN
-            > self.slot_count * LOAD_FACTOR_NUM
-        {
+        let incoming = u64::try_from(pairs.len()).expect("batch fits u64");
+        while (self.live_count + incoming) * LOAD_FACTOR_DEN > self.slot_count * LOAD_FACTOR_NUM {
             self.resize()?;
         }
 
@@ -570,7 +580,7 @@ impl RobinHoodTable {
             let mut submitted = 0u32;
             claimed.clear();
             for (i, state) in states.iter().enumerate() {
-                if state.resolved || !claimed.insert(state.slot) {
+                if state.resolved || claimed.contains(&state.slot) {
                     continue;
                 }
                 let offset = Self::slot_offset(state.slot);
@@ -584,7 +594,11 @@ impl RobinHoodTable {
                     )
                 }
                 .user_data(u64::try_from(i).expect("index fits u64"));
-                flush_if_full(ring, self.apply_fd_flags(sqe), &mut submitted)?;
+                if !self.try_push_read(ring, sqe)? {
+                    break;
+                }
+                claimed.insert(state.slot);
+                submitted += 1;
             }
 
             if submitted == 0 {
@@ -673,7 +687,7 @@ impl RobinHoodTable {
                     )
                 }
                 .user_data(u64::MAX);
-                flush_if_full(ring, sqe, &mut write_count)?;
+                flush_if_full(ring, self.apply_fd_flags(sqe), &mut write_count)?;
             }
 
             if write_count > 0 {
@@ -773,7 +787,10 @@ impl RobinHoodTable {
                     )
                 }
                 .user_data(u64::try_from(i).expect("index fits u64"));
-                flush_if_full(ring, self.apply_fd_flags(sqe), &mut submitted)?;
+                if !self.try_push_read(ring, sqe)? {
+                    break;
+                }
+                submitted += 1;
             }
 
             if submitted == 0 {
@@ -782,7 +799,6 @@ impl RobinHoodTable {
 
             ring.submit_and_wait(submitted).map_err(uring_err)?;
 
-            let mut need_reprobe = false;
             while let Some(cqe) = ring.complete() {
                 let i = usize::try_from(cqe.user_data()).expect("user_data index fits usize");
                 if i >= n {
@@ -810,11 +826,6 @@ impl RobinHoodTable {
                 }
                 dists[i] += 1;
                 slots[i] = (slots[i] + 1) & self.mask;
-                need_reprobe = true;
-            }
-
-            if !need_reprobe {
-                break;
             }
         }
 
@@ -870,7 +881,6 @@ impl RobinHoodTable {
         arena.resize(needed, 0);
 
         loop {
-            // Submit reads for all unresolved outpoints.
             let mut submitted = 0u32;
             for i in 0..n {
                 if resolved[i] {
@@ -887,7 +897,10 @@ impl RobinHoodTable {
                     )
                 }
                 .user_data(u64::try_from(i).expect("index fits u64"));
-                flush_if_full(ring, self.apply_fd_flags(sqe), &mut submitted)?;
+                if !self.try_push_read(ring, sqe)? {
+                    break;
+                }
+                submitted += 1;
             }
 
             if submitted == 0 {
@@ -896,8 +909,6 @@ impl RobinHoodTable {
 
             ring.submit_and_wait(submitted).map_err(uring_err)?;
 
-            // Process completions.
-            let mut need_reprobe = false;
             while let Some(cqe) = ring.complete() {
                 let i = usize::try_from(cqe.user_data()).expect("user_data index fits usize");
                 if i >= n {
@@ -928,14 +939,8 @@ impl RobinHoodTable {
                     continue;
                 }
 
-                // Probe miss — advance to next slot for next round.
                 dists[i] += 1;
                 slots[i] = (slots[i] + 1) & self.mask;
-                need_reprobe = true;
-            }
-
-            if !need_reprobe {
-                break;
             }
         }
 
@@ -2214,6 +2219,74 @@ mod tests {
     }
 
     #[test]
+    fn engine_keeps_every_unspent_coin_across_many_synced_flushes() {
+        let dir = TmpFile::new("many-flushes");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let mut eng = RobinHoodEngine::open(dir.path()).unwrap();
+        let mut live: Vec<OutPoint> = Vec::new();
+        let mut spent_total = 0usize;
+        let mut prev_hash = Hash256::ZERO;
+
+        for h in 1..=6_000u32 {
+            let created: Vec<mantle_consensus::chain_view::NewCoin<'_>> = (0..4u32)
+                .map(|vout| mantle_consensus::chain_view::NewCoin {
+                    outpoint: OutPoint {
+                        txid: Hash256::hash(&h.to_le_bytes()),
+                        vout,
+                    },
+                    value: Satoshi::new(u64::from(h)),
+                    script_pubkey: &[0x51],
+                    coinbase: vout == 0,
+                    height: BlockHeight::new(h),
+                })
+                .collect();
+            let spent: Vec<OutPoint> = if h % 3 == 0 && live.len() > 8 {
+                let picks = [live.len() / 3, live.len() / 2, live.len() - 1];
+                let mut out: Vec<OutPoint> = picks.iter().map(|&i| live[i]).collect();
+                out.dedup();
+                live.retain(|op| !out.contains(op));
+                out
+            } else {
+                Vec::new()
+            };
+            spent_total += spent.len();
+            live.extend(created.iter().map(|c| c.outpoint));
+
+            let durability = if h % 500 == 0 {
+                Durability::Synced
+            } else {
+                Durability::Memory
+            };
+            let mut hash_bytes = [0u8; 32];
+            hash_bytes[..4].copy_from_slice(&(h + 1_000_000).to_le_bytes());
+            let block_hash = Hash256::from_bytes(hash_bytes);
+            let mut header = make_header(h);
+            header.set_prev_block(prev_hash);
+            eng.write_block(&CommitBlockReq {
+                token: crate::types::ReqToken(u64::from(h)),
+                height: BlockHeight::new(h),
+                hash: block_hash,
+                prev_hash,
+                header,
+                created: &created,
+                spent: &spent,
+                block_bytes: None,
+                durability,
+            })
+            .unwrap();
+            eng.flush(durability).unwrap();
+            prev_hash = block_hash;
+        }
+
+        assert!(spent_total > 1_000);
+        let mut out = Vec::new();
+        eng.read_coins(&live, &mut out).unwrap();
+        let missing: Vec<_> = out.iter().filter(|r| r.coin.is_none()).collect();
+        assert!(missing.is_empty(), "{} of {} live coins lost", missing.len(), live.len());
+        assert_eq!(eng.table.len(), u64::try_from(live.len()).unwrap());
+    }
+
+    #[test]
     fn flush_then_lookup_via_engine() {
         let dir = TmpFile::new("flush-lookup");
         std::fs::create_dir_all(dir.path()).unwrap();
@@ -2778,6 +2851,86 @@ mod tests {
             }
         }
         assert_eq!(table.len(), 25);
+    }
+
+    #[test]
+    fn batch_insert_writes_through_a_registered_fd_without_a_resize() {
+        let tmp = TmpFile::new("uring-batch-registered");
+        let mut table = RobinHoodTable::open_with_capacity(tmp.path(), 1024).unwrap();
+        let mut ring = crate::engine::ring_budget::RingBudget::new(256, 16).build().unwrap();
+        ring.register_files(&[table.fd().as_i32()]).unwrap();
+        table.set_fixed_fd(ququmatz::types::RawFd::from_raw(0));
+        let mut arena = Vec::new();
+        let mut write_arena = Vec::new();
+        let mut states = Vec::new();
+
+        let pairs: Vec<(OutPoint, Coin)> = (0..100u32)
+            .map(|i| (colliding_op(i), make_coin(u64::from(i) + 1, &[0x51])))
+            .collect();
+        table
+            .insert_batch_uring(&pairs, &mut ring, &mut arena, &mut write_arena, &mut states)
+            .unwrap();
+
+        for (op, coin) in &pairs {
+            assert_eq!(
+                table.get(op).unwrap().map(|c| c.value),
+                Some(coin.value),
+                "registered-fd batch insert lost {op:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn batches_larger_than_the_ring_lose_no_lookups_inserts_or_removes() {
+        let tmp = TmpFile::new("uring-small-ring");
+        let mut table = RobinHoodTable::open_with_capacity(tmp.path(), 1024).unwrap();
+        let mut ring = crate::engine::ring_budget::RingBudget::new(16, 16).build().unwrap();
+        let (mut arena, mut write_arena, mut states) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut slots, mut dists, mut resolved) = (Vec::new(), Vec::new(), Vec::new());
+
+        let pairs: Vec<(OutPoint, Coin)> = (0..300u32)
+            .map(|i| (colliding_op(i), make_coin(u64::from(i) + 1, &[0x51])))
+            .collect();
+        table
+            .insert_batch_uring(&pairs, &mut ring, &mut arena, &mut write_arena, &mut states)
+            .unwrap();
+        assert_eq!(table.len(), 300);
+
+        let ops: Vec<OutPoint> = pairs.iter().map(|(op, _)| *op).collect();
+        let mut found = Vec::new();
+        table
+            .get_batch_uring(&ops, &mut found, &mut ring, &mut arena, &mut slots, &mut dists, &mut resolved)
+            .unwrap();
+        let missing = found.iter().filter(|c| c.is_none()).count();
+        assert_eq!(missing, 0, "batched lookup lost {missing} of 300");
+
+        let removed: Vec<OutPoint> = ops.iter().step_by(2).copied().collect();
+        table
+            .remove_batch_uring(&removed, &mut ring, &mut arena, &mut slots, &mut dists, &mut resolved)
+            .unwrap();
+        assert_eq!(table.len(), 150, "batched remove missed entries");
+    }
+
+    #[test]
+    fn batch_insert_grows_the_table_enough_for_a_large_batch() {
+        let tmp = TmpFile::new("uring-batch-large");
+        let mut table = RobinHoodTable::open_with_capacity(tmp.path(), 64).unwrap();
+        let mut ring = crate::engine::ring_budget::RingBudget::new(256, 16).build().unwrap();
+        let mut arena = Vec::new();
+        let mut write_arena = Vec::new();
+        let mut states = Vec::new();
+
+        let pairs: Vec<(OutPoint, Coin)> = (0..1_000u32)
+            .map(|i| (colliding_op(i), make_coin(u64::from(i) + 1, &[0x51])))
+            .collect();
+        table
+            .insert_batch_uring(&pairs, &mut ring, &mut arena, &mut write_arena, &mut states)
+            .unwrap();
+
+        assert!(table.len() * LOAD_FACTOR_DEN <= table.slot_count * LOAD_FACTOR_NUM);
+        for (op, coin) in &pairs {
+            assert_eq!(table.get(op).unwrap().map(|c| c.value), Some(coin.value));
+        }
     }
 
     #[test]
