@@ -14,4 +14,4 @@ ripemd = { workspace = true }
 k256 = { workspace = true, features = ["ecdsa", "schnorr"] }
 
 [dev-dependencies]
-k256 = { workspace = true, features = ["ecdsa", "arithmetic"] }
+k256 = { workspace = true, features = ["ecdsa", "schnorr", "arithmetic"] }

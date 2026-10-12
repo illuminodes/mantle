@@ -8,7 +8,7 @@ use arbitrary::{Arbitrary, Unstructured};
 use mantle::codec::{Decode, Encode};
 use mantle::primitives::{Hash256, Satoshi, Transaction, TxOut};
 use mantle_conformance::conformance;
-use mantle_consensus::script::{ScriptFlags, verify_script};
+use mantle_consensus::script::{ScriptFlags, ScriptVerifier, SpentOutputs};
 use std::io::Cursor;
 
 /// Mask to the flag bits we currently assert parity on.
@@ -115,6 +115,21 @@ pub fn run_differential(input: &FuzzInput) {
         None
     };
 
+    let mantle_amounts: Vec<Satoshi> = input
+        .spent_outputs
+        .iter()
+        .take(tx.inputs.len())
+        .map(|s| Satoshi::new(s.amount))
+        .collect();
+    let mantle_spks: Vec<&[u8]> = input
+        .spent_outputs
+        .iter()
+        .take(tx.inputs.len())
+        .map(|s| s.script_pubkey.as_slice())
+        .collect();
+    let mantle_spent = spent_outputs_arg
+        .and_then(|_| SpentOutputs::new(&mantle_amounts, &mantle_spks));
+
     for (i, spent) in input.spent_outputs.iter().enumerate().take(tx.inputs.len()) {
         // Exercise TxOut codec on each spent output.
         let txout = TxOut {
@@ -139,14 +154,12 @@ pub fn run_differential(input: &FuzzInput) {
             flags,
         );
 
-        let mantle = verify_script(
-            tx.inputs[i].script_sig.as_slice(),
-            &spent.script_pubkey,
-            &tx,
-            i,
-            Satoshi::new(spent.amount),
-            mantle_flags,
-        );
+        let mut verifier =
+            ScriptVerifier::new(&tx, i, Satoshi::new(spent.amount), mantle_flags);
+        if let Some(table) = mantle_spent {
+            verifier = verifier.with_spent_outputs(table);
+        }
+        let mantle = verifier.verify(tx.inputs[i].script_sig.as_slice(), &spent.script_pubkey);
 
         assert_eq!(
             oracle.is_ok(),

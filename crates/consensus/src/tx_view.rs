@@ -137,6 +137,13 @@ pub trait TxView {
     /// cannot fail).
     fn compute_txid(&self, scratch: &mut Vec<u8>) -> std::io::Result<Hash256>;
 
+    /// Compute the wtxid (`SHA256d` of the full BIP144 serialisation,
+    /// including witness data). Equals the txid for non-segwit transactions.
+    ///
+    /// # Errors
+    /// Propagates encoding errors (none in practice).
+    fn compute_wtxid(&self, scratch: &mut Vec<u8>) -> std::io::Result<Hash256>;
+
     /// Materialise into an owned `Transaction`.
     ///
     /// Required by the legacy sighash path, which builds a *modified* tx
@@ -276,6 +283,14 @@ impl TxView for Transaction {
     fn compute_txid(&self, scratch: &mut Vec<u8>) -> std::io::Result<Hash256> {
         use mantle::primitives::TxHash;
         Ok(TxHash::txid_into(self, scratch)?)
+    }
+
+    fn compute_wtxid(&self, scratch: &mut Vec<u8>) -> std::io::Result<Hash256> {
+        use mantle::codec::Encode;
+        use mantle::hash::ByteSliceExt;
+        scratch.clear();
+        self.encode(scratch)?;
+        Ok(scratch.sha256d())
     }
 
     fn to_owned_tx(&self) -> std::io::Result<Transaction> {
@@ -444,6 +459,11 @@ where
         // non_witness_raw directly; we still take it for trait uniformity.
         use mantle::primitives::TxHash;
         Ok(TxHash::txid_into(self, scratch)?)
+    }
+
+    fn compute_wtxid(&self, _scratch: &mut Vec<u8>) -> std::io::Result<Hash256> {
+        use mantle::hash::ByteSliceExt;
+        Ok(self.raw.sha256d())
     }
 
     fn to_owned_tx(&self) -> std::io::Result<Transaction> {

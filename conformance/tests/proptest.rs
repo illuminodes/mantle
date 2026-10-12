@@ -218,9 +218,8 @@ proptest! {
 // ── ScriptExecutionCache: cached == uncached verdict ─────────────────────────
 
 proptest! {
-    /// Any input that produces a verdict on the cold path must produce the
-    /// same verdict when retrieved from the cache on the second call.
-    /// This is the M5 cache-correctness gate.
+    /// The cached verifier must agree with the uncached one on every call,
+    /// cold or warm, and a warm success must come from the cache.
     #[test]
     fn exec_cache_same_verdict_cold_vs_hot(
         script_sig  in prop::collection::vec(any::<u8>(), 0..=32_usize),
@@ -228,7 +227,8 @@ proptest! {
         amount      in any::<u64>(),
     ) {
         use mantle::primitives::{Hash256, OutPoint, Satoshi, TxIn, TxOut, Witness};
-        use mantle_consensus::script::{ScriptExecutionCache, ScriptFlags, verify_script_cached};
+        use mantle_consensus::script::{ScriptExecutionCache, ScriptFlags, ScriptVerifier, verify_script};
+        use mantle_consensus::tx_view::TxView;
 
         let flags = ScriptFlags::NONE;
         let amount = Satoshi::new(amount);
@@ -247,14 +247,16 @@ proptest! {
             locktime: Locktime::new(0),
         };
 
+        let wtxid = tx.compute_wtxid(&mut Vec::new()).expect("wtxid");
+        let verifier = ScriptVerifier::new(&tx, 0, amount, flags);
+        let reference = verify_script(&script_sig, &script_pubkey, &tx, 0, amount, flags);
+
         let mut cache = ScriptExecutionCache::new(64);
-        let cold = verify_script_cached(&script_sig, &script_pubkey, &tx, 0, amount, flags, &mut cache);
-        let hot  = verify_script_cached(&script_sig, &script_pubkey, &tx, 0, amount, flags, &mut cache);
-        prop_assert_eq!(
-            cold.is_ok(), hot.is_ok(),
-            "cache returned different verdict: cold={:?} hot={:?}", cold, hot
-        );
-        prop_assert_eq!(cache.hits(), 1, "second call must be a cache hit");
+        let cold = verifier.verify_cached(&script_sig, &script_pubkey, &wtxid, &mut cache);
+        let hot  = verifier.verify_cached(&script_sig, &script_pubkey, &wtxid, &mut cache);
+        prop_assert_eq!(&cold, &reference);
+        prop_assert_eq!(&hot, &reference);
+        prop_assert_eq!(cache.hits(), u64::from(reference.is_ok()));
     }
 }
 

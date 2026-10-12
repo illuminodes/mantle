@@ -7,10 +7,13 @@
 //!   Keyed on a 32-byte `SHA256d` digest so the map key is constant-size and
 //!   cryptographically uniform — appropriate for [`PrehashedMap`].
 //!
-//! - [`ScriptExecutionCache`]: remembers whether a complete
-//!   `(script_sig, script_pubkey, witness, amount, flags)` tuple verified.
-//!   Populated by [`verify_script_cached`] after a cold-path verification.
-//!   A cache hit short-circuits the entire interpreter.
+//! - [`ScriptExecutionCache`]: remembers which transaction inputs already
+//!   verified, keyed on `(wtxid, input index, spent output, flags)`.
+//!   Populated by [`ScriptVerifier::verify_cached`] after a successful
+//!   cold-path verification. A hit short-circuits the entire interpreter.
+//!   Only successes are stored, so a rejection always reports its real error.
+//!
+//! [`ScriptVerifier::verify_cached`]: super::ScriptVerifier::verify_cached
 //!
 //! ## Key construction
 //!
@@ -135,12 +138,12 @@ impl SignatureCache {
 
 // ── ScriptExecutionCache ───────────────────────────────────────────────────────
 
-/// Remembers the verdict for a complete script-verification input tuple.
+/// Remembers which transaction inputs have already passed script verification.
 ///
-/// The key is `SHA256d(script_sig || script_pubkey || witness_items_flat ||
-/// amount_le8 || flags_le4)`. Every field that affects the verdict is
-/// included; omitting any one would allow a different script to produce a
-/// false cache hit.
+/// The key is `SHA256d(wtxid || n_in || amount || len(spk) || spk || flags)`.
+/// The wtxid commits to every scriptSig, witness and the whole transaction
+/// body that legacy, BIP143 and BIP341 sighashes sign over; the index selects
+/// the input; the spent output and flags cover the remaining verdict inputs.
 pub struct ScriptExecutionCache {
     map: PrehashedMap<[u8; 32], bool>,
     order: VecDeque<[u8; 32]>,
@@ -172,24 +175,22 @@ impl ScriptExecutionCache {
         Self::new(DEFAULT_EXEC_CACHE_ENTRIES)
     }
 
-    /// Build the 32-byte cache key.
+    /// Build the 32-byte cache key for input `n_in` of the transaction with
+    /// the given `wtxid`.
     #[must_use]
     pub fn key(
-        script_sig: &[u8],
+        wtxid: &Hash256,
+        n_in: usize,
         script_pubkey: &[u8],
-        witness_items: &[Vec<u8>],
         amount_sats: u64,
         flags_bits: u32,
     ) -> [u8; 32] {
-        let witness_total: usize = witness_items.iter().map(Vec::len).sum();
-        let mut preimage =
-            Vec::with_capacity(script_sig.len() + script_pubkey.len() + witness_total + 12);
-        preimage.extend_from_slice(script_sig);
-        preimage.extend_from_slice(script_pubkey);
-        for item in witness_items {
-            preimage.extend_from_slice(item);
-        }
+        let mut preimage = Vec::with_capacity(32 + 8 + 8 + 8 + script_pubkey.len() + 4);
+        preimage.extend_from_slice(wtxid.as_bytes());
+        preimage.extend_from_slice(&(n_in as u64).to_le_bytes());
         preimage.extend_from_slice(&amount_sats.to_le_bytes());
+        preimage.extend_from_slice(&(script_pubkey.len() as u64).to_le_bytes());
+        preimage.extend_from_slice(script_pubkey);
         preimage.extend_from_slice(&flags_bits.to_le_bytes());
         *Hash256::hash(&preimage).as_bytes()
     }
@@ -295,10 +296,14 @@ mod tests {
 
     // ── ScriptExecutionCache ──────────────────────────────────────────────────
 
+    fn wtxid(b: u8) -> Hash256 {
+        Hash256::from_bytes([b; 32])
+    }
+
     #[test]
     fn exec_cache_miss_then_hit() {
         let mut cache = ScriptExecutionCache::new(16);
-        let key = ScriptExecutionCache::key(&[0x51], &[0xac], &[], 1000, 0);
+        let key = ScriptExecutionCache::key(&wtxid(1), 0, &[0xac], 1000, 0);
         assert_eq!(cache.get(&key), None);
         cache.insert(key, true);
         assert_eq!(cache.get(&key), Some(true));
@@ -309,9 +314,9 @@ mod tests {
     #[test]
     fn exec_cache_evicts_at_capacity() {
         let mut cache = ScriptExecutionCache::new(2);
-        let k1 = ScriptExecutionCache::key(&[1], &[1], &[], 100, 0);
-        let k2 = ScriptExecutionCache::key(&[2], &[2], &[], 100, 0);
-        let k3 = ScriptExecutionCache::key(&[3], &[3], &[], 100, 0);
+        let k1 = ScriptExecutionCache::key(&wtxid(1), 0, &[1], 100, 0);
+        let k2 = ScriptExecutionCache::key(&wtxid(2), 0, &[2], 100, 0);
+        let k3 = ScriptExecutionCache::key(&wtxid(3), 0, &[3], 100, 0);
         cache.insert(k1, true);
         cache.insert(k2, true);
         cache.insert(k3, true); // evicts k1
@@ -321,22 +326,36 @@ mod tests {
 
     #[test]
     fn exec_cache_flags_affect_key() {
-        let k1 = ScriptExecutionCache::key(&[], &[], &[], 0, 0b0001);
-        let k2 = ScriptExecutionCache::key(&[], &[], &[], 0, 0b0010);
+        let k1 = ScriptExecutionCache::key(&wtxid(0), 0, &[], 0, 0b0001);
+        let k2 = ScriptExecutionCache::key(&wtxid(0), 0, &[], 0, 0b0010);
         assert_ne!(k1, k2);
     }
 
     #[test]
     fn exec_cache_amount_affects_key() {
-        let k1 = ScriptExecutionCache::key(&[], &[], &[], 1000, 0);
-        let k2 = ScriptExecutionCache::key(&[], &[], &[], 2000, 0);
+        let k1 = ScriptExecutionCache::key(&wtxid(0), 0, &[], 1000, 0);
+        let k2 = ScriptExecutionCache::key(&wtxid(0), 0, &[], 2000, 0);
         assert_ne!(k1, k2);
     }
 
     #[test]
-    fn exec_cache_witness_affects_key() {
-        let k1 = ScriptExecutionCache::key(&[], &[], &[vec![0x01]], 0, 0);
-        let k2 = ScriptExecutionCache::key(&[], &[], &[vec![0x02]], 0, 0);
+    fn exec_cache_wtxid_affects_key() {
+        let k1 = ScriptExecutionCache::key(&wtxid(1), 0, &[0x51], 0, 0);
+        let k2 = ScriptExecutionCache::key(&wtxid(2), 0, &[0x51], 0, 0);
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn exec_cache_input_index_affects_key() {
+        let k1 = ScriptExecutionCache::key(&wtxid(1), 0, &[0x51], 0, 0);
+        let k2 = ScriptExecutionCache::key(&wtxid(1), 1, &[0x51], 0, 0);
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn exec_cache_spk_length_is_unambiguous() {
+        let k1 = ScriptExecutionCache::key(&wtxid(1), 0, &[0x00, 0x00], 0, 0);
+        let k2 = ScriptExecutionCache::key(&wtxid(1), 0, &[0x00], 0, 0);
         assert_ne!(k1, k2);
     }
 }

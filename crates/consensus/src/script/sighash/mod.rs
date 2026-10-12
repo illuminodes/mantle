@@ -937,7 +937,6 @@ impl TapHasher {
     /// Returns `None` if `internal_key` is not a valid secp256k1 x-only point.
     #[must_use]
     pub fn tweak_output_key(internal_key: &[u8; 32], merkle_root: &[u8]) -> Option<[u8; 32]> {
-        use k256::elliptic_curve::Group;
         use k256::elliptic_curve::bigint::Encoding;
         use k256::elliptic_curve::ops::Reduce;
         use k256::elliptic_curve::point::AffineCoordinates;

@@ -1241,7 +1241,7 @@ fn connect_bip30_non_coinbase_coin_is_not_a_violation() {
 
 /// When exec_cache is Some and script verification fails (cold miss),
 /// the error propagates as ScriptVerifyFailed. This covers the
-/// `verify_script_cached` branch inside connect_block for a failing input.
+/// `ScriptVerifier::verify_cached` branch inside `connect_block` for a failing input.
 #[test]
 fn connect_exec_cache_script_failure_propagates() {
     let (mut view, _, _) = connect_setup(200);

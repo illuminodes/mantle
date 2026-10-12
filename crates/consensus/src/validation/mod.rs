@@ -2,6 +2,7 @@ mod clock;
 mod connect;
 mod pow;
 mod structure;
+mod tx_script_context;
 
 // ── Re-exports (preserve the public API of the old validation.rs) ─────────────
 
@@ -112,3 +113,5 @@ pub fn validate_block_context_with_clock(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_script_cache;

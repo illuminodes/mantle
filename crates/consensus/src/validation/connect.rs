@@ -2,8 +2,8 @@ use mantle::primitives::{BlockHeight, Hash256, OutPoint, Satoshi};
 
 use crate::chain_view::{ChainView, ConnectResult, ConnectScratch, NewCoin};
 use crate::error::ValidationError;
-use crate::script::sighash::Bip143Cache;
-use crate::script::{ScriptExecutionCache, ScriptFlags, ScriptVerifier, verify_script_cached};
+use super::tx_script_context::TxScriptContext;
+use crate::script::{ScriptExecutionCache, ScriptFlags};
 use crate::tx_view::{BlockView, InputView, OutputView, TxView};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -173,12 +173,16 @@ where
         view.get_coins_into(outpoints_scratch, &mut coins_scratch)?;
         let coins = &coins_scratch;
 
-        // Built once per-tx only when scripts run without an exec_cache.
-        // Under skip_script or when exec_cache is present, never allocated.
-        let bip143_cache: Option<Bip143Cache> = if !skip_script && exec_cache.is_none() {
-            Some(Bip143Cache::new(tx))
-        } else {
+        let script_ctx = if skip_script {
             None
+        } else {
+            Some(TxScriptContext::new(
+                tx,
+                coins,
+                script_flags,
+                exec_cache.is_some(),
+                scratch,
+            )?)
         };
 
         let mut input_total = Satoshi::ZERO;
@@ -202,29 +206,15 @@ where
             // Script verification: fourth per-input check, after coin lookup,
             // before fee math. Skipped entirely under assumevalid (`skip_script`).
             // When a cache is provided, probes it before running the interpreter.
-            if !skip_script {
-                let script_result = if let Some(ref mut cache) = exec_cache {
-                    verify_script_cached(
-                        input.script_sig(),
-                        coin.script_pubkey.as_slice(),
-                        tx,
-                        input_index,
-                        coin.value,
-                        script_flags,
-                        cache,
-                    )
-                } else {
-                    ScriptVerifier::with_cache(
-                        tx,
-                        input_index,
-                        coin.value,
-                        script_flags,
-                        #[allow(clippy::clone_on_ref_ptr)]
-                        bip143_cache.clone().unwrap_or_else(|| unreachable!()),
-                    )
-                    .verify(input.script_sig(), coin.script_pubkey.as_slice())
-                };
-                script_result.map_err(|kind| ValidationError::ScriptVerifyFailed {
+            if let Some(ctx) = &script_ctx {
+                ctx.verify_input(
+                    tx,
+                    input_index,
+                    input.script_sig(),
+                    coin,
+                    exec_cache.as_deref_mut(),
+                )
+                .map_err(|kind| ValidationError::ScriptVerifyFailed {
                     tx_index,
                     input_index,
                     kind,

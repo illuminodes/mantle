@@ -15,8 +15,9 @@
 //!    - P2WSH (`OP_0 <32 bytes>`): hash-check the witness script, then eval it.
 //! 7. Optional `CLEANSTACK` check — exactly one item must remain.
 
-use mantle::primitives::Satoshi;
+use mantle::primitives::{Hash256, Satoshi};
 
+use super::cache::ScriptExecutionCache;
 use super::checker::{SignatureChecker, TxSigChecker};
 use super::consensus_crypto::{Ecdsa, Schnorr};
 use super::error::ScriptError;
@@ -192,6 +193,39 @@ impl<'a, T: TxView> ScriptVerifier<'a, T> {
         result
     }
 
+    /// [`verify`] behind a [`ScriptExecutionCache`].
+    ///
+    /// `wtxid` must be the witness txid of the transaction this verifier was
+    /// built for. A cached success returns `Ok(())` without running the
+    /// interpreter; failures are never cached, so a rejection always carries
+    /// the interpreter's real error.
+    ///
+    /// # Errors
+    /// Same as [`verify`].
+    ///
+    /// [`verify`]: ScriptVerifier::verify
+    pub fn verify_cached(
+        &self,
+        script_sig: &[u8],
+        script_pubkey: &[u8],
+        wtxid: &Hash256,
+        cache: &mut ScriptExecutionCache,
+    ) -> Result<(), ScriptError> {
+        let key = ScriptExecutionCache::key(
+            wtxid,
+            self.n_in,
+            script_pubkey,
+            self.amount.to_u64(),
+            self.flags.bits(),
+        );
+        if cache.get(&key) == Some(true) {
+            return Ok(());
+        }
+        self.verify(script_sig, script_pubkey)?;
+        cache.insert(key, true);
+        Ok(())
+    }
+
     /// Zero-allocation variant of [`verify`].
     ///
     /// The caller passes two pre-allocated, empty `Vec` buffers (for the main
@@ -272,49 +306,6 @@ pub fn verify_script_with_spent_outputs<T: TxView>(
     ScriptVerifier::new(tx, n_in, amount, flags)
         .with_spent_outputs(spent_outputs)
         .verify(script_sig, script_pubkey)
-}
-
-/// Cached variant of [`verify_script`].
-///
-/// Probes `cache` with a key derived from `(script_sig, script_pubkey,
-/// witness, amount, flags)` before calling the interpreter. On a hit the
-/// stored verdict is returned immediately; on a miss the cold path runs and
-/// the verdict is stored for future calls.
-///
-/// Accepts/rejects map to `Ok(())`/`Err(ScriptError::EvalFalse)` for cached
-/// rejects (the exact error variant from a cold path is not stored — callers
-/// that need the specific error on rejection should use [`verify_script`]).
-///
-/// # Errors
-/// Same variants as [`verify_script`] on a cold miss. Cached rejects return
-/// [`ScriptError::EvalFalse`].
-pub fn verify_script_cached<T: TxView>(
-    script_sig: &[u8],
-    script_pubkey: &[u8],
-    tx: &T,
-    n_in: usize,
-    amount: Satoshi,
-    flags: ScriptFlags,
-    cache: &mut super::cache::ScriptExecutionCache,
-) -> Result<(), ScriptError> {
-    let witness_items = tx.input(n_in).witness().to_vec();
-    let key = super::cache::ScriptExecutionCache::key(
-        script_sig,
-        script_pubkey,
-        &witness_items,
-        amount.to_u64(),
-        flags.bits(),
-    );
-    if let Some(verdict) = cache.get(&key) {
-        return if verdict {
-            Ok(())
-        } else {
-            Err(ScriptError::EvalFalse)
-        };
-    }
-    let result = verify_script(script_sig, script_pubkey, tx, n_in, amount, flags);
-    cache.insert(key, result.is_ok());
-    result
 }
 
 #[allow(clippy::too_many_arguments)]
