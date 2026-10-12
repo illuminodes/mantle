@@ -10,16 +10,18 @@ pub enum FailureStage {
     Structure,
     Context,
     Connect,
+    UtxoHash,
 }
 
 impl FailureStage {
-    const ALL: [Self; 3] = [Self::Structure, Self::Context, Self::Connect];
+    const ALL: [Self; 4] = [Self::Structure, Self::Context, Self::Connect, Self::UtxoHash];
 
     const fn index(self) -> usize {
         match self {
             Self::Structure => 0,
             Self::Context => 1,
             Self::Connect => 2,
+            Self::UtxoHash => 3,
         }
     }
 
@@ -28,6 +30,7 @@ impl FailureStage {
             Self::Structure => "structure",
             Self::Context => "context",
             Self::Connect => "connect",
+            Self::UtxoHash => "utxo-hash",
         }
     }
 }

@@ -19,6 +19,14 @@ path = "src/discover_peers.rs"
 name = "rank-peers"
 path = "src/rank_peers.rs"
 
+[[bin]]
+name = "fetch-blocks"
+path = "src/fetch_blocks.rs"
+
+[lib]
+name = "mantle_replay"
+path = "src/lib.rs"
+
 [dependencies]
 mantle = { path = "../crates/mantle" }
 mantle-block-io = { path = "../crates/block-io" }
@@ -26,6 +34,7 @@ mantle-consensus = { path = "../crates/consensus" }
 mantle-fetcher = { path = "../crates/fetcher" }
 mantle-storage = { path = "../crates/storage" }
 mantle-transport = { path = "../crates/transport" }
+mantle-utxo-hash = { path = "../crates/utxo-hash" }
 mantle-validator = { path = "../crates/validator" }
 ququmatz.workspace = true
 quetzalcoatl.workspace = true

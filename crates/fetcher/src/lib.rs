@@ -453,13 +453,30 @@ where
         &mut self,
         headers: &[(BlockHeight, BlockHeader)],
     ) -> Result<(), FetchError> {
+        let wanted: Vec<(BlockHeight, Hash256)> =
+            headers.iter().map(|(h, hdr)| (*h, hdr.hash())).collect();
+        self.fetch_blocks_by_hash(&wanted)
+    }
+
+    /// Download the blocks with the given hashes, without syncing headers.
+    /// Each block is cached under the paired height, which is only used as
+    /// the cache key and is not checked against the chain.
+    ///
+    /// # Errors
+    /// Returns [`FetchError`] if no peers are configured, the peer pool is
+    /// exhausted, or no block arrives before the no-progress deadline. Blocks
+    /// that arrived before the error stay cached.
+    pub fn fetch_blocks_by_hash(
+        &mut self,
+        wanted: &[(BlockHeight, Hash256)],
+    ) -> Result<(), FetchError> {
         if self.peer_book.is_empty() {
             return Err(FetchError::NoPeers);
         }
-        let needed: Vec<(BlockHeight, Hash256)> = headers
+        let needed: Vec<(BlockHeight, Hash256)> = wanted
             .iter()
             .filter(|(h, _)| !self.file_io.has_block(*h))
-            .map(|(h, hdr)| (*h, hdr.hash()))
+            .copied()
             .collect();
         if needed.is_empty() {
             return Ok(());

@@ -19,11 +19,9 @@
 //! CLI: `mantle-replay [--data-dir DIR] [--network NAME] [--peer HOST:PORT]…
 //!                    [--skip-script] [--start-height N] [--stop-height N] [--help]`.
 
-mod failure_blocks;
 mod failures;
 mod report;
 
-use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -39,10 +37,12 @@ use mantle_validator::{
     ForcedCommit, HeaderSnapshot, PipelineError, PipelineOpts, PrefetchedView, ReplayBufs,
 };
 
-use crate::failure_blocks::FailureBlocks;
 use crate::failures::{FailureLog, FailureStage};
 use crate::report::Reporter;
 use mantle_fetcher::Fetcher;
+use mantle_replay::block_files::BlockFiles;
+use mantle_replay::peer_list::PeerList;
+use mantle_replay::utxo_hash_check::{UtxoHashReference, UtxoHashTracker, UtxoHashVerdict};
 
 struct ReplayCtx {
     storage: StorageHandle<'static>,
@@ -53,7 +53,8 @@ struct ReplayCtx {
     token: u64,
     forced: ForcedCommit,
     failures: Option<FailureLog>,
-    failure_blocks: Option<FailureBlocks>,
+    failure_blocks: Option<BlockFiles>,
+    utxo_hash: Option<UtxoHashTracker>,
 }
 
 /// Block at which `Durability::Synced` flushes everything to disk. Matches
@@ -68,7 +69,7 @@ struct Args {
     data_dir: PathBuf,
     block_cache_dir: Option<PathBuf>,
     network: Network,
-    extra_peers: Vec<SocketAddrV4>,
+    extra_peers: PeerList,
     skip_script: bool,
     download_only: bool,
     /// First height to validate. Defaults to `storage.tip().height + 1`.
@@ -87,9 +88,22 @@ struct VerifyOpts {
     ephemeral: bool,
     window: usize,
     progress_every: std::time::Duration,
+    utxo_hash_file: Option<PathBuf>,
+    utxo_hash_every: Option<u32>,
 }
 
 impl VerifyOpts {
+    fn utxo_hash_tracker(&self) -> Result<Option<UtxoHashTracker>, String> {
+        if self.utxo_hash_file.is_none() && self.utxo_hash_every.is_none() {
+            return Ok(None);
+        }
+        let reference = match &self.utxo_hash_file {
+            Some(path) => UtxoHashReference::load(path)?,
+            None => UtxoHashReference::default(),
+        };
+        Ok(Some(UtxoHashTracker::new(reference, self.utxo_hash_every)))
+    }
+
     fn failure_log(&self) -> Result<Option<FailureLog>, String> {
         if !self.keep_going {
             return Ok(None);
@@ -99,11 +113,11 @@ impl VerifyOpts {
             .map_err(|e| format!("create failures file: {e}"))
     }
 
-    fn failure_blocks(&self) -> Result<Option<FailureBlocks>, String> {
+    fn failure_blocks(&self) -> Result<Option<BlockFiles>, String> {
         self.failure_blocks_dir
             .clone()
             .map(|dir| {
-                FailureBlocks::new(dir.clone())
+                BlockFiles::new(dir.clone())
                     .map_err(|e| format!("create failure blocks dir {}: {e}", dir.display()))
             })
             .transpose()
@@ -168,6 +182,13 @@ Options:
     --progress-secs N     Seconds between replay progress lines (default: 2).
                           Raise it for long CI runs to stay under the job
                           log size limit.
+    --utxo-hash-file PATH Track the UTXO set MuHash and compare it at each
+                          height listed in PATH (`<height> <muhash>` lines,
+                          from `bitcoin-cli gettxoutsetinfo muhash <height>`).
+                          A mismatch is a consensus failure. Requires
+                          --start-height 1 (the hash starts from genesis).
+    --utxo-hash-every N   Track the UTXO set MuHash and print it every N
+                          blocks as a `UTXO HASH` line.
     --help                Print this message and exit.
 ";
 
@@ -176,7 +197,7 @@ fn parse_args() -> Result<Args, String> {
     let mut data_dir: Option<PathBuf> = None;
     let mut block_cache_dir: Option<PathBuf> = None;
     let mut network = Network::Mainnet;
-    let mut extra_peers: Vec<SocketAddrV4> = Vec::new();
+    let mut extra_peers = PeerList::new();
     let mut skip_script = false;
     let mut download_only = false;
     let mut start_height: Option<BlockHeight> = None;
@@ -188,6 +209,8 @@ fn parse_args() -> Result<Args, String> {
     let mut ephemeral = false;
     let mut window: Option<usize> = None;
     let mut progress_secs: u64 = 2;
+    let mut utxo_hash_file: Option<PathBuf> = None;
+    let mut utxo_hash_every: Option<u32> = None;
 
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -215,34 +238,12 @@ fn parse_args() -> Result<Args, String> {
             "--peer" => {
                 i += 1;
                 let v = raw.get(i).ok_or("--peer requires HOST:PORT")?;
-                let addr: SocketAddrV4 =
-                    v.parse().map_err(|e| format!("invalid --peer {v}: {e}"))?;
-                extra_peers.push(addr);
+                extra_peers.push_spec(v)?;
             }
             "--peer-file" => {
                 i += 1;
                 let v = raw.get(i).ok_or("--peer-file requires a path")?;
-                let body =
-                    std::fs::read_to_string(v).map_err(|e| format!("read --peer-file {v}: {e}"))?;
-                let mut added = 0usize;
-                for (lineno, line) in body.lines().enumerate() {
-                    let trimmed = line.split('#').next().unwrap_or("").trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    match trimmed.parse::<SocketAddrV4>() {
-                        Ok(addr) => {
-                            extra_peers.push(addr);
-                            added += 1;
-                        }
-                        Err(e) => {
-                            return Err(format!(
-                                "{v}:{}: invalid peer {trimmed:?}: {e}",
-                                lineno + 1
-                            ));
-                        }
-                    }
-                }
+                let added = extra_peers.extend_from_file(std::path::Path::new(v))?;
                 eprintln!("  loaded {added} peers from {v}");
             }
             "--locator-hash" => {
@@ -281,6 +282,22 @@ fn parse_args() -> Result<Args, String> {
                 progress_secs = v
                     .parse()
                     .map_err(|e| format!("invalid --progress-secs {v}: {e}"))?;
+            }
+            "--utxo-hash-file" => {
+                i += 1;
+                let v = raw.get(i).ok_or("--utxo-hash-file requires a path")?;
+                utxo_hash_file = Some(PathBuf::from(v));
+            }
+            "--utxo-hash-every" => {
+                i += 1;
+                let v = raw.get(i).ok_or("--utxo-hash-every requires N")?;
+                let n: u32 = v
+                    .parse()
+                    .map_err(|e| format!("invalid --utxo-hash-every {v}: {e}"))?;
+                if n == 0 {
+                    return Err("--utxo-hash-every must be at least 1".to_string());
+                }
+                utxo_hash_every = Some(n);
             }
             "--window" => {
                 i += 1;
@@ -336,6 +353,20 @@ fn parse_args() -> Result<Args, String> {
     if failures_file.is_some() && !keep_going {
         return Err("--failures-file requires --keep-going".to_string());
     }
+    let tracks_utxo_hash = utxo_hash_file.is_some() || utxo_hash_every.is_some();
+    if tracks_utxo_hash && download_only {
+        return Err("--utxo-hash-* needs a replay; drop --download-only".to_string());
+    }
+    if tracks_utxo_hash && start_height != Some(BlockHeight::new(1)) {
+        return Err(
+            "--utxo-hash-* hashes the UTXO set from genesis; pass --start-height 1 \
+             with an empty --data-dir"
+                .to_string(),
+        );
+    }
+    if tracks_utxo_hash && skip_script {
+        eprintln!("  note: --skip-script with --utxo-hash-* still compares UTXO sets");
+    }
 
     let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(format!("./data/{}", network.name())));
     if ephemeral
@@ -371,6 +402,8 @@ fn parse_args() -> Result<Args, String> {
             ephemeral,
             window,
             progress_every: std::time::Duration::from_secs(progress_secs),
+            utxo_hash_file,
+            utxo_hash_every,
         },
     })
 }
@@ -550,8 +583,7 @@ fn run(args: &Args) -> Result<u64, String> {
     // were unreliable in practice (stale entries that aggressively close on
     // version handshake, polluting the pool) — the curated lists from
     // `rank-peers` give us live peers without the seed-induced flakiness.
-    let peer_addrs: Vec<SocketAddrV4> = args.extra_peers.clone();
-    if peer_addrs.is_empty() {
+    if args.extra_peers.is_empty() {
         return Err(format!(
             "no peers: supply --peer HOST:PORT or --peer-file PATH (network={})",
             args.network.name()
@@ -563,7 +595,7 @@ fn run(args: &Args) -> Result<u64, String> {
         .unwrap_or(&args.data_dir);
     std::fs::create_dir_all(block_cache_dir)
         .map_err(|e| format!("create block cache dir {}: {e}", block_cache_dir.display()))?;
-    let mut fetcher = Fetcher::new(args.network, peer_addrs, block_cache_dir)
+    let mut fetcher = Fetcher::new(args.network, args.extra_peers.addrs().to_vec(), block_cache_dir)
         .map_err(|e| format!("fetcher init: {e}"))?;
 
     // ── Phase 1: sync all headers to tip ──────────────────────────────────
@@ -637,6 +669,7 @@ fn run(args: &Args) -> Result<u64, String> {
         forced: ForcedCommit::new(),
         failures: args.verify.failure_log()?,
         failure_blocks: args.verify.failure_blocks()?,
+        utxo_hash: args.verify.utxo_hash_tracker()?,
     };
 
     eprintln!(
@@ -751,13 +784,17 @@ impl ReplayCtx {
                 exec_cache: Some(&mut self.cache),
                 durability,
                 token,
+                utxo_hash: self.utxo_hash.as_mut().and_then(UtxoHashTracker::hash_mut),
             },
         );
         match connected {
-            Ok(_) => Ok(()),
+            Ok(_) => self.check_utxo_hash(height, hash),
             Err(PipelineError::Validation(e)) => {
                 self.save_failed_block(height, hash, fetcher, &mut saved);
                 self.fail(height, hash, FailureStage::Connect, &e)?;
+                if let Some(tracker) = &mut self.utxo_hash {
+                    tracker.stop(height);
+                }
                 self.force_commit(&block, height, durability, token)
             }
             Err(e @ PipelineError::Storage(_)) => {
@@ -784,7 +821,7 @@ impl ReplayCtx {
         }
         let written = fetcher
             .read_block_bytes(height)
-            .and_then(|bytes| blocks.save(height, hash, &bytes));
+            .and_then(|bytes| blocks.save(Some(height), hash, &bytes));
         match written {
             Ok(path) => eprintln!("  saved failing block to {}", path.display()),
             Err(e) => eprintln!(
@@ -823,7 +860,29 @@ impl ReplayCtx {
             .map_err(|e| format!("forced commit at {}: {e}", height.to_u32()))
     }
 
+    fn check_utxo_hash(&mut self, height: BlockHeight, hash: Hash256) -> Result<(), String> {
+        let Some(tracker) = &mut self.utxo_hash else {
+            return Ok(());
+        };
+        match tracker.after_block(height) {
+            UtxoHashVerdict::NotChecked => Ok(()),
+            UtxoHashVerdict::Match(muhash) => {
+                eprintln!("  utxo hash matches at height {}: {muhash}", height.to_u32());
+                Ok(())
+            }
+            UtxoHashVerdict::Mismatch { expected, actual } => self.fail(
+                height,
+                hash,
+                FailureStage::UtxoHash,
+                &format!("UTXO set MuHash {actual}, Bitcoin Core reports {expected}"),
+            ),
+        }
+    }
+
     fn summarize_failures(&self) -> u64 {
+        if let Some(tracker) = &self.utxo_hash {
+            tracker.print_summary();
+        }
         self.failures.as_ref().map_or(0, |log| {
             log.print_summary();
             log.total()
