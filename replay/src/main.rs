@@ -19,6 +19,8 @@
 //! CLI: `mantle-replay [--data-dir DIR] [--network NAME] [--peer HOST:PORT]…
 //!                    [--skip-script] [--start-height N] [--stop-height N] [--help]`.
 
+mod failure_blocks;
+mod failures;
 mod report;
 
 use std::net::SocketAddrV4;
@@ -32,8 +34,13 @@ use mantle_consensus::script::ScriptExecutionCache;
 use mantle_consensus::validation::{validate_block_context, validate_block_structure};
 use mantle_storage::StorageHandle;
 use mantle_storage::types::{Durability, ReqToken};
-use mantle_validator::{HeaderSnapshot, PipelineOpts, PrefetchedView, ReplayBufs};
+use mantle::primitives::Block;
+use mantle_validator::{
+    ForcedCommit, HeaderSnapshot, PipelineError, PipelineOpts, PrefetchedView, ReplayBufs,
+};
 
+use crate::failure_blocks::FailureBlocks;
+use crate::failures::{FailureLog, FailureStage};
 use crate::report::Reporter;
 use mantle_fetcher::Fetcher;
 
@@ -44,6 +51,9 @@ struct ReplayCtx {
     cache: ScriptExecutionCache,
     bufs: ReplayBufs,
     token: u64,
+    forced: ForcedCommit,
+    failures: Option<FailureLog>,
+    failure_blocks: Option<FailureBlocks>,
 }
 
 /// Block at which `Durability::Synced` flushes everything to disk. Matches
@@ -67,7 +77,49 @@ struct Args {
     /// reports as its current tip after a single `getheaders` page.
     stop_height: Option<BlockHeight>,
     locator_hash: Option<Hash256>,
+    verify: VerifyOpts,
 }
+
+struct VerifyOpts {
+    keep_going: bool,
+    failures_file: Option<PathBuf>,
+    failure_blocks_dir: Option<PathBuf>,
+    ephemeral: bool,
+    window: usize,
+    progress_every: std::time::Duration,
+}
+
+impl VerifyOpts {
+    fn failure_log(&self) -> Result<Option<FailureLog>, String> {
+        if !self.keep_going {
+            return Ok(None);
+        }
+        FailureLog::new(self.failures_file.as_deref())
+            .map(Some)
+            .map_err(|e| format!("create failures file: {e}"))
+    }
+
+    fn failure_blocks(&self) -> Result<Option<FailureBlocks>, String> {
+        self.failure_blocks_dir
+            .clone()
+            .map(|dir| {
+                FailureBlocks::new(dir.clone())
+                    .map_err(|e| format!("create failure blocks dir {}: {e}", dir.display()))
+            })
+            .transpose()
+    }
+
+    fn mode_suffix(&self) -> &'static str {
+        match (self.keep_going, self.ephemeral) {
+            (true, true) => ", keep-going, ephemeral",
+            (true, false) => ", keep-going",
+            (false, true) => ", ephemeral",
+            (false, false) => "",
+        }
+    }
+}
+
+const DEFAULT_EPHEMERAL_WINDOW: usize = 1_000;
 
 const HELP: &str = "\
 mantle-replay — historical replay against a Bitcoin Core-compatible network
@@ -99,6 +151,23 @@ Options:
                           Default: peer tip from one getheaders call.
     --locator-hash HEX    Hash of the block immediately before START. Required
                           for historical download-only ranges.
+    --keep-going          Do not stop at a consensus failure. Print it as a
+                          `CONSENSUS FAILURE` line, apply the block's UTXO
+                          changes unvalidated, and continue. Exits 1 at the
+                          end if any failure was seen.
+    --failures-file PATH  Also append each failure to PATH as TSV.
+    --failure-blocks-dir DIR
+                          Save the raw bytes of every block that fails a
+                          consensus check to DIR/<height>-<hash>.block.
+                          Must be outside --data-dir with --ephemeral.
+    --ephemeral           Do not keep the chain: download blocks in windows,
+                          delete each window after validating it, and remove
+                          --data-dir on exit. Requires an empty --data-dir.
+    --window N            Blocks per download window (default: 1000 with
+                          --ephemeral, whole range otherwise).
+    --progress-secs N     Seconds between replay progress lines (default: 2).
+                          Raise it for long CI runs to stay under the job
+                          log size limit.
     --help                Print this message and exit.
 ";
 
@@ -113,6 +182,12 @@ fn parse_args() -> Result<Args, String> {
     let mut start_height: Option<BlockHeight> = None;
     let mut stop_height: Option<BlockHeight> = None;
     let mut locator_hash: Option<Hash256> = None;
+    let mut keep_going = false;
+    let mut failures_file: Option<PathBuf> = None;
+    let mut failure_blocks_dir: Option<PathBuf> = None;
+    let mut ephemeral = false;
+    let mut window: Option<usize> = None;
+    let mut progress_secs: u64 = 2;
 
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -184,6 +259,38 @@ fn parse_args() -> Result<Args, String> {
             "--download-only" => {
                 download_only = true;
             }
+            "--keep-going" => {
+                keep_going = true;
+            }
+            "--ephemeral" => {
+                ephemeral = true;
+            }
+            "--failures-file" => {
+                i += 1;
+                let v = raw.get(i).ok_or("--failures-file requires a path")?;
+                failures_file = Some(PathBuf::from(v));
+            }
+            "--failure-blocks-dir" => {
+                i += 1;
+                let v = raw.get(i).ok_or("--failure-blocks-dir requires a path")?;
+                failure_blocks_dir = Some(PathBuf::from(v));
+            }
+            "--progress-secs" => {
+                i += 1;
+                let v = raw.get(i).ok_or("--progress-secs requires N")?;
+                progress_secs = v
+                    .parse()
+                    .map_err(|e| format!("invalid --progress-secs {v}: {e}"))?;
+            }
+            "--window" => {
+                i += 1;
+                let v = raw.get(i).ok_or("--window requires N")?;
+                let n: usize = v.parse().map_err(|e| format!("invalid --window {v}: {e}"))?;
+                if n == 0 {
+                    return Err("--window must be at least 1".to_string());
+                }
+                window = Some(n);
+            }
             "--assume-valid" => {
                 return Err(
                     "--assume-valid is not implemented; use --skip-script to skip all scripts"
@@ -219,7 +326,33 @@ fn parse_args() -> Result<Args, String> {
         ));
     }
 
+    if ephemeral && download_only {
+        return Err("--ephemeral discards blocks, so it cannot be combined with --download-only"
+            .to_string());
+    }
+    if ephemeral && block_cache_dir.is_some() {
+        return Err("--ephemeral keeps blocks under --data-dir; drop --block-cache-dir".to_string());
+    }
+    if failures_file.is_some() && !keep_going {
+        return Err("--failures-file requires --keep-going".to_string());
+    }
+
     let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(format!("./data/{}", network.name())));
+    if ephemeral
+        && failure_blocks_dir
+            .as_deref()
+            .is_some_and(|d| d.starts_with(&data_dir))
+    {
+        return Err(
+            "--failure-blocks-dir must be outside --data-dir, which --ephemeral deletes"
+                .to_string(),
+        );
+    }
+    let window = window.unwrap_or(if ephemeral {
+        DEFAULT_EPHEMERAL_WINDOW
+    } else {
+        usize::MAX
+    });
 
     Ok(Args {
         data_dir,
@@ -231,16 +364,25 @@ fn parse_args() -> Result<Args, String> {
         start_height,
         stop_height,
         locator_hash,
+        verify: VerifyOpts {
+            keep_going,
+            failures_file,
+            failure_blocks_dir,
+            ephemeral,
+            window,
+            progress_every: std::time::Duration::from_secs(progress_secs),
+        },
     })
 }
 
 // ── header snapshot construction ─────────────────────────────────────────────
 
-/// Lookback applied to the snapshot when starting mid-chain. Big enough
-/// to cover BIP113 MTP (11 ancestors) and one retarget interval (2 016
-/// blocks back at retarget heights). Storage holds every committed
-/// header, so this is just a contiguous range read.
-const SNAPSHOT_LOOKBACK: u32 = 2_016;
+/// Lookback applied to the snapshot when starting mid-chain. BIP68
+/// time-based sequence locks need the median time past at the height of
+/// any spent coin, however old, so the snapshot carries the whole header
+/// chain back to genesis. Storage holds every committed header, so this is
+/// a contiguous range read.
+const SNAPSHOT_LOOKBACK: u32 = u32::MAX;
 
 /// Build a `HeaderSnapshot` for validating `[start..=stop]`. The snapshot
 /// must carry enough *prior* headers that
@@ -332,6 +474,16 @@ fn main() -> ExitCode {
         }
     };
 
+    if args.verify.ephemeral
+        && std::fs::read_dir(&args.data_dir).is_ok_and(|mut d| d.next().is_some())
+    {
+        eprintln!(
+            "error: --ephemeral needs an empty or missing --data-dir; {} has files",
+            args.data_dir.display()
+        );
+        return ExitCode::from(2);
+    }
+
     if let Err(e) = std::fs::create_dir_all(&args.data_dir) {
         eprintln!(
             "error: cannot create data dir {}: {e}",
@@ -340,8 +492,24 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    match run(&args) {
-        Ok(()) => ExitCode::SUCCESS,
+    let result = run(&args);
+
+    if args.verify.ephemeral {
+        match std::fs::remove_dir_all(&args.data_dir) {
+            Ok(()) => eprintln!("  removed ephemeral data dir {}", args.data_dir.display()),
+            Err(e) => eprintln!(
+                "  warning: could not remove ephemeral data dir {}: {e}",
+                args.data_dir.display()
+            ),
+        }
+    }
+
+    match result {
+        Ok(0) => ExitCode::SUCCESS,
+        Ok(failures) => {
+            eprintln!("finished with {failures} consensus failure(s)");
+            ExitCode::FAILURE
+        }
         Err(e) => {
             eprintln!("fatal: {e}");
             ExitCode::FAILURE
@@ -349,7 +517,8 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(args: &Args) -> Result<(), String> {
+#[allow(clippy::too_many_lines)]
+fn run(args: &Args) -> Result<u64, String> {
     eprintln!(
         "mantle-replay starting on {} (data-dir {})",
         args.network.name(),
@@ -429,7 +598,7 @@ fn run(args: &Args) -> Result<(), String> {
     if header_pairs.is_empty() {
         eprintln!("  no new headers from peers — already at tip");
         storage.shutdown().map_err(|e| format!("shutdown: {e}"))?;
-        return Ok(());
+        return Ok(0);
     }
 
     let actual_stop = header_pairs.last().unwrap().0;
@@ -440,22 +609,20 @@ fn run(args: &Args) -> Result<(), String> {
         actual_stop.to_u32(),
     );
 
-    // ── Phase 2: download all blocks ────────────────────────────────────
-    eprintln!("  downloading blocks…");
-    fetcher
-        .fetch_blocks(&header_pairs)
-        .map_err(|e| format!("fetch blocks: {e:?}"))?;
-
     if args.download_only {
+        eprintln!("  downloading blocks…");
+        fetcher
+            .fetch_blocks(&header_pairs)
+            .map_err(|e| format!("fetch blocks: {e:?}"))?;
         eprintln!(
             "download complete: cached blocks {}..={} (no replay performed)",
             start_height.to_u32(),
             actual_stop.to_u32(),
         );
-        return Ok(());
+        return Ok(0);
     }
 
-    // ── Phase 3: replay ─────────────────────────────────────────────────
+    // ── Phase 2: download + replay, one window at a time ───────────────
     let headers: Vec<BlockHeader> = header_pairs.iter().map(|(_, h)| *h).collect();
     let snapshot = build_snapshot(start_height, &headers, args.network, &mut storage)?;
 
@@ -467,76 +634,199 @@ fn run(args: &Args) -> Result<(), String> {
         cache: ScriptExecutionCache::new(SCRIPT_CACHE_ENTRIES),
         bufs: ReplayBufs::new(),
         token: u64::from(tip.height.to_u32()).saturating_add(1),
+        forced: ForcedCommit::new(),
+        failures: args.verify.failure_log()?,
+        failure_blocks: args.verify.failure_blocks()?,
     };
 
     eprintln!(
-        "  replaying {}..={} ({} script verification)…",
+        "  replaying {}..={} ({} script verification{})…",
         start_height.to_u32(),
         actual_stop.to_u32(),
         if args.skip_script { "skipping" } else { "with" },
+        args.verify.mode_suffix(),
     );
 
-    let mut reporter = Reporter::new(start_height, actual_stop);
-    let mut last_committed = tip.height;
-
-    for (height, header) in &header_pairs {
-        replay_one_block(*height, *header, &mut fetcher, &snapshot, &mut ctx)?;
-        last_committed = *height;
-        reporter.tick(*height);
-    }
+    let mut reporter = Reporter::new(start_height, actual_stop, args.verify.progress_every);
+    let last_committed = ctx.replay_range(
+        &header_pairs,
+        &args.verify,
+        &mut fetcher,
+        &snapshot,
+        &mut reporter,
+    )?;
     reporter.done(last_committed);
 
     eprintln!("IBD complete at height {}", last_committed.to_u32());
+    let failures = ctx.summarize_failures();
     ctx.storage
         .shutdown()
         .map_err(|e| format!("shutdown storage: {e}"))?;
-    Ok(())
+    Ok(failures)
 }
 
-fn replay_one_block<RReq, RResp>(
-    height: BlockHeight,
-    header: BlockHeader,
-    fetcher: &mut Fetcher<RReq, RResp>,
-    snapshot: &HeaderSnapshot,
-    ctx: &mut ReplayCtx,
-) -> Result<(), String>
-where
-    RReq: std::ops::Deref<Target = quetzalcoatl::mpsc::RingBuffer<mantle_block_io::FileReq>>,
-    RResp: std::ops::Deref<Target = quetzalcoatl::spsc::RingBuffer<mantle_block_io::FileResp>>,
-{
-    let block = fetcher
-        .read_block_decoded(height, header.hash())
-        .map_err(|e| format!("read block {}: {e}", height.to_u32()))?;
+impl ReplayCtx {
+    fn replay_range<RReq, RResp>(
+        &mut self,
+        header_pairs: &[(BlockHeight, BlockHeader)],
+        verify: &VerifyOpts,
+        fetcher: &mut Fetcher<RReq, RResp>,
+        snapshot: &HeaderSnapshot,
+        reporter: &mut Reporter,
+    ) -> Result<BlockHeight, String>
+    where
+        RReq: std::ops::Deref<Target = quetzalcoatl::mpsc::RingBuffer<mantle_block_io::FileReq>>,
+        RResp: std::ops::Deref<Target = quetzalcoatl::spsc::RingBuffer<mantle_block_io::FileResp>>,
+    {
+        let mut last_committed = self.storage.tip().height;
+        for window in header_pairs.chunks(verify.window) {
+            let (first, _) = window[0];
+            let (last, _) = window[window.len() - 1];
+            eprintln!(
+                "  downloading blocks {}..={}…",
+                first.to_u32(),
+                last.to_u32()
+            );
+            fetcher
+                .fetch_blocks(window)
+                .map_err(|e| format!("fetch blocks: {e:?}"))?;
+            for (height, header) in window {
+                self.replay_block(*height, *header, fetcher, snapshot)?;
+                last_committed = *height;
+                reporter.tick(*height);
+            }
+            if verify.ephemeral {
+                fetcher
+                    .discard_cached_blocks()
+                    .map_err(|e| format!("discard blocks: {e}"))?;
+            }
+        }
+        Ok(last_committed)
+    }
 
-    validate_block_structure(&block)
-        .map_err(|e| format!("structure check at {}: {e:?}", height.to_u32()))?;
+    fn replay_block<RReq, RResp>(
+        &mut self,
+        height: BlockHeight,
+        header: BlockHeader,
+        fetcher: &mut Fetcher<RReq, RResp>,
+        snapshot: &HeaderSnapshot,
+    ) -> Result<(), String>
+    where
+        RReq: std::ops::Deref<Target = quetzalcoatl::mpsc::RingBuffer<mantle_block_io::FileReq>>,
+        RResp: std::ops::Deref<Target = quetzalcoatl::spsc::RingBuffer<mantle_block_io::FileResp>>,
+    {
+        let hash = header.hash();
+        let block = fetcher
+            .read_block_decoded(height, hash)
+            .map_err(|e| format!("read block {}: {e}", height.to_u32()))?;
 
-    let empty_coins = PrehashedMap::with_hasher(BuildPrehashedHasher);
-    let context_view = PrefetchedView::new(&empty_coins, snapshot, ctx.storage.tip());
-    validate_block_context(&block, &context_view, ctx.allow_min_difficulty)
-        .map_err(|e| format!("context check at {}: {e:?}", height.to_u32()))?;
+        let mut saved = false;
+        if let Err(e) = validate_block_structure(&block) {
+            self.save_failed_block(height, hash, fetcher, &mut saved);
+            self.fail(height, hash, FailureStage::Structure, &e)?;
+        }
 
-    let durability = if height.to_u32().is_multiple_of(SYNC_EVERY) {
-        Durability::Synced
-    } else {
-        Durability::Memory
-    };
+        let empty_coins = PrehashedMap::with_hasher(BuildPrehashedHasher);
+        let context_view = PrefetchedView::new(&empty_coins, snapshot, self.storage.tip());
+        if let Err(e) = validate_block_context(&block, &context_view, self.allow_min_difficulty) {
+            self.save_failed_block(height, hash, fetcher, &mut saved);
+            self.fail(height, hash, FailureStage::Context, &e)?;
+        }
 
-    ctx.bufs
-        .validate_and_commit(
+        let durability = if height.to_u32().is_multiple_of(SYNC_EVERY) {
+            Durability::Synced
+        } else {
+            Durability::Memory
+        };
+        let token = ReqToken(self.token);
+        self.token = self.token.saturating_add(1);
+
+        let connected = self.bufs.validate_and_commit(
             &block,
             height,
-            &mut ctx.storage,
+            &mut self.storage,
             snapshot,
             PipelineOpts {
-                skip_script: ctx.skip_script,
-                exec_cache: Some(&mut ctx.cache),
+                skip_script: self.skip_script,
+                exec_cache: Some(&mut self.cache),
                 durability,
-                token: ReqToken(ctx.token),
+                token,
             },
-        )
-        .map_err(|e| format!("validate_and_commit at {}: {e}", height.to_u32()))?;
+        );
+        match connected {
+            Ok(_) => Ok(()),
+            Err(PipelineError::Validation(e)) => {
+                self.save_failed_block(height, hash, fetcher, &mut saved);
+                self.fail(height, hash, FailureStage::Connect, &e)?;
+                self.force_commit(&block, height, durability, token)
+            }
+            Err(e @ PipelineError::Storage(_)) => {
+                Err(format!("validate_and_commit at {}: {e}", height.to_u32()))
+            }
+        }
+    }
 
-    ctx.token = ctx.token.saturating_add(1);
-    Ok(())
+    fn save_failed_block<RReq, RResp>(
+        &self,
+        height: BlockHeight,
+        hash: Hash256,
+        fetcher: &mut Fetcher<RReq, RResp>,
+        saved: &mut bool,
+    ) where
+        RReq: std::ops::Deref<Target = quetzalcoatl::mpsc::RingBuffer<mantle_block_io::FileReq>>,
+        RResp: std::ops::Deref<Target = quetzalcoatl::spsc::RingBuffer<mantle_block_io::FileResp>>,
+    {
+        let Some(blocks) = &self.failure_blocks else {
+            return;
+        };
+        if std::mem::replace(saved, true) {
+            return;
+        }
+        let written = fetcher
+            .read_block_bytes(height)
+            .and_then(|bytes| blocks.save(height, hash, &bytes));
+        match written {
+            Ok(path) => eprintln!("  saved failing block to {}", path.display()),
+            Err(e) => eprintln!(
+                "  warning: could not save failing block {}: {e}",
+                height.to_u32()
+            ),
+        }
+    }
+
+    fn fail(
+        &mut self,
+        height: BlockHeight,
+        hash: Hash256,
+        stage: FailureStage,
+        error: &dyn std::fmt::Display,
+    ) -> Result<(), String> {
+        match &mut self.failures {
+            Some(log) => {
+                log.record(height, hash, stage, error);
+                Ok(())
+            }
+            None => Err(format!("{stage} check at {}: {error}", height.to_u32())),
+        }
+    }
+
+    fn force_commit(
+        &mut self,
+        block: &Block,
+        height: BlockHeight,
+        durability: Durability,
+        token: ReqToken,
+    ) -> Result<(), String> {
+        self.forced
+            .commit(block, height, &mut self.storage, durability, token)
+            .map(|_| ())
+            .map_err(|e| format!("forced commit at {}: {e}", height.to_u32()))
+    }
+
+    fn summarize_failures(&self) -> u64 {
+        self.failures.as_ref().map_or(0, |log| {
+            log.print_summary();
+            log.total()
+        })
+    }
 }

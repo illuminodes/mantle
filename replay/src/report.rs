@@ -9,9 +9,8 @@ use std::time::{Duration, Instant};
 
 use mantle::primitives::BlockHeight;
 
-const INTERVAL: Duration = Duration::from_secs(2);
-
 pub struct Reporter {
+    interval: Duration,
     start: Instant,
     last_print: Instant,
     start_height: BlockHeight,
@@ -21,9 +20,10 @@ pub struct Reporter {
 }
 
 impl Reporter {
-    pub fn new(start_height: BlockHeight, target_height: BlockHeight) -> Self {
+    pub fn new(start_height: BlockHeight, target_height: BlockHeight, interval: Duration) -> Self {
         let now = Instant::now();
         Self {
+            interval,
             start: now,
             last_print: now,
             start_height,
@@ -38,7 +38,7 @@ impl Reporter {
         self.committed_since_last += 1;
         let now = Instant::now();
         let since_print = now.duration_since(self.last_print);
-        if since_print < INTERVAL {
+        if since_print < self.interval {
             return;
         }
 
