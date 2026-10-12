@@ -3,7 +3,9 @@ mod clock;
 mod connect;
 mod pow;
 mod structure;
+mod tx_finality;
 mod tx_script_context;
+mod witness_commitment;
 
 // ── Re-exports (preserve the public API of the old validation.rs) ─────────────
 
@@ -28,6 +30,8 @@ use crate::error::ValidationError;
 use clock::SystemClock as _SystemClock;
 use pow::expected_nbits;
 use structure::BIP34_HEIGHT as _BIP34_HEIGHT;
+use tx_finality::TxFinality;
+use witness_commitment::WitnessCommitment;
 
 // ── Stage 2: contextual validation ───────────────────────────────────────────
 
@@ -107,6 +111,9 @@ pub fn validate_block_context_with_clock(
     // For v1: enforce the historical minimums only.
     header.check_version(this_height)?;
 
+    TxFinality::new(this_height, header.time(), mtp).check(block)?;
+    WitnessCommitment::check(block, this_height)?;
+
     Ok(())
 }
 
@@ -114,5 +121,7 @@ pub fn validate_block_context_with_clock(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_block_rules;
 #[cfg(test)]
 mod tests_script_cache;

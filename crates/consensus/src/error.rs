@@ -87,6 +87,14 @@ pub enum ValidationError {
     },
     /// The requested block's parent is not in the chain view.
     UnknownParent,
+    /// A transaction's lock-time is not yet satisfied (`IsFinalTx`, BIP113).
+    NonFinalTransaction { tx_index: usize },
+    /// The coinbase witness is not a single 32-byte reserved value (BIP141).
+    BadWitnessNonceSize,
+    /// The coinbase witness commitment does not match the block's wtxids (BIP141).
+    BadWitnessMerkleMatch,
+    /// A transaction carries witness data in a block without a witness commitment.
+    UnexpectedWitness { tx_index: usize },
     /// `ChainView` returned an error.
     ChainView(ChainViewError),
     /// An I/O error during serialisation (e.g. computing a txid).
