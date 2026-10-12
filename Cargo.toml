@@ -32,6 +32,7 @@ default-members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [workspace.lints.clippy]
 all = "warn"
@@ -47,10 +48,8 @@ debug = true
 sha2 = "0.11"
 sha1 = "0.11"
 ripemd = "0.2"
-k256 = { version = "0.14", default-features = false }
+k256 = { version = "0.14.0", default-features = false }
 bitcoinconsensus = "0.106.0"
-ququmatz = { path = "/home/cuarentaydos/Code/tooling/ququmatz" }
-quetzalcoatl = { path = "/home/cuarentaydos/Code/tooling/quetzalcoatl" }
+ququmatz = "0.16.2"
+quetzalcoatl = "0.15.2"
 
-[patch.crates-io]
-quetzalcoatl = { path = "/home/cuarentaydos/Code/tooling/quetzalcoatl" }

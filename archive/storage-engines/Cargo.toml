@@ -2,6 +2,7 @@
 name = "mantle-storage-engines"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish = false
 autobins = false
 

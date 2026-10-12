@@ -1737,7 +1737,7 @@ mod tests {
     fn batched_uring_lookup() {
         let tmp = TmpFile::new("uring-batch");
         let mut table = RobinHoodTable::open_with_capacity(tmp.path(), 64).unwrap();
-        let mut ring = ququmatz::IoUring::new(256).unwrap();
+        let mut ring = crate::engine::ring_budget::RingBudget::new(256, 16).build().unwrap();
         let mut arena = Vec::new();
 
         let count = 50u8;
@@ -1789,7 +1789,7 @@ mod tests {
     fn batched_uring_remove() {
         let tmp = TmpFile::new("uring-remove");
         let mut table = RobinHoodTable::open_with_capacity(tmp.path(), 128).unwrap();
-        let mut ring = ququmatz::IoUring::new(256).unwrap();
+        let mut ring = crate::engine::ring_budget::RingBudget::new(256, 16).build().unwrap();
         let mut arena = Vec::new();
 
         let count = 50u8;
@@ -2734,7 +2734,7 @@ mod tests {
         // exercises remove_backshift_phase with multi-step shifts.
         let tmp = TmpFile::new("uring-backshift-multi");
         let mut table = RobinHoodTable::open_with_capacity(tmp.path(), 16).unwrap();
-        let mut ring = ququmatz::IoUring::new(256).unwrap();
+        let mut ring = crate::engine::ring_budget::RingBudget::new(256, 16).build().unwrap();
         let mut arena = Vec::new();
 
         let ops: Vec<OutPoint> = (0..12u8).map(make_op).collect();
@@ -2815,7 +2815,7 @@ mod tests {
         }
         assert_eq!(table.len(), 10);
 
-        let mut ring = ququmatz::IoUring::new(256).unwrap();
+        let mut ring = crate::engine::ring_budget::RingBudget::new(256, 16).build().unwrap();
         let mut arena = Vec::new();
         let mut write_arena = Vec::new();
         let mut states = Vec::new();
@@ -2871,7 +2871,7 @@ mod tests {
         }
         assert_eq!(table.len(), 5);
 
-        let mut ring = ququmatz::IoUring::new(256).unwrap();
+        let mut ring = crate::engine::ring_budget::RingBudget::new(256, 16).build().unwrap();
         let mut arena = Vec::new();
         let mut write_arena = Vec::new();
         let mut states = Vec::new();
@@ -2938,7 +2938,7 @@ mod tests {
         let op_c = make_op_for_slot(12, 0);
         table.insert(&op_c, &make_coin(300, &[0x51])).unwrap();
 
-        let mut ring = ququmatz::IoUring::new(256).unwrap();
+        let mut ring = crate::engine::ring_budget::RingBudget::new(256, 16).build().unwrap();
         let mut arena = Vec::new();
         let mut write_arena = Vec::new();
         let mut states = Vec::new();
@@ -3017,7 +3017,7 @@ mod tests {
         // Remove the first entry (slot 30, ideal=30, pd=1).  The backshift
         // chain must pull entries from slots 31, 0, 1 backward — wrapping
         // around the table boundary.
-        let mut ring = ququmatz::IoUring::new(256).unwrap();
+        let mut ring = crate::engine::ring_budget::RingBudget::new(256, 16).build().unwrap();
         let mut arena = Vec::new();
         let (mut slots, mut dists, mut resolved) = (Vec::new(), Vec::new(), Vec::new());
 
@@ -3075,7 +3075,7 @@ mod tests {
         let remove_indices: Vec<u8> = vec![3, 7, 12, 19, 25];
         let remove_ops: Vec<OutPoint> = remove_indices.iter().map(|&i| make_op(i)).collect();
 
-        let mut ring = ququmatz::IoUring::new(256).unwrap();
+        let mut ring = crate::engine::ring_budget::RingBudget::new(256, 16).build().unwrap();
         let mut arena = Vec::new();
         let (mut slots, mut dists, mut resolved) = (Vec::new(), Vec::new(), Vec::new());
 
@@ -3155,7 +3155,7 @@ mod tests {
         // All three chains are independent (non-overlapping slot ranges).
         let remove_ops = vec![cluster_a[0], cluster_b[0], cluster_c[0]];
 
-        let mut ring = ququmatz::IoUring::new(256).unwrap();
+        let mut ring = crate::engine::ring_budget::RingBudget::new(256, 16).build().unwrap();
         let mut arena = Vec::new();
         let (mut slots, mut dists, mut resolved) = (Vec::new(), Vec::new(), Vec::new());
 

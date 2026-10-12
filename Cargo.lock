@@ -1084,6 +1084,8 @@ dependencies = [
 [[package]]
 name = "quetzalcoatl"
 version = "0.15.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81eea00c7a8c79f8ef98c0a60f924b4b1c7cb846a30936c64c706fb972574ab7"
 dependencies = [
  "loom",
 ]
@@ -1115,6 +1117,8 @@ dependencies = [
 [[package]]
 name = "ququmatz"
 version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bdaa0b004e11b2f7fc896ac93258fea15b6801949ff968e347a8072311e39b3"
 
 [[package]]
 name = "r-efi"
