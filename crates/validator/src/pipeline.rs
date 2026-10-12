@@ -188,9 +188,10 @@ impl ReplayBufs {
         self.spend_ops.extend_from_slice(&self.bip30_ops);
     }
 
-    /// Fetch coins from storage and merge with intra-block outputs into
-    /// `self.coins`. After this call the coin map is ready for building a
-    /// `PrefetchedView`.
+    /// Fetch coins from storage into `self.coins`. Outpoints created inside
+    /// the block are registered as absent: `connect_block` resolves them
+    /// itself, in block order. After this call the coin map is ready for
+    /// building a `PrefetchedView`.
     fn fetch_coins<S>(&mut self, storage: &mut S) -> Result<(), StorageError>
     where
         S: for<'x> StorageOps<'x>,
@@ -203,8 +204,8 @@ impl ReplayBufs {
         for r in self.lookup.drain(..) {
             self.coins.insert(r.outpoint, r.coin);
         }
-        for (k, v) in self.intra.drain() {
-            self.coins.insert(k, v);
+        for (k, _) in self.intra.drain() {
+            self.coins.insert(k, None);
         }
 
         Ok(())

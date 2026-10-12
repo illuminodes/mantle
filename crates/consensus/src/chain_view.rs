@@ -58,6 +58,8 @@ pub struct ConnectScratch {
     pub(crate) created: Vec<NewCoin<'static>>,
     /// Reused for per-tx coin lookups within each block.
     pub(crate) coins: Vec<Option<&'static Coin>>,
+    /// Same-block created and spent outpoints for the block being connected.
+    pub(crate) in_block: crate::validation::block_coins::InBlockCoins,
 }
 
 impl ConnectScratch {

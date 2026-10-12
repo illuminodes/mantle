@@ -1,3 +1,4 @@
+pub(crate) mod block_coins;
 mod clock;
 mod connect;
 mod pow;

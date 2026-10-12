@@ -2,6 +2,7 @@ use mantle::primitives::{BlockHeight, Hash256, OutPoint, Satoshi};
 
 use crate::chain_view::{ChainView, ConnectResult, ConnectScratch, NewCoin};
 use crate::error::ValidationError;
+use super::block_coins::SpentCoin;
 use super::tx_script_context::TxScriptContext;
 use crate::script::{ScriptExecutionCache, ScriptFlags};
 use crate::tx_view::{BlockView, InputView, OutputView, TxView};
@@ -114,6 +115,8 @@ where
 
     let mut total_fees = Satoshi::ZERO;
     let mut total_sigops: u32 = 0;
+    connect_scratch.in_block.clear();
+    let mut spent_coins: Vec<SpentCoin<'_>> = Vec::new();
 
     for (tx_index, tx) in block.txs().enumerate() {
         let is_coinbase = tx_index == 0;
@@ -151,11 +154,13 @@ where
             // Coinbase outputs go straight into created; no input lookup needed.
             for (vout, output) in tx.outputs().enumerate() {
                 #[allow(clippy::cast_possible_truncation)]
+                let outpoint = OutPoint {
+                    txid,
+                    vout: vout as u32,
+                };
+                connect_scratch.in_block.record_created(outpoint, created.len());
                 created.push(NewCoin {
-                    outpoint: OutPoint {
-                        txid,
-                        vout: vout as u32,
-                    },
+                    outpoint,
                     value: output.value(),
                     script_pubkey: output.script_pubkey(),
                     coinbase: true,
@@ -171,14 +176,31 @@ where
         outpoints_scratch.clear();
         outpoints_scratch.extend(tx.inputs().map(|i| i.previous_output()));
         view.get_coins_into(outpoints_scratch, &mut coins_scratch)?;
-        let coins = &coins_scratch;
+
+        spent_coins.clear();
+        for (input_index, (outpoint, from_view)) in
+            outpoints_scratch.iter().zip(coins_scratch.iter()).enumerate()
+        {
+            let missing = ValidationError::MissingInput {
+                tx_index,
+                input_index,
+            };
+            if !connect_scratch.in_block.spend(*outpoint) {
+                return Err(missing);
+            }
+            let coin = match connect_scratch.in_block.created_index(outpoint) {
+                Some(i) => SpentCoin::from_block(&created[i]),
+                None => SpentCoin::from_utxo(from_view.ok_or(missing)?),
+            };
+            spent_coins.push(coin);
+        }
 
         let script_ctx = if skip_script {
             None
         } else {
             Some(TxScriptContext::new(
                 tx,
-                coins,
+                &spent_coins,
                 script_flags,
                 exec_cache.is_some(),
                 scratch,
@@ -186,11 +208,7 @@ where
         };
 
         let mut input_total = Satoshi::ZERO;
-        for (input_index, (input, coin_opt)) in tx.inputs().zip(coins.iter()).enumerate() {
-            let coin = coin_opt.as_ref().ok_or(ValidationError::MissingInput {
-                tx_index,
-                input_index,
-            })?;
+        for (input_index, (input, coin)) in tx.inputs().zip(spent_coins.iter()).enumerate() {
 
             // Coinbase maturity: coinbase outputs must be 100 blocks deep.
             if coin.coinbase {
@@ -244,11 +262,13 @@ where
 
         for (vout, output) in tx.outputs().enumerate() {
             #[allow(clippy::cast_possible_truncation)]
+            let outpoint = OutPoint {
+                txid,
+                vout: vout as u32,
+            };
+            connect_scratch.in_block.record_created(outpoint, created.len());
             created.push(NewCoin {
-                outpoint: OutPoint {
-                    txid,
-                    vout: vout as u32,
-                },
+                outpoint,
                 value: output.value(),
                 script_pubkey: output.script_pubkey(),
                 coinbase: false,

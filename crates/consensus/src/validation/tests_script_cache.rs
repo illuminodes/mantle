@@ -199,6 +199,47 @@ impl Spend {
 }
 
 #[test]
+fn connect_block_rejects_two_transactions_spending_one_output() {
+    let mut chain = Chain::new();
+    let funded = chain.fund(0x31, 50_000, &[0x51]);
+    let first = Spend::tx(&[funded], 40_000);
+    let mut second = Spend::tx(&[funded], 30_000);
+    second.version = TxVersion::new(1);
+    let r = chain.connect(&Chain::block(vec![first, second]), None);
+    assert!(
+        matches!(r, Err(ValidationError::MissingInput { tx_index: 2, input_index: 0 })),
+        "a second spend of the same output must be rejected, got {r:?}"
+    );
+}
+
+#[test]
+fn connect_block_resolves_a_spend_of_an_earlier_output_in_the_block() {
+    let mut chain = Chain::new();
+    let funded = chain.fund(0x41, 50_000, &[0x51]);
+    let parent = Spend::tx(&[funded], 45_000);
+    let parent_txid = parent.txid().expect("txid");
+    let child = Spend::tx(&[OutPoint { txid: parent_txid, vout: 0 }], 40_000);
+    assert_eq!(
+        chain.connect(&Chain::block(vec![parent, child]), None),
+        Ok(Satoshi::new(10_000))
+    );
+}
+
+#[test]
+fn connect_block_rejects_a_spend_of_a_later_output_in_the_block() {
+    let mut chain = Chain::new();
+    let funded = chain.fund(0x51, 50_000, &[0x51]);
+    let parent = Spend::tx(&[funded], 45_000);
+    let parent_txid = parent.txid().expect("txid");
+    let child = Spend::tx(&[OutPoint { txid: parent_txid, vout: 0 }], 40_000);
+    let r = chain.connect(&Chain::block(vec![child, parent]), None);
+    assert!(
+        matches!(r, Err(ValidationError::MissingInput { tx_index: 1, input_index: 0 })),
+        "spending an output created later in the block must fail, got {r:?}"
+    );
+}
+
+#[test]
 fn exec_cache_does_not_reuse_a_verdict_across_transactions() {
     let key = EcdsaKey::new(7);
     let spk = key.p2pkh_spk();

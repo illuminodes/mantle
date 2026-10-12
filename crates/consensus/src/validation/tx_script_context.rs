@@ -1,6 +1,6 @@
 use mantle::primitives::{Hash256, Satoshi};
 
-use crate::chain_view::Coin;
+use super::block_coins::SpentCoin;
 use crate::script::sighash::Bip143Cache;
 use crate::script::{ScriptError, ScriptExecutionCache, ScriptFlags, ScriptVerifier, SpentOutputs};
 use crate::tx_view::TxView;
@@ -27,36 +27,26 @@ impl<'v> SpentTable<'v> {
         spk.len() == 34 && spk.starts_with(&Self::TAPROOT_PROGRAM_PREFIX)
     }
 
-    fn build(coins: &[Option<&'v Coin>]) -> Option<Self> {
-        if coins.len() < 2 {
+    fn build(coins: &[SpentCoin<'v>]) -> Option<Self> {
+        if coins.len() < 2 || !coins.iter().any(|c| Self::is_taproot_output(c.script_pubkey)) {
             return None;
         }
-        let mut amounts = Vec::with_capacity(coins.len());
-        let mut script_pubkeys = Vec::with_capacity(coins.len());
-        let mut any_taproot = false;
-        for coin in coins {
-            let coin = (*coin)?;
-            let spk = coin.script_pubkey.as_slice();
-            any_taproot |= Self::is_taproot_output(spk);
-            amounts.push(coin.value);
-            script_pubkeys.push(spk);
-        }
-        any_taproot.then_some(Self {
-            amounts,
-            script_pubkeys,
+        Some(Self {
+            amounts: coins.iter().map(|c| c.value).collect(),
+            script_pubkeys: coins.iter().map(|c| c.script_pubkey).collect(),
         })
     }
 
     fn view(&self) -> SpentOutputs<'_> {
         SpentOutputs::new(&self.amounts, &self.script_pubkeys)
-            .expect("amounts and script_pubkeys are pushed in lockstep")
+            .expect("amounts and script_pubkeys are built from the same coins")
     }
 }
 
 impl<'v> TxScriptContext<'v> {
     pub(super) fn new<T: TxView>(
         tx: &T,
-        coins: &[Option<&'v Coin>],
+        coins: &[SpentCoin<'v>],
         flags: ScriptFlags,
         cached: bool,
         scratch: &mut Vec<u8>,
@@ -78,7 +68,7 @@ impl<'v> TxScriptContext<'v> {
         tx: &T,
         n_in: usize,
         script_sig: &[u8],
-        coin: &Coin,
+        coin: &SpentCoin<'_>,
         exec_cache: Option<&mut ScriptExecutionCache>,
     ) -> Result<(), ScriptError> {
         let mut verifier = match &self.bip143 {
@@ -90,10 +80,11 @@ impl<'v> TxScriptContext<'v> {
         if let Some(table) = &self.spent {
             verifier = verifier.with_spent_outputs(table.view());
         }
-        let spk = coin.script_pubkey.as_slice();
         match (exec_cache, &self.wtxid) {
-            (Some(cache), Some(wtxid)) => verifier.verify_cached(script_sig, spk, wtxid, cache),
-            _ => verifier.verify(script_sig, spk),
+            (Some(cache), Some(wtxid)) => {
+                verifier.verify_cached(script_sig, coin.script_pubkey, wtxid, cache)
+            }
+            _ => verifier.verify(script_sig, coin.script_pubkey),
         }
     }
 }
