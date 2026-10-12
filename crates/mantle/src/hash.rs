@@ -53,6 +53,33 @@ impl Hash256 {
         Ok(Self(bytes))
     }
 
+    /// Const-context twin of [`Self::from_display_hex`] for hash constants.
+    ///
+    /// # Panics
+    /// Panics (at compile time when used in a `const`) if `s` is not exactly
+    /// 64 hex characters.
+    #[must_use]
+    pub const fn from_display_hex_const(s: &str) -> Self {
+        let s = s.as_bytes();
+        assert!(s.len() == 64, "expected 64 hex characters");
+        let mut bytes = [0u8; 32];
+        let mut i = 0;
+        while i < 32 {
+            bytes[31 - i] = Self::hex_nibble(s[i * 2]) << 4 | Self::hex_nibble(s[i * 2 + 1]);
+            i += 1;
+        }
+        Self(bytes)
+    }
+
+    const fn hex_nibble(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            b'A'..=b'F' => c - b'A' + 10,
+            _ => panic!("invalid hex character"),
+        }
+    }
+
     /// Format as a 64-character hex string in display order (reversed from
     /// internal storage, per Bitcoin convention).
     #[must_use]
@@ -326,6 +353,22 @@ mod tests {
         let hex = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
         let h = Hash256::from_display_hex(hex).unwrap();
         assert_eq!(h.to_display_hex(), hex);
+    }
+
+    #[test]
+    fn from_display_hex_const_matches_runtime_parser() {
+        const GENESIS: Hash256 = Hash256::from_display_hex_const(
+            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+        );
+        let runtime = Hash256::from_display_hex(
+            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+        )
+        .unwrap();
+        assert_eq!(GENESIS, runtime);
+        assert_eq!(
+            Hash256::from_display_hex_const(&"AB".repeat(32)),
+            Hash256::from_bytes([0xab; 32])
+        );
     }
 
     #[test]

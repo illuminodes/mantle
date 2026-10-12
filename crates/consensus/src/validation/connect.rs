@@ -2,6 +2,7 @@ use mantle::primitives::{BlockHeight, Hash256, OutPoint, Satoshi};
 
 use crate::chain_view::{ChainView, ConnectResult, ConnectScratch, NewCoin};
 use crate::error::ValidationError;
+use super::bip30::Bip30;
 use super::block_coins::SpentCoin;
 use super::sequence_locks::SequenceLocks;
 use super::sigop_cost::SigopCost;
@@ -17,18 +18,12 @@ const HALVING_INTERVAL: u32 = 210_000;
 /// Coinbase outputs must be at least this many blocks deep before they can be spent.
 const COINBASE_MATURITY: u32 = 100;
 
-/// Heights of the two historical BIP30 exception blocks on mainnet.
-/// These coinbase txids collide with earlier unspent coinbases but were
-/// accepted by Core before BIP30 enforcement began.
-const BIP30_EXCEPTION_HEIGHTS: [BlockHeight; 2] =
-    [BlockHeight::new(91_842), BlockHeight::new(91_880)];
-
 // ── connect_block ─────────────────────────────────────────────────────────────
 
 /// Stage 3: connect a block to the chain, checking UTXO-dependent rules.
 ///
 /// Assumes Stage 1 and Stage 2 have already passed. Checks:
-/// - BIP30: no tx shares a txid with an existing unspent coinbase
+/// - BIP30: no tx creates an output that already exists unspent
 /// - Every non-coinbase input exists in the UTXO set
 /// - Coinbase maturity (100 blocks)
 /// - Fee math: sum(inputs) >= sum(outputs) per tx; coinbase <= subsidy + fees
@@ -81,7 +76,7 @@ where
             "precomputed txids length must match block tx count",
         );
     }
-    let is_bip30_exception = BIP30_EXCEPTION_HEIGHTS.contains(&height);
+    let bip30 = Bip30::new(height, block.header());
     let subsidy = block_subsidy(height);
     let script_flags = ScriptFlags::for_height(height);
 
@@ -128,16 +123,7 @@ where
             None => tx.compute_txid(scratch)?,
         };
 
-        // BIP30: if any output of this tx is at a txid that already has an
-        // unspent coinbase in the UTXO set, reject (unless this is an exception height).
-        if !is_bip30_exception {
-            let bip30_probe = OutPoint { txid, vout: 0 };
-            if let Some(coin) = view.get_coin(&bip30_probe)?
-                && coin.coinbase
-            {
-                return Err(ValidationError::Bip30Violation { tx_index });
-            }
-        }
+        bip30.check(view, tx, txid, tx_index)?;
 
         sigop_cost += SigopCost::legacy(tx) * SigopCost::WITNESS_SCALE_FACTOR;
         if sigop_cost > SigopCost::MAX_BLOCK_COST {

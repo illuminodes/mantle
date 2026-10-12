@@ -1152,88 +1152,45 @@ fn nbits_target_roundtrip_canonical_examples() {
 
 // ── BIP30 exception-height bypass ────────────────────────────────────────
 
-/// At BIP30 exception heights (91842, 91880), a duplicate-txid coinbase
-/// must NOT trigger the BIP30 rejection — the check is bypassed entirely.
+/// Core rejects an overwrite of any unspent output, whether or not the
+/// existing coin came from a coinbase, and on any output index.
 #[test]
-fn connect_bip30_exception_height_bypasses_check() {
-    // Use height 91842 (first BIP30 exception).
-    let exception_height = BlockHeight::new(91_842);
-    let (mut view, _, _) = connect_setup(91_842);
-
-    // Build a coinbase for this exception height and compute its txid.
-    let cb = coinbase_tx(exception_height, block_subsidy(exception_height).to_u64());
-    let collision_txid = cb.txid().expect("txid encoding cannot fail");
-
-    // Pre-populate the UTXO set with a coinbase at the same txid.
-    view.insert_coin(
-        OutPoint {
-            txid: collision_txid,
-            vout: 0,
-        },
-        Coin {
-            value: Satoshi::new(1_000),
-            script_pubkey: vec![0x51].into(),
-            height: BlockHeight::new(1),
-            coinbase: true,
-        },
-    );
-
-    let block = make_block(vec![cb], CompactBits::new(0x207f_ffff));
-    let mut scratch = Vec::new();
-
-    // At a non-exception height this would fail with Bip30Violation.
-    // At the exception height it must succeed.
-    connect_block(
-        &block,
-        exception_height,
-        &view,
-        &mut scratch,
-        &mut ConnectScratch::new(),
-        true, // skip script — focus on BIP30 logic only
-        None,
-        None,
-    )
-    .expect("BIP30 exception height must bypass the duplicate-txid check");
-}
-
-/// BIP30 probe finds an existing coin that is NOT a coinbase — this is
-/// not a BIP30 violation, so connect_block must proceed normally.
-#[test]
-fn connect_bip30_non_coinbase_coin_is_not_a_violation() {
+fn connect_bip30_rejects_overwriting_a_non_coinbase_coin_at_a_later_index() {
     let (mut view, _, _) = connect_setup(200);
-    let cb = coinbase_tx(
+    let mut cb = coinbase_tx(
         BlockHeight::new(200),
         block_subsidy(BlockHeight::new(200)).to_u64(),
     );
-    let collision_txid = cb.txid().expect("txid encoding cannot fail");
-
-    // Insert a NON-coinbase coin at the same outpoint (txid:0).
+    cb.outputs.push(TxOut {
+        value: Satoshi::ZERO,
+        script_pubkey: vec![0x51].into(),
+    });
+    let txid = cb.txid().expect("txid encoding cannot fail");
     view.insert_coin(
-        OutPoint {
-            txid: collision_txid,
-            vout: 0,
-        },
+        OutPoint { txid, vout: 1 },
         Coin {
             value: Satoshi::new(1_000),
             script_pubkey: vec![0x51].into(),
             height: BlockHeight::new(1),
-            coinbase: false, // NOT coinbase — BIP30 should not trigger
+            coinbase: false,
         },
     );
 
     let block = make_block(vec![cb], CompactBits::new(0x207f_ffff));
     let mut scratch = Vec::new();
-    connect_block(
-        &block,
-        BlockHeight::new(200),
-        &view,
-        &mut scratch,
-        &mut ConnectScratch::new(),
-        true, // skip script
-        None,
-        None,
-    )
-    .expect("non-coinbase coin at same txid must not trigger BIP30");
+    assert_eq!(
+        connect_block(
+            &block,
+            BlockHeight::new(200),
+            &view,
+            &mut scratch,
+            &mut ConnectScratch::new(),
+            true,
+            None,
+            None,
+        ),
+        Err(ValidationError::Bip30Violation { tx_index: 0 })
+    );
 }
 
 // ── exec_cache: cold script failure caches the rejection ─────────────────

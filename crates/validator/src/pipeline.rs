@@ -3,7 +3,8 @@ use mantle::primitives::{Block, BlockHeader, BlockHeight, BlockRef, Hash256, Out
 use mantle_consensus::chain_view::{Coin, ConnectResult, ConnectScratch};
 use mantle_consensus::error::ValidationError;
 use mantle_consensus::script::ScriptExecutionCache;
-use mantle_consensus::validation::connect_block;
+use mantle_consensus::tx_view::BlockView;
+use mantle_consensus::validation::{Bip30, connect_block};
 use mantle_storage::ops::StorageOps;
 use mantle_storage::types::{CommitBlockReq, CommittedResp, Durability, ReqToken, StorageError};
 
@@ -75,7 +76,7 @@ impl ReplayBufs {
     ///
     /// After this call `self.intra` holds intra-block coins, `self.spend_ops`
     /// holds all outpoints to look up from storage (spend + BIP30).
-    fn collect_outpoints_block(&mut self, block: &Block) {
+    fn collect_outpoints_block(&mut self, block: &Block, height: BlockHeight) {
         for tx in block.transactions.iter().skip(1) {
             for inp in &tx.inputs {
                 self.spent_set.insert(inp.previous_output);
@@ -117,21 +118,24 @@ impl ReplayBufs {
             }
         }
 
+        self.collect_bip30_probes(block, height);
+    }
+
+    fn collect_bip30_probes<B: BlockView>(&mut self, block: &B, height: BlockHeight) {
         self.spent_set.clear();
         self.spent_set.extend(self.spend_ops.iter().copied());
-        for &txid in &self.txids {
-            let op = OutPoint { txid, vout: 0 };
+        let bip30 = Bip30::new(height, block.header());
+        for op in bip30.probes(block, &self.txids) {
             if !self.intra.contains_key(&op) && !self.spent_set.contains(&op) {
                 self.bip30_ops.push(op);
             }
         }
-
         self.spend_ops.extend_from_slice(&self.bip30_ops);
     }
 
     /// Collect intra-block outputs and external outpoints from a zero-copy
     /// `BlockRef`.
-    fn collect_outpoints_ref(&mut self, block_ref: &BlockRef<'_, '_>) {
+    fn collect_outpoints_ref(&mut self, block_ref: &BlockRef<'_, '_>, height: BlockHeight) {
         for tx in block_ref.transactions().skip(1) {
             for inp in tx.inputs() {
                 let Ok(i) = inp else { continue };
@@ -176,16 +180,7 @@ impl ReplayBufs {
             }
         }
 
-        self.spent_set.clear();
-        self.spent_set.extend(self.spend_ops.iter().copied());
-        for &txid in &self.txids {
-            let op = OutPoint { txid, vout: 0 };
-            if !self.intra.contains_key(&op) && !self.spent_set.contains(&op) {
-                self.bip30_ops.push(op);
-            }
-        }
-
-        self.spend_ops.extend_from_slice(&self.bip30_ops);
+        self.collect_bip30_probes(block_ref, height);
     }
 
     /// Fetch coins from storage into `self.coins`. Outpoints created inside
@@ -232,7 +227,7 @@ impl ReplayBufs {
         S: for<'x> StorageOps<'x>,
     {
         self.clear();
-        self.collect_outpoints_block(block);
+        self.collect_outpoints_block(block, height);
 
         let hash = block.header.hash();
         self.fetch_coins(storage)?;
@@ -288,7 +283,7 @@ impl ReplayBufs {
         S: for<'x> StorageOps<'x>,
     {
         self.clear();
-        self.collect_outpoints_ref(block_ref);
+        self.collect_outpoints_ref(block_ref, height);
 
         self.fetch_coins(storage)?;
         let tip = storage.tip();
@@ -388,6 +383,8 @@ mod tests {
     };
     use mantle::primitives::{TxOut, Witness};
 
+    const TEST_HEIGHT: BlockHeight = BlockHeight::new(100);
+
     /// Build a minimal block with one coinbase tx and one spending tx.
     ///
     /// The spending tx's input references `(prev_txid, 0)`, so we can
@@ -450,7 +447,7 @@ mod tests {
         let block = make_block_with_spend(prev_txid);
 
         let mut bufs = ReplayBufs::new();
-        bufs.collect_outpoints_block(&block);
+        bufs.collect_outpoints_block(&block, TEST_HEIGHT);
 
         // The spending tx references (prev_txid, 0). Since prev_txid is not
         // produced by any tx in this block, it must appear in spend_ops as an
@@ -533,7 +530,7 @@ mod tests {
         };
 
         let mut bufs = ReplayBufs::new();
-        bufs.collect_outpoints_block(&block);
+        bufs.collect_outpoints_block(&block, TEST_HEIGHT);
 
         // The spend of (coinbase_txid, 0) is intra-block, so it should
         // appear in `intra` with the coinbase output's coin data.
@@ -593,7 +590,7 @@ mod tests {
         };
 
         let mut bufs = ReplayBufs::new();
-        bufs.collect_outpoints_block(&block);
+        bufs.collect_outpoints_block(&block, TEST_HEIGHT);
 
         // With only a coinbase, there are no non-coinbase inputs, so no
         // external spends. The only spend_ops entry (if any) is the BIP30
@@ -604,12 +601,32 @@ mod tests {
     }
 
     #[test]
+    fn bip30_probes_cover_every_output_only_while_enforced() {
+        let mut block = make_block_with_spend(Hash256::from_bytes([0xab; 32]));
+        block.transactions[1].outputs.push(TxOut {
+            value: Satoshi::new(1),
+            script_pubkey: vec![0x51].into(),
+        });
+
+        let mut bufs = ReplayBufs::new();
+        bufs.collect_outpoints_block(&block, TEST_HEIGHT);
+        let mut scratch = Vec::new();
+        let spender = block.transactions[1].txid_into(&mut scratch).expect("txid");
+        assert!(bufs.bip30_ops.contains(&OutPoint { txid: spender, vout: 1 }));
+        assert_eq!(bufs.bip30_ops.len(), 3);
+
+        bufs.clear();
+        bufs.collect_outpoints_block(&block, BlockHeight::new(500_000));
+        assert!(bufs.bip30_ops.is_empty());
+    }
+
+    #[test]
     fn collect_outpoints_block_records_txids() {
         let prev_txid = Hash256::from_bytes([0xcd; 32]);
         let block = make_block_with_spend(prev_txid);
 
         let mut bufs = ReplayBufs::new();
-        bufs.collect_outpoints_block(&block);
+        bufs.collect_outpoints_block(&block, TEST_HEIGHT);
 
         // Should have recorded 2 txids (coinbase + spending tx).
         assert_eq!(bufs.txids.len(), 2, "expected 2 txids");
@@ -632,7 +649,7 @@ mod tests {
                 .expect("decode BlockRef");
 
         let mut bufs = ReplayBufs::new();
-        bufs.collect_outpoints_ref(&block_ref);
+        bufs.collect_outpoints_ref(&block_ref, TEST_HEIGHT);
 
         let expected_external = OutPoint {
             txid: prev_txid,
@@ -720,7 +737,7 @@ mod tests {
         let block = make_block_with_spend(prev_txid);
 
         let mut bufs = ReplayBufs::new();
-        bufs.collect_outpoints_block(&block);
+        bufs.collect_outpoints_block(&block, TEST_HEIGHT);
 
         // Record how many external ops need lookup.
         let external_count = bufs.spend_ops.len();
@@ -749,7 +766,7 @@ mod tests {
         let block = make_block_with_spend(prev_txid);
 
         let mut bufs = ReplayBufs::new();
-        bufs.collect_outpoints_block(&block);
+        bufs.collect_outpoints_block(&block, TEST_HEIGHT);
 
         // Verify some state was accumulated.
         assert!(!bufs.txids.is_empty());

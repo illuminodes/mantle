@@ -15,7 +15,7 @@ use mantle::primitives::{
 use mantle_consensus::chain_view::{ChainView, Coin, ConnectScratch, TipInfo};
 use mantle_consensus::error::ChainViewError;
 use mantle_consensus::script::ScriptExecutionCache;
-use mantle_consensus::validation::connect_block;
+use mantle_consensus::validation::{Bip30, connect_block};
 use mantle_storage::StorageHandle;
 use mantle_storage::types::{CommitBlockReq, Durability, LookupResult, ReqToken};
 use mantle_validator::prefetched_view::HeaderSnapshot;
@@ -243,15 +243,13 @@ pub fn replay_block(
         .collect();
 
     let spend_op_set: PrehashedSet<OutPoint> = spend_ops.iter().copied().collect();
-    scratch.clear();
-    let bip30_ops: Vec<OutPoint> = block
+    let txids: Vec<Hash256> = block
         .transactions
         .iter()
-        .filter_map(|tx| {
-            tx.txid_into(&mut scratch)
-                .ok()
-                .map(|txid| OutPoint { txid, vout: 0 })
-        })
+        .map(|tx| tx.txid_into(&mut scratch).expect("txid hash never fails"))
+        .collect();
+    let bip30_ops: Vec<OutPoint> = Bip30::new(height, &block.header)
+        .probes(block, &txids)
         .filter(|op| !intra.contains_key(op) && !spend_op_set.contains(op))
         .collect();
 
@@ -326,7 +324,7 @@ pub fn replay_block_ref(
     let block_ref = BlockRef::decode_with_arena(wire, arena, &mut txs_buf)
         .unwrap_or_else(|e| panic!("BlockRef decode at height {}: {e}", height.to_u32()));
 
-    let (txids, intra, all_ops) = build_ref_outpoints(&block_ref);
+    let (txids, intra, all_ops) = build_ref_outpoints(&block_ref, height);
 
     let mut lookup = Vec::new();
     storage
@@ -375,6 +373,7 @@ pub fn replay_block_ref(
 
 fn build_ref_outpoints(
     block_ref: &BlockRef<'_, '_>,
+    height: BlockHeight,
 ) -> (
     Vec<Hash256>,
     PrehashedMap<OutPoint, Option<Coin>>,
@@ -445,8 +444,7 @@ fn build_ref_outpoints(
         PrehashedSet::with_capacity_and_hasher(spend_ops.len(), BuildPrehashedHasher);
     spend_op_set.extend(spend_ops.iter().copied());
     let mut bip30_ops: Vec<OutPoint> = Vec::with_capacity(tx_count);
-    for &txid in &txids {
-        let op = OutPoint { txid, vout: 0 };
+    for op in Bip30::new(height, &block_ref.header).probes(block_ref, &txids) {
         if !intra.contains_key(&op) && !spend_op_set.contains(&op) {
             bip30_ops.push(op);
         }
@@ -584,8 +582,7 @@ pub fn replay_block_ref_reusing(
     bufs.spend_op_set.reserve(bufs.spend_ops.len());
     bufs.spend_op_set.extend(bufs.spend_ops.iter().copied());
     bufs.bip30_ops.reserve(tx_count);
-    for &txid in &bufs.txids {
-        let op = OutPoint { txid, vout: 0 };
+    for op in Bip30::new(height, &block_ref.header).probes(&block_ref, &bufs.txids) {
         if !bufs.intra.contains_key(&op) && !bufs.spend_op_set.contains(&op) {
             bufs.bip30_ops.push(op);
         }

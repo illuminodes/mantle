@@ -484,17 +484,16 @@ mod ordinals {
             .filter(|op| !intra.contains_key(op))
             .collect();
         let spend_set: PrehashedSet<OutPoint> = spend_ops.iter().copied().collect();
-        scratch.clear();
-        let bip30_ops: Vec<OutPoint> = block
+        let txids: Vec<Hash256> = block
             .transactions
             .iter()
-            .filter_map(|tx| {
-                tx.txid_into(&mut scratch)
-                    .ok()
-                    .map(|txid| OutPoint { txid, vout: 0 })
-            })
-            .filter(|op| !intra.contains_key(op) && !spend_set.contains(op))
+            .map(|tx| tx.txid_into(&mut scratch).expect("txid hash never fails"))
             .collect();
+        let bip30_ops: Vec<OutPoint> =
+            mantle_consensus::validation::Bip30::new(height, &block.header)
+                .probes(block, &txids)
+                .filter(|op| !intra.contains_key(op) && !spend_set.contains(op))
+                .collect();
         let mut all_ops = spend_ops;
         all_ops.extend_from_slice(&bip30_ops);
 

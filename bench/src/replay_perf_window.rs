@@ -195,8 +195,9 @@ fn replay_block_timed(
         PrehashedSet::with_capacity_and_hasher(spend_ops.len(), BuildPrehashedHasher);
     spend_op_set.extend(spend_ops.iter().copied());
     let mut bip30_ops: Vec<OutPoint> = Vec::with_capacity(tx_count);
-    for &txid in &txids {
-        let op = OutPoint { txid, vout: 0 };
+    for op in mantle_consensus::validation::Bip30::new(height, &block_ref.header)
+        .probes(&block_ref, &txids)
+    {
         if !intra.contains_key(&op) && !spend_op_set.contains(&op) {
             bip30_ops.push(op);
         }

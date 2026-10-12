@@ -1,3 +1,4 @@
+mod bip30;
 pub(crate) mod block_coins;
 mod clock;
 mod connect;
@@ -11,6 +12,7 @@ mod witness_commitment;
 
 // ── Re-exports (preserve the public API of the old validation.rs) ─────────────
 
+pub use bip30::Bip30;
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use connect::{BlockHeightExt, connect_block};
 pub use sigop_cost::SigopCost;
@@ -124,6 +126,8 @@ pub fn validate_block_context_with_clock(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_bip30;
 #[cfg(test)]
 mod tests_block_rules;
 #[cfg(test)]
