@@ -14,9 +14,6 @@ members = [
     "bench",
     "conformance",
     "replay",
-    "harness",
-    "crates/oracle",
-    "crates/oracled",
 ]
 
 [workspace.package]
@@ -41,9 +38,6 @@ k256 = { version = "0.14", default-features = false }
 bitcoinconsensus = "0.106.0"
 ququmatz = { path = "/home/cuarentaydos/Code/tooling/ququmatz" }
 quetzalcoatl = { path = "/home/cuarentaydos/Code/tooling/quetzalcoatl" }
-nostro2 = { path = "/home/cuarentaydos/Code/illuminodes/NostrO2/crates/core", default-features = false, features = ["serde", "k256"] }
-nostro2-signer = { path = "/home/cuarentaydos/Code/illuminodes/NostrO2/crates/signer", default-features = false, features = ["serde", "k256"] }
-nostro2-relay = { path = "/home/cuarentaydos/Code/illuminodes/NostrO2/crates/relay" }
 
 [patch.crates-io]
 quetzalcoatl = { path = "/home/cuarentaydos/Code/tooling/quetzalcoatl" }

@@ -9,9 +9,8 @@ dhat-heap.json
 perf*.data
 perf*.data.old
 bench/fixtures/
-data/mainnet/
-data/testnet3/*
-data/testnet4/
-data/signet/*
-data/regtest/*
+data/*
+!data/*/
+data/*/*
 !data/*/.gitkeep
+.claude/
