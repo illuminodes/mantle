@@ -13,8 +13,7 @@ full-chain-verify:
   tags:
     - ansibler
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "web"'
-    - if: '$CI_PIPELINE_SOURCE == "schedule" && $FULL_CHAIN_VERIFY == "1"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "full-chain-verify"'
   timeout: 7d
   before_script:
     - export PATH="$HOME/.cargo/bin:$PATH"
