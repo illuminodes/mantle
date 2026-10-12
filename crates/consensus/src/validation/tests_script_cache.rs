@@ -198,6 +198,74 @@ impl Spend {
     }
 }
 
+struct SigopHeavy;
+
+impl SigopHeavy {
+    const P2SH_REDEEM_LEN: usize = 520;
+    const WITNESS_SCRIPT_LEN: usize = 5_000;
+
+    fn p2sh(chain: &mut Chain, tag: u8) -> (OutPoint, Vec<u8>) {
+        let redeem = vec![0xae; Self::P2SH_REDEEM_LEN];
+        let hash: [u8; 20] = Ripemd160::digest(Sha256::digest(&redeem)).into();
+        let mut spk = vec![0xa9, 0x14];
+        spk.extend_from_slice(&hash);
+        spk.push(0x87);
+        let len = u16::try_from(redeem.len()).expect("fits").to_le_bytes();
+        let mut script_sig = vec![0x4d, len[0], len[1]];
+        script_sig.extend_from_slice(&redeem);
+        (chain.fund(tag, 10_000, &spk), script_sig)
+    }
+
+    fn p2wsh(chain: &mut Chain, tag: u8) -> (OutPoint, Vec<u8>) {
+        let script = vec![0xae; Self::WITNESS_SCRIPT_LEN];
+        let mut spk = vec![0x00, 0x20];
+        spk.extend_from_slice(&Sha256::digest(&script));
+        (chain.fund(tag, 10_000, &spk), script)
+    }
+
+    fn connect(chain: &Chain, tx: Transaction) -> Result<Satoshi, ValidationError> {
+        connect_block(
+            &Chain::block(vec![tx]),
+            BlockHeight::new(HEIGHT),
+            &chain.view,
+            &mut Vec::new(),
+            &mut ConnectScratch::new(),
+            true,
+            None,
+            None,
+        )
+        .map(|r| r.fees)
+    }
+}
+
+#[test]
+fn connect_block_counts_p2sh_redeem_script_sigops() {
+    let mut chain = Chain::new();
+    let (a, sig_a) = SigopHeavy::p2sh(&mut chain, 0x61);
+    let (b, sig_b) = SigopHeavy::p2sh(&mut chain, 0x62);
+    let mut tx = Spend::tx(&[a, b], 1_000);
+    tx.inputs[0].script_sig = sig_a.into();
+    tx.inputs[1].script_sig = sig_b.into();
+    let r = SigopHeavy::connect(&chain, tx);
+    assert!(
+        matches!(r, Err(ValidationError::SigopsLimitExceeded { cost: 83_200 })),
+        "two 520-byte CHECKMULTISIG redeem scripts must exceed the budget, got {r:?}"
+    );
+}
+
+#[test]
+fn connect_block_counts_witness_script_sigops() {
+    let mut chain = Chain::new();
+    let (outpoint, script) = SigopHeavy::p2wsh(&mut chain, 0x71);
+    let mut tx = Spend::tx(&[outpoint], 1_000);
+    tx.inputs[0].witness = Witness::from_slice(&[&script]);
+    let r = SigopHeavy::connect(&chain, tx);
+    assert!(
+        matches!(r, Err(ValidationError::SigopsLimitExceeded { cost: 100_000 })),
+        "a 5,000-byte CHECKMULTISIG witness script must exceed the budget, got {r:?}"
+    );
+}
+
 #[test]
 fn connect_block_rejects_two_transactions_spending_one_output() {
     let mut chain = Chain::new();

@@ -6,10 +6,12 @@ use mantle::primitives::{
     Nonce, OutPoint, Satoshi, Sequence, Transaction, TxHash, TxIn, TxOut, TxVersion, Witness,
 };
 
+use super::connect::{block_subsidy, connect_block};
+use super::sigop_cost::SigopCost;
 use super::tx_finality::TxFinality;
 use super::witness_commitment::WitnessCommitment;
 use super::{FixedClock, validate_block_context_with_clock};
-use crate::chain_view::{ChainView, MemoryChainView};
+use crate::chain_view::{ChainView, Coin, ConnectScratch, MemoryChainView};
 use crate::error::ValidationError;
 use crate::merkle::compute_merkle_root;
 use crate::test_helpers::decode_hex;
@@ -100,6 +102,114 @@ impl Fixture {
         }
         view
     }
+}
+
+struct RelativeLock {
+    view: MemoryChainView,
+    funded: OutPoint,
+}
+
+impl RelativeLock {
+    const TIP: u32 = 500_000;
+    const COIN_HEIGHT: u32 = 499_990;
+    const FIRST_TIME: u32 = 1_500_000_000;
+
+    fn new() -> Self {
+        let mut view = Fixture::chain(Self::TIP, Self::FIRST_TIME);
+        let funded = OutPoint {
+            txid: Hash256::from_bytes([0x88; 32]),
+            vout: 0,
+        };
+        view.insert_coin(
+            funded,
+            Coin {
+                value: Satoshi::new(10_000),
+                script_pubkey: vec![0x51].into(),
+                height: BlockHeight::new(Self::COIN_HEIGHT),
+                coinbase: false,
+            },
+        );
+        Self { view, funded }
+    }
+
+    fn connect(&self, version: i32, sequence: u32) -> Result<(), ValidationError> {
+        let height = BlockHeight::new(Self::TIP + 1);
+        let mut spend = Fixture::spend(0, Sequence::new(sequence));
+        spend.version = TxVersion::new(version);
+        spend.inputs[0].previous_output = self.funded;
+        let mut coinbase = Fixture::coinbase(height);
+        coinbase.outputs[0].value = block_subsidy(height);
+        let block = Fixture::block(self.view.tip().hash, 0, vec![coinbase, spend]);
+        connect_block(
+            &block,
+            height,
+            &self.view,
+            &mut Vec::new(),
+            &mut ConnectScratch::new(),
+            true,
+            None,
+            None,
+        )
+        .map(|_| ())
+    }
+}
+
+#[test]
+fn a_height_lock_is_satisfied_only_once_enough_blocks_have_passed() {
+    let chain = RelativeLock::new();
+    let depth = RelativeLock::TIP + 1 - RelativeLock::COIN_HEIGHT;
+    assert_eq!(chain.connect(2, depth), Ok(()));
+    assert_eq!(
+        chain.connect(2, depth + 1),
+        Err(ValidationError::SequenceLockNotSatisfied { tx_index: 1 })
+    );
+}
+
+#[test]
+fn relative_locks_are_ignored_for_version_1_and_disabled_sequences() {
+    let chain = RelativeLock::new();
+    assert_eq!(chain.connect(1, 0xffff), Ok(()));
+    assert_eq!(chain.connect(2, (1 << 31) | 0xffff), Ok(()));
+}
+
+#[test]
+fn a_time_lock_compares_median_times_past() {
+    let chain = RelativeLock::new();
+    let type_flag = 1u32 << 22;
+    assert_eq!(chain.connect(2, type_flag | 1), Ok(()));
+    assert_eq!(
+        chain.connect(2, type_flag | 20),
+        Err(ValidationError::SequenceLockNotSatisfied { tx_index: 1 })
+    );
+}
+
+#[test]
+fn accurate_multisig_counting_uses_the_key_count() {
+    let two_of_three = [0x52, 0x21, 0x02, 0x53, 0xae];
+    assert_eq!(SigopCost::count(&[0x52, 0x53, 0xae], true), 3);
+    assert_eq!(SigopCost::count(&[0x52, 0x53, 0xae], false), 20);
+    assert_eq!(SigopCost::count(&[0xac, 0xad], true), 2);
+    assert_eq!(SigopCost::count(&two_of_three, true), 0);
+}
+
+#[test]
+fn sigop_counting_skips_push_data() {
+    assert_eq!(SigopCost::count(&[0x02, 0xac, 0xac, 0xac], false), 1);
+    assert_eq!(SigopCost::count(&[0x4c, 0x05, 0xac], false), 0);
+}
+
+#[test]
+fn p2sh_sigops_come_from_the_redeem_script() {
+    let p2sh_spk = {
+        let mut s = vec![0xa9, 0x14];
+        s.extend_from_slice(&[0u8; 20]);
+        s.push(0x87);
+        s
+    };
+    let script_sig = [0x00, 0x03, 0x52, 0x53, 0xae];
+    assert_eq!(SigopCost::p2sh(&script_sig, &p2sh_spk), 3);
+    assert_eq!(SigopCost::p2sh(&script_sig, &[0x51]), 0);
+    assert_eq!(SigopCost::p2sh(&[0xac, 0x03, 0x52, 0x53, 0xae], &p2sh_spk), 0);
 }
 
 #[test]

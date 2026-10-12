@@ -3,6 +3,8 @@ use mantle::primitives::{BlockHeight, Hash256, OutPoint, Satoshi};
 use crate::chain_view::{ChainView, ConnectResult, ConnectScratch, NewCoin};
 use crate::error::ValidationError;
 use super::block_coins::SpentCoin;
+use super::sequence_locks::SequenceLocks;
+use super::sigop_cost::SigopCost;
 use super::tx_script_context::TxScriptContext;
 use crate::script::{ScriptExecutionCache, ScriptFlags};
 use crate::tx_view::{BlockView, InputView, OutputView, TxView};
@@ -14,9 +16,6 @@ const HALVING_INTERVAL: u32 = 210_000;
 
 /// Coinbase outputs must be at least this many blocks deep before they can be spent.
 const COINBASE_MATURITY: u32 = 100;
-
-/// Maximum legacy sigops per block.
-const MAX_BLOCK_SIGOPS: u32 = 20_000;
 
 /// Heights of the two historical BIP30 exception blocks on mainnet.
 /// These coinbase txids collide with earlier unspent coinbases but were
@@ -33,7 +32,8 @@ const BIP30_EXCEPTION_HEIGHTS: [BlockHeight; 2] =
 /// - Every non-coinbase input exists in the UTXO set
 /// - Coinbase maturity (100 blocks)
 /// - Fee math: sum(inputs) >= sum(outputs) per tx; coinbase <= subsidy + fees
-/// - Legacy sigops budget (<= 20,000 per block)
+/// - Sigop cost budget (BIP141: legacy and P2SH sigops x4 plus witness sigops <= 80,000)
+/// - BIP68 relative lock-times on version-2+ transactions
 ///
 /// Returns a [`ConnectResult`] carrying the UTXO delta for the storage layer.
 ///
@@ -114,9 +114,12 @@ where
     };
 
     let mut total_fees = Satoshi::ZERO;
-    let mut total_sigops: u32 = 0;
+    let mut sigop_cost: u64 = 0;
+    let count_p2sh = script_flags.contains(ScriptFlags::P2SH);
+    let count_witness = script_flags.contains(ScriptFlags::WITNESS);
     connect_scratch.in_block.clear();
     let mut spent_coins: Vec<SpentCoin<'_>> = Vec::new();
+    let sequence_locks = SequenceLocks::new(view, block.header(), height);
 
     for (tx_index, tx) in block.txs().enumerate() {
         let is_coinbase = tx_index == 0;
@@ -136,18 +139,9 @@ where
             }
         }
 
-        // Legacy sigops: count OP_CHECKSIG / OP_CHECKMULTISIG in scriptSig and
-        // scriptPubKey. Each OP_CHECKMULTISIG counts as 20 (MAX_PUBKEYS_PER_MULTISIG).
-        for input in tx.inputs() {
-            total_sigops = total_sigops.saturating_add(count_legacy_sigops(input.script_sig()));
-        }
-        for output in tx.outputs() {
-            total_sigops = total_sigops.saturating_add(count_legacy_sigops(output.script_pubkey()));
-        }
-        if total_sigops > MAX_BLOCK_SIGOPS {
-            return Err(ValidationError::SigopsLimitExceeded {
-                count: total_sigops,
-            });
+        sigop_cost += SigopCost::legacy(tx) * SigopCost::WITNESS_SCALE_FACTOR;
+        if sigop_cost > SigopCost::MAX_BLOCK_COST {
+            return Err(ValidationError::SigopsLimitExceeded { cost: sigop_cost });
         }
 
         if is_coinbase {
@@ -194,6 +188,21 @@ where
             };
             spent_coins.push(coin);
         }
+
+        for (input, coin) in tx.inputs().zip(spent_coins.iter()) {
+            if count_p2sh {
+                sigop_cost += SigopCost::p2sh(input.script_sig(), coin.script_pubkey)
+                    * SigopCost::WITNESS_SCALE_FACTOR;
+            }
+            if count_witness {
+                sigop_cost += SigopCost::witness(&input, coin.script_pubkey);
+            }
+        }
+        if sigop_cost > SigopCost::MAX_BLOCK_COST {
+            return Err(ValidationError::SigopsLimitExceeded { cost: sigop_cost });
+        }
+
+        sequence_locks.check(tx, &spent_coins, tx_index)?;
 
         let script_ctx = if skip_script {
             None
@@ -327,7 +336,7 @@ impl BlockHeightExt for BlockHeight {
     }
 }
 
-// ── block_subsidy / count_legacy_sigops ───────────────────────────────────────
+// ── block_subsidy ─────────────────────────────────────────────────────────────
 
 pub(super) fn block_subsidy(height: BlockHeight) -> Satoshi {
     let halvings = height.to_u32() / HALVING_INTERVAL;
@@ -337,73 +346,13 @@ pub(super) fn block_subsidy(height: BlockHeight) -> Satoshi {
     Satoshi::new(INITIAL_SUBSIDY.to_u64() >> halvings)
 }
 
-/// Count legacy sigops (`OP_CHECKSIG` + `OP_CHECKSIGVERIFY` + `OP_CHECKMULTISIG` family)
-/// in a raw script byte slice.
-///
-/// `OP_CHECKMULTISIG` / `OP_CHECKMULTISIGVERIFY` each count as 20 (the maximum
-/// allowed pubkeys per multisig), matching Core's pre-segwit counting rule.
-///
-/// # Panics
-/// Panics if an `OP_PUSHDATA4` length field exceeds `usize::MAX` (impossible on
-/// 32-bit or wider platforms).
-#[must_use]
-pub fn count_legacy_sigops(script: &[u8]) -> u32 {
-    const OP_CHECKSIG: u8 = 0xac;
-    const OP_CHECKSIGVERIFY: u8 = 0xad;
-    const OP_CHECKMULTISIG: u8 = 0xae;
-    const OP_CHECKMULTISIGVERIFY: u8 = 0xaf;
-
-    let mut count: u32 = 0;
-    let mut i = 0;
-    while i < script.len() {
-        let op = script[i];
-        match op {
-            OP_CHECKSIG | OP_CHECKSIGVERIFY => count += 1,
-            OP_CHECKMULTISIG | OP_CHECKMULTISIGVERIFY => count += 20,
-            // Push data opcodes: skip the pushed bytes.
-            0x01..=0x4b => i += usize::from(op),
-            0x4c => {
-                // OP_PUSHDATA1: next byte is length
-                if let Some(&len) = script.get(i + 1) {
-                    i += 1 + usize::from(len);
-                } else {
-                    break;
-                }
-            }
-            0x4d => {
-                // OP_PUSHDATA2: next 2 bytes are little-endian length
-                if i + 2 < script.len() {
-                    let len = usize::from(u16::from_le_bytes([script[i + 1], script[i + 2]]));
-                    i += 2 + len;
-                } else {
-                    break;
-                }
-            }
-            0x4e => {
-                // OP_PUSHDATA4: next 4 bytes are little-endian length
-                if i + 4 < script.len() {
-                    let len = usize::try_from(u32::from_le_bytes([
-                        script[i + 1],
-                        script[i + 2],
-                        script[i + 3],
-                        script[i + 4],
-                    ]))
-                    .expect("script push length overflows usize");
-                    i += 4 + len;
-                } else {
-                    break;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    count
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn count_legacy_sigops(script: &[u8]) -> u64 {
+        SigopCost::count(script, false)
+    }
 
     #[test]
     fn sigops_empty_script() {

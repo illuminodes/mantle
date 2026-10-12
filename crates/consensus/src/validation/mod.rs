@@ -2,6 +2,8 @@ pub(crate) mod block_coins;
 mod clock;
 mod connect;
 mod pow;
+mod sequence_locks;
+mod sigop_cost;
 mod structure;
 mod tx_finality;
 mod tx_script_context;
@@ -10,7 +12,8 @@ mod witness_commitment;
 // ── Re-exports (preserve the public API of the old validation.rs) ─────────────
 
 pub use clock::{Clock, FixedClock, SystemClock};
-pub use connect::{BlockHeightExt, connect_block, count_legacy_sigops};
+pub use connect::{BlockHeightExt, connect_block};
+pub use sigop_cost::SigopCost;
 pub use pow::{HeaderValidationExt, RetargetExt};
 pub use structure::{
     BIP34_HEIGHT, MAX_BLOCK_TRANSACTIONS, MAX_BLOCK_WEIGHT, MAX_COINBASE_SCRIPTSIG_LEN, MAX_MONEY,

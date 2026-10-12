@@ -1029,14 +1029,13 @@ fn block_subsidy_halvings() {
 
 #[test]
 fn sigops_checksig_and_multisig() {
-    assert_eq!(count_legacy_sigops(&[0xac]), 1); // OP_CHECKSIG
-    assert_eq!(count_legacy_sigops(&[0xad]), 1); // OP_CHECKSIGVERIFY
-    assert_eq!(count_legacy_sigops(&[0xae]), 20); // OP_CHECKMULTISIG
-    assert_eq!(count_legacy_sigops(&[0xaf]), 20); // OP_CHECKMULTISIGVERIFY
-    // push 1 byte then OP_CHECKSIG — push skips the data byte
-    assert_eq!(count_legacy_sigops(&[0x01, 0xac, 0xac]), 1);
-    // empty script
-    assert_eq!(count_legacy_sigops(&[]), 0);
+    let legacy = |s: &[u8]| super::sigop_cost::SigopCost::count(s, false);
+    assert_eq!(legacy(&[0xac]), 1);
+    assert_eq!(legacy(&[0xad]), 1);
+    assert_eq!(legacy(&[0xae]), 20);
+    assert_eq!(legacy(&[0xaf]), 20);
+    assert_eq!(legacy(&[0x01, 0xac, 0xac]), 1);
+    assert_eq!(legacy(&[]), 0);
 }
 
 #[test]

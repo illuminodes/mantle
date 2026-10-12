@@ -50,6 +50,8 @@ pub enum ValidationError {
     /// BIP30: a transaction in this block has the same txid as an unspent
     /// coinbase already in the UTXO set.
     Bip30Violation { tx_index: usize },
+    /// An input's BIP68 relative lock-time has not elapsed.
+    SequenceLockNotSatisfied { tx_index: usize },
     /// A non-coinbase input spends an outpoint that does not exist in the UTXO set.
     MissingInput { tx_index: usize, input_index: usize },
     /// A coinbase input is spent before it has 100 confirmations.
@@ -60,8 +62,9 @@ pub enum ValidationError {
     NegativeFee { tx_index: usize },
     /// The coinbase output value exceeds the block subsidy plus collected fees.
     CoinbaseRewardExceedsSubsidy,
-    /// Legacy sigops across the block exceed the 20,000 limit.
-    SigopsLimitExceeded { count: u32 },
+    /// Weighted sigop cost across the block exceeds 80,000 (BIP141; equal to
+    /// 20,000 legacy sigops before segwit).
+    SigopsLimitExceeded { cost: u64 },
     /// Script verification rejected this input — `kind` carries the
     /// structured `ScriptError` from the interpreter.
     ScriptVerifyFailed {
