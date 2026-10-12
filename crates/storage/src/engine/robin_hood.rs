@@ -565,10 +565,12 @@ impl RobinHoodTable {
         write_arena.clear();
         write_arena.resize(needed, 0u8);
 
+        let mut claimed: std::collections::HashSet<u64> = std::collections::HashSet::new();
         loop {
             let mut submitted = 0u32;
+            claimed.clear();
             for (i, state) in states.iter().enumerate() {
-                if state.resolved {
+                if state.resolved || !claimed.insert(state.slot) {
                     continue;
                 }
                 let offset = Self::slot_offset(state.slot);
@@ -683,13 +685,12 @@ impl RobinHoodTable {
         Ok(())
     }
 
-    /// Batched delete using `io_uring`.
+    /// Batched delete.
     ///
-    /// Phase 1: batch-read to locate each target slot across all ops (same
-    /// round-loop as `get_batch_uring`).  Phase 2: for each found target, run
-    /// the Robin Hood backshift.  Backshift chains across all ops are
-    /// interleaved in the ring — one read per active chain per round — so all
-    /// N chains make progress in parallel.
+    /// Locates every target with batched `io_uring` reads, then removes the
+    /// found entries one at a time. Each backshift reads the table as the
+    /// previous one left it; running backshifts concurrently corrupts
+    /// chains that overlap.
     ///
     /// Scratch vecs are passed in by the caller for reuse.
     ///
@@ -716,7 +717,12 @@ impl RobinHoodTable {
         let found_slots =
             self.remove_probe_phase(ops, ring, arena, slots, dists, resolved)?;
 
-        self.remove_backshift_phase(&found_slots, ring, arena)
+        for (op, found) in ops.iter().zip(&found_slots) {
+            if found.is_some() {
+                self.remove(op)?;
+            }
+        }
+        Ok(())
     }
 
     /// Phase 1 of [`remove_batch_uring`]: probe the table to locate each
@@ -813,143 +819,6 @@ impl RobinHoodTable {
         }
 
         Ok(found_slots)
-    }
-
-    /// Phase 2 of [`remove_batch_uring`]: backshift chains, interleaved across
-    /// all found entries.
-    ///
-    /// For each found entry we maintain a (prev, next) pair of slots where
-    /// `prev` is the slot to blank/overwrite and `next` is the slot to read
-    /// next.  Each round we submit one read per active chain; after
-    /// completions we either write (blank prev or copy shifted bucket) and
-    /// advance, or terminate the chain.
-    fn remove_backshift_phase(
-        &mut self,
-        found_slots: &[Option<u64>],
-        ring: &mut ququmatz::IoUring,
-        arena: &mut Vec<u8>,
-    ) -> io::Result<()> {
-        let fd = self.uring_fd();
-
-        // Active backshift state: (prev_slot, next_slot).
-        // Index j corresponds to the j-th *found* entry (not the original op index).
-        let mut shifts: Vec<(u64, u64)> = Vec::new();
-        let found_count = found_slots.iter().filter(|s| s.is_some()).count();
-        if found_count == 0 {
-            return Ok(());
-        }
-        // Read arena: one slot per chain for the next-slot reads.
-        // Write arena: one slot per chain, stable across submit_and_wait, so
-        // the kernel never sees a buffer that has been reused for a read.
-        arena.clear();
-        arena.resize(found_count * BUCKET_SIZE, 0u8);
-        let mut write_arena: Vec<u8> = vec![0u8; found_count * BUCKET_SIZE];
-
-        for slot in found_slots.iter().flatten() {
-            let next = (*slot + 1) & self.mask;
-            shifts.push((*slot, next));
-        }
-        self.live_count -= u64::try_from(found_count).expect("found_count fits u64");
-
-        // shift_done[j] = true once chain j has terminated.
-        let mut shift_done: Vec<bool> = vec![false; shifts.len()];
-
-        loop {
-            let mut submitted = 0u32;
-            for (j, &(_, next)) in shifts.iter().enumerate() {
-                if shift_done[j] {
-                    continue;
-                }
-                let offset = Self::slot_offset(next);
-                let buf_start = j * BUCKET_SIZE;
-                let sqe = unsafe {
-                    ququmatz::Sqe::read_ptr(
-                        fd,
-                        arena[buf_start..].as_mut_ptr(),
-                        u32::try_from(BUCKET_SIZE).expect("BUCKET_SIZE fits u32"),
-                        offset,
-                    )
-                }
-                .user_data(u64::try_from(j).expect("index fits u64"));
-                flush_if_full(ring, self.apply_fd_flags(sqe), &mut submitted)?;
-            }
-
-            if submitted == 0 {
-                break;
-            }
-
-            ring.submit_and_wait(submitted).map_err(uring_err)?;
-
-            // Collect write decisions; (slot_to_write, chain_index, is_blank).
-            let mut write_ops: Vec<(u64, usize, bool)> = Vec::new();
-
-            while let Some(cqe) = ring.complete() {
-                let j = usize::try_from(cqe.user_data()).expect("user_data index fits usize");
-                if j >= shifts.len() {
-                    continue;
-                }
-                let res = cqe.raw_result();
-                if res < 0 {
-                    return Err(io::Error::from_raw_os_error(-res));
-                }
-
-                let buf_start = j * BUCKET_SIZE;
-                let buf: &[u8; BUCKET_SIZE] = arena[buf_start..buf_start + BUCKET_SIZE]
-                    .try_into()
-                    .expect("bucket-aligned slice");
-                let next_bucket = Bucket::decode(buf);
-                let (prev, next) = shifts[j];
-
-                if next_bucket.is_empty() || next_bucket.probe_distance == 1 {
-                    // Terminate: blank prev slot.
-                    write_ops.push((prev, j, true));
-                    shift_done[j] = true;
-                } else {
-                    // Shift: write next_bucket (pd-1) into prev, advance chain.
-                    let mut shifted = next_bucket;
-                    shifted.probe_distance -= 1;
-                    let wbuf_start = j * BUCKET_SIZE;
-                    shifted.encode(
-                        (&mut write_arena[wbuf_start..wbuf_start + BUCKET_SIZE])
-                            .try_into()
-                            .expect("bucket-aligned slice"),
-                    );
-                    write_ops.push((prev, j, false));
-                    shifts[j] = (next, (next + 1) & self.mask);
-                }
-            }
-
-            // Submit writes (buffers live in write_arena, stable until wait).
-            let mut write_count = 0u32;
-            for (slot, j, blank) in write_ops {
-                let wbuf_start = j * BUCKET_SIZE;
-                if blank {
-                    write_arena[wbuf_start..wbuf_start + BUCKET_SIZE].fill(0);
-                }
-                let offset = Self::slot_offset(slot);
-                let sqe = unsafe {
-                    ququmatz::Sqe::write_ptr(
-                        fd,
-                        write_arena[wbuf_start..].as_ptr(),
-                        u32::try_from(BUCKET_SIZE).expect("BUCKET_SIZE fits u32"),
-                        offset,
-                    )
-                }
-                .user_data(u64::MAX);
-                flush_if_full(ring, sqe, &mut write_count)?;
-            }
-
-            if write_count > 0 {
-                ring.submit_and_wait(write_count).map_err(uring_err)?;
-                while ring.complete().is_some() {}
-            }
-
-            if shift_done.iter().all(|d| *d) {
-                break;
-            }
-        }
-
-        Ok(())
     }
 
     /// Batched UTXO lookup using `io_uring`.
@@ -2851,6 +2720,64 @@ mod tests {
                 .unwrap_or_else(|| panic!("entry {i} should be present after batch insert"));
             assert_eq!(coin.value.to_u64(), u64::from(i) * 10);
         }
+    }
+
+    fn colliding_op(i: u32) -> OutPoint {
+        OutPoint {
+            txid: Hash256::hash(&i.to_le_bytes()),
+            vout: i % 3,
+        }
+    }
+
+    #[test]
+    fn batch_insert_and_remove_keep_every_entry_when_probes_collide() {
+        let tmp = TmpFile::new("uring-batch-collide");
+        let mut table = RobinHoodTable::open_with_capacity(tmp.path(), 64).unwrap();
+        let mut ring = crate::engine::ring_budget::RingBudget::new(256, 16).build().unwrap();
+        let mut arena = Vec::new();
+        let mut write_arena = Vec::new();
+        let mut states = Vec::new();
+
+        let pairs: Vec<(OutPoint, Coin)> = (0..50u32)
+            .map(|i| (colliding_op(i), make_coin(u64::from(i) + 1, &[0x51])))
+            .collect();
+        table
+            .insert_batch_uring(&pairs, &mut ring, &mut arena, &mut write_arena, &mut states)
+            .unwrap();
+        for (op, coin) in &pairs {
+            assert_eq!(
+                table.get(op).unwrap().map(|c| c.value),
+                Some(coin.value),
+                "batch insert lost {op:?}"
+            );
+        }
+        assert_eq!(table.len(), 50);
+
+        let removed: Vec<OutPoint> = (0..50u32).step_by(2).map(colliding_op).collect();
+        let (mut slots, mut dists, mut resolved) = (Vec::new(), Vec::new(), Vec::new());
+        table
+            .remove_batch_uring(
+                &removed,
+                &mut ring,
+                &mut arena,
+                &mut slots,
+                &mut dists,
+                &mut resolved,
+            )
+            .unwrap();
+        for i in 0..50u32 {
+            let found = table.get(&colliding_op(i)).unwrap();
+            if i % 2 == 0 {
+                assert!(found.is_none(), "batch remove left {i}");
+            } else {
+                assert_eq!(
+                    found.map(|c| c.value.to_u64()),
+                    Some(u64::from(i) + 1),
+                    "batch remove lost {i}"
+                );
+            }
+        }
+        assert_eq!(table.len(), 25);
     }
 
     #[test]
