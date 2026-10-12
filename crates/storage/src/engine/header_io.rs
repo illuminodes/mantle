@@ -10,7 +10,7 @@
 //! time(4) + bits(4) + nonce(4) + height(4).
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use mantle::collections::{BuildPrehashedHasher, PrehashedMap};
@@ -29,7 +29,7 @@ pub const HEADER_RECORD_SIZE: usize = 116;
 pub const HEADER_RECORD_SIZE_U64: u64 = HEADER_RECORD_SIZE as u64;
 
 /// Shared header persistence owned by every engine implementation.
-pub(crate) struct HeaderStore {
+pub struct HeaderStore {
     header_file: File,
     pub write_len: u64,
     pub index: PrehashedMap<Hash256, u32>,
@@ -40,6 +40,9 @@ pub(crate) struct HeaderStore {
 
 impl HeaderStore {
     /// Open (or create) the header and checkpoint files in `data_dir`.
+    ///
+    /// # Errors
+    /// Returns `EngineError::Io` if either file cannot be opened.
     pub fn open(data_dir: &Path) -> Result<Self, EngineError> {
         let header_path = data_dir.join("headers.bin");
         let checkpoint_path = data_dir.join("checkpoint.bin");
@@ -77,6 +80,9 @@ impl HeaderStore {
     }
 
     /// Rebuild the header index and tip from `headers.bin` + `checkpoint.bin`.
+    ///
+    /// # Errors
+    /// Returns `EngineError::Io` on read or seek failure.
     pub fn recover(&mut self) -> Result<(), EngineError> {
         let mut cp_buf = [0u8; 4];
         let n = self.checkpoint_file.read(&mut cp_buf)?;
@@ -114,6 +120,9 @@ impl HeaderStore {
     }
 
     /// Read a header by its block hash.
+    ///
+    /// # Errors
+    /// Returns `EngineError::Io` on read failure.
     pub fn read_header(&self, hash: &Hash256) -> Result<Option<BlockHeader>, EngineError> {
         let Some(&height_u32) = self.index.get(hash) else {
             return Ok(None);
@@ -122,6 +131,9 @@ impl HeaderStore {
     }
 
     /// Read a header by height, opening the file and seeking.
+    ///
+    /// # Errors
+    /// Returns `EngineError::Io` on open, seek or read failure.
     pub fn read_header_at(&self, h: BlockHeight) -> Result<Option<BlockHeader>, EngineError> {
         let offset = u64::from(h.to_u32()) * HEADER_RECORD_SIZE_U64;
         let mut f = File::open(self.header_path())?;
@@ -134,6 +146,9 @@ impl HeaderStore {
     }
 
     /// Append a header record and update the in-memory index.
+    ///
+    /// # Errors
+    /// Returns `EngineError::Io` on write failure.
     pub fn write_header(
         &mut self,
         h: BlockHeight,
@@ -152,6 +167,9 @@ impl HeaderStore {
     }
 
     /// Write a header record and update both index and tip.
+    ///
+    /// # Errors
+    /// Returns `EngineError::Io` on write failure.
     pub fn write_block_header(
         &mut self,
         h: BlockHeight,
@@ -171,11 +189,15 @@ impl HeaderStore {
     }
 
     /// Borrow the underlying header file (e.g. for `pread`-based reads).
+    #[must_use]
     pub fn file(&self) -> &File {
         &self.header_file
     }
 
     /// Flush and sync header + checkpoint files.
+    ///
+    /// # Errors
+    /// Returns `EngineError::Io` on flush, seek, write or sync failure.
     pub fn sync_checkpoint(&mut self) -> Result<(), EngineError> {
         self.header_file.flush()?;
         self.header_file.sync_all()?;
@@ -190,6 +212,9 @@ impl HeaderStore {
 }
 
 /// Write a single header record. Returns the new logical end-of-file position.
+///
+/// # Errors
+/// Returns `EngineError::Io` on truncate or write failure.
 pub fn write_header_record(
     f: &mut File,
     h: BlockHeight,
@@ -216,6 +241,9 @@ pub fn write_header_record(
 }
 
 /// Read exactly one header record from the current file position.
+///
+/// # Errors
+/// Returns `EngineError::Io` if fewer than 116 bytes are available.
 pub fn read_header_record(f: &mut File) -> Result<BlockHeader, EngineError> {
     let mut buf = [0u8; HEADER_RECORD_SIZE];
     f.read_exact(&mut buf)?;
@@ -234,10 +262,6 @@ pub fn parse_header_record(buf: &[u8; HEADER_RECORD_SIZE]) -> BlockHeader {
         CompactBits::new(buf.read_u32_le(104)),
         Nonce::new(buf.read_u32_le(108)),
     )
-}
-
-pub(crate) fn io_err(e: impl Into<io::Error>) -> EngineError {
-    EngineError::Io(e.into())
 }
 
 #[cfg(test)]

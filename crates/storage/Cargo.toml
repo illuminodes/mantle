@@ -11,10 +11,7 @@ storage-dbg = []
 
 [dependencies]
 mantle = { path = "../mantle" }
-mantle-bloom = { path = "../bloom" }
 mantle-consensus = { path = "../consensus" }
-mantle-lru = { path = "../lru-cache" }
-mantle-utxo-set = { path = "../utxo-set" }
 quetzalcoatl.workspace = true
 ququmatz.workspace = true
 

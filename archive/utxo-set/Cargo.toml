@@ -7,6 +7,6 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
-mantle = { path = "../mantle" }
-mantle-consensus = { path = "../consensus" }
+mantle = { path = "../../crates/mantle" }
+mantle-consensus = { path = "../../crates/consensus" }
 ququmatz.workspace = true

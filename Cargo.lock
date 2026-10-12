@@ -736,7 +736,6 @@ dependencies = [
  "mantle-consensus",
  "mantle-storage",
  "mantle-transport",
- "mantle-utxo-set",
  "mantle-validator",
  "pprof",
  "ququmatz",
@@ -817,11 +816,25 @@ name = "mantle-storage"
 version = "0.1.0"
 dependencies = [
  "mantle",
+ "mantle-consensus",
+ "quetzalcoatl",
+ "ququmatz",
+ "tempfile",
+]
+
+[[package]]
+name = "mantle-storage-engines"
+version = "0.1.0"
+dependencies = [
+ "dhat",
+ "divan",
+ "mantle",
  "mantle-bloom",
  "mantle-consensus",
  "mantle-lru",
+ "mantle-storage",
  "mantle-utxo-set",
- "quetzalcoatl",
+ "pprof",
  "ququmatz",
  "tempfile",
 ]

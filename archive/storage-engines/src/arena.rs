@@ -6,12 +6,12 @@ use mantle::primitives::{
     BlockHeader, BlockHeight, Hash256, OutPoint,
 };
 use mantle_consensus::chain_view::{Coin, TipInfo};
+use mantle_storage::engine::header_io::HeaderStore;
+use mantle_storage::engine::{Engine, EngineError};
+use mantle_storage::types::{CommitBlockReq, Durability};
 use mantle_utxo_set::{ArenaUtxoSet, ConnectScratch};
 
-use super::header_io::HeaderStore;
-use super::wal_io::{read_wal_entry, write_wal_create, write_wal_spend, WalEntry};
-use super::{Engine, EngineError};
-use crate::types::{CommitBlockReq, Durability};
+use crate::wal_io::{read_wal_entry, write_wal_create, write_wal_spend, WalEntry};
 
 const WRITE_BUF_BYTES: usize = 256 * 1024;
 
@@ -152,7 +152,7 @@ mod tests {
     use super::*;
     use mantle::primitives::{BlockTime, BlockVersion, CompactBits, Nonce, Satoshi};
     use mantle_consensus::chain_view::NewCoin;
-    use crate::types::ReqToken;
+    use mantle_storage::types::ReqToken;
 
     struct TmpDir(PathBuf);
     impl TmpDir {

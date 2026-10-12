@@ -4,7 +4,7 @@
 //!   cargo build --release --bin utxo-set-dhat
 //!   ./target/release/utxo-set-dhat [SCENARIO]
 
-#[path = "../storage/fixtures.rs"]
+#[path = "fixtures.rs"]
 #[allow(clippy::wildcard_imports)]
 mod fixtures;
 
@@ -182,7 +182,7 @@ fn run_scenario(name: &str) {
         "tx_grouped_write" => {
             let dir = tempfile::tempdir().unwrap();
             let mut eng =
-                mantle_storage::engine::tx_grouped::TxGroupedEngine::open(dir.path()).unwrap();
+                mantle_storage_engines::tx_grouped::TxGroupedEngine::open(dir.path()).unwrap();
             write_blocks_1000(&mut eng, "tx_grouped");
         }
         "flat_write_spend" => {
@@ -200,7 +200,7 @@ fn run_scenario(name: &str) {
         "tx_grouped_write_spend" => {
             let dir = tempfile::tempdir().unwrap();
             let mut eng =
-                mantle_storage::engine::tx_grouped::TxGroupedEngine::open(dir.path()).unwrap();
+                mantle_storage_engines::tx_grouped::TxGroupedEngine::open(dir.path()).unwrap();
             write_and_spend_500(&mut eng, "tx_grouped");
         }
         "flat_read_batch" => {
@@ -235,7 +235,7 @@ fn run_scenario(name: &str) {
         "tx_grouped_multi_output" => {
             let dir = tempfile::tempdir().unwrap();
             let mut eng =
-                mantle_storage::engine::tx_grouped::TxGroupedEngine::open(dir.path()).unwrap();
+                mantle_storage_engines::tx_grouped::TxGroupedEngine::open(dir.path()).unwrap();
             seed_multi_output(&mut eng, 1000, 10);
             multi_output_lookup(&mut eng, "tx_grouped");
         }
@@ -272,7 +272,7 @@ fn run_scenario(name: &str) {
             }
             for _ in 0..100u32 {
                 let _ =
-                    mantle_storage::engine::tx_grouped::TxGroupedEngine::open(dir.path())
+                    mantle_storage_engines::tx_grouped::TxGroupedEngine::open(dir.path())
                         .unwrap();
             }
             eprintln!("tx_grouped_recover(500 blocks): 100 iters done");
@@ -280,13 +280,13 @@ fn run_scenario(name: &str) {
         "production_write" => {
             let dir = tempfile::tempdir().unwrap();
             let mut eng =
-                mantle_storage::engine::production::ProductionEngine::open(dir.path()).unwrap();
+                mantle_storage_engines::production::ProductionEngine::open(dir.path()).unwrap();
             write_blocks_1000(&mut eng, "production");
         }
         "production_write_spend" => {
             let dir = tempfile::tempdir().unwrap();
             let mut eng =
-                mantle_storage::engine::production::ProductionEngine::open(dir.path()).unwrap();
+                mantle_storage_engines::production::ProductionEngine::open(dir.path()).unwrap();
             write_and_spend_500(&mut eng, "production");
         }
         "production_read_batch" => {
@@ -297,7 +297,7 @@ fn run_scenario(name: &str) {
         "production_multi_output" => {
             let dir = tempfile::tempdir().unwrap();
             let mut eng =
-                mantle_storage::engine::production::ProductionEngine::open(dir.path()).unwrap();
+                mantle_storage_engines::production::ProductionEngine::open(dir.path()).unwrap();
             seed_multi_output(&mut eng, 1000, 10);
             multi_output_lookup(&mut eng, "production");
         }
@@ -309,7 +309,7 @@ fn run_scenario(name: &str) {
             }
             for _ in 0..10u32 {
                 let _ =
-                    mantle_storage::engine::production::ProductionEngine::open(dir.path())
+                    mantle_storage_engines::production::ProductionEngine::open(dir.path())
                         .unwrap();
             }
             eprintln!("production_recover(500 blocks): 10 iters done");
@@ -356,7 +356,7 @@ fn main() {
         let _profiler = dhat::Profiler::new_heap();
         run_scenario(name);
     } else {
-        eprintln!("usage: utxo-set-dhat <SCENARIO>");
+        eprintln!("usage: storage-engines-dhat <SCENARIO>");
         eprintln!("available scenarios:");
         for s in SCENARIOS {
             eprintln!("  {s}");

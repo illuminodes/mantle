@@ -1,12 +1,7 @@
-pub mod arena;
-pub mod disk_arena;
 pub mod flat;
-pub(crate) mod header_io;
-pub mod production;
+pub mod header_io;
 pub mod ring_budget;
 pub mod robin_hood;
-pub mod tx_grouped;
-pub(crate) mod wal_io;
 
 use mantle::primitives::{BlockHeader, BlockHeight, Hash256, OutPoint};
 use mantle_consensus::chain_view::{Coin, TipInfo};

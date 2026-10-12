@@ -13,9 +13,10 @@ use mantle_lru::LruCache;
 use mantle_utxo_set::disk_arena::{DiskArena, DiskSpan, DiskTxHandle};
 use mantle_utxo_set::tx_index::TxIndex;
 
-use super::header_io::{io_err, HeaderStore};
-use super::{Engine, EngineError};
-use crate::types::{CommitBlockReq, Durability, LookupResult};
+use mantle_storage::engine::header_io::HeaderStore;
+use mantle_storage::engine::ring_budget::RingBudget;
+use mantle_storage::engine::{Engine, EngineError};
+use mantle_storage::types::{CommitBlockReq, Durability, LookupResult};
 const WRITE_BUFFER_CAP: usize = 100_000;
 const LRU_CAPACITY: usize = 12_000_000;
 const BLOOM_EXPECTED_ITEMS: usize = 85_000_000;
@@ -78,7 +79,7 @@ impl ProductionEngine {
 
         let headers = HeaderStore::open(data_dir)?;
 
-        let ring = crate::engine::ring_budget::RingBudget::new(256, 64).build()?;
+        let ring = RingBudget::new(256, 64).build()?;
 
         let mut engine = Self {
             arena,
@@ -281,7 +282,7 @@ impl Engine for ProductionEngine {
         if !handle.is_unspent(op.vout) {
             return Ok(None);
         }
-        self.arena.read_coin(handle.span.base + op.vout).map_err(io_err)
+        self.arena.read_coin(handle.span.base + op.vout).map_err(EngineError::from)
     }
 
     fn read_coins(
@@ -418,7 +419,7 @@ mod tests {
             height: BlockHeight::new(1),
         };
         eng.write_block(&CommitBlockReq {
-            token: crate::types::ReqToken(1),
+            token: mantle_storage::types::ReqToken(1),
             height: BlockHeight::new(1),
             hash: make_block_hash(1),
             prev_hash: Hash256::ZERO,
@@ -448,7 +449,7 @@ mod tests {
                 height: BlockHeight::new(5),
             };
             eng.write_block(&CommitBlockReq {
-                token: crate::types::ReqToken(1),
+                token: mantle_storage::types::ReqToken(1),
                 height: BlockHeight::new(5),
                 hash: make_block_hash(5),
                 prev_hash: Hash256::ZERO,
@@ -481,7 +482,7 @@ mod tests {
             height: BlockHeight::new(1),
         };
         eng.write_block(&CommitBlockReq {
-            token: crate::types::ReqToken(1),
+            token: mantle_storage::types::ReqToken(1),
             height: BlockHeight::new(1),
             hash: make_block_hash(1),
             prev_hash: Hash256::ZERO,
@@ -495,7 +496,7 @@ mod tests {
         let mut h2 = make_header(1);
         h2.set_prev_block(make_block_hash(1));
         eng.write_block(&CommitBlockReq {
-            token: crate::types::ReqToken(2),
+            token: mantle_storage::types::ReqToken(2),
             height: BlockHeight::new(2),
             hash: make_block_hash(2),
             prev_hash: make_block_hash(1),
@@ -524,7 +525,7 @@ mod tests {
             height: BlockHeight::new(1),
         };
         eng.write_block(&CommitBlockReq {
-            token: crate::types::ReqToken(1),
+            token: mantle_storage::types::ReqToken(1),
             height: BlockHeight::new(1),
             hash: make_block_hash(1),
             prev_hash: Hash256::ZERO,
@@ -539,7 +540,7 @@ mod tests {
         let mut h2 = make_header(1);
         h2.set_prev_block(make_block_hash(1));
         eng.write_block(&CommitBlockReq {
-            token: crate::types::ReqToken(2),
+            token: mantle_storage::types::ReqToken(2),
             height: BlockHeight::new(2),
             hash: make_block_hash(2),
             prev_hash: make_block_hash(1),
@@ -568,7 +569,7 @@ mod tests {
             height: BlockHeight::new(1),
         };
         eng.write_block(&CommitBlockReq {
-            token: crate::types::ReqToken(1),
+            token: mantle_storage::types::ReqToken(1),
             height: BlockHeight::new(1),
             hash: make_block_hash(1),
             prev_hash: Hash256::ZERO,
@@ -615,7 +616,7 @@ mod tests {
             coinbase: false, height: BlockHeight::new(1),
         };
         eng.write_block(&CommitBlockReq {
-            token: crate::types::ReqToken(1),
+            token: mantle_storage::types::ReqToken(1),
             height: BlockHeight::new(1),
             hash: make_block_hash(1),
             prev_hash: Hash256::ZERO,
@@ -652,7 +653,7 @@ mod tests {
         // Block 1: txid-A
         let op_a = make_outpoint(100);
         eng.write_block(&CommitBlockReq {
-            token: crate::types::ReqToken(1),
+            token: mantle_storage::types::ReqToken(1),
             height: BlockHeight::new(1),
             hash: make_block_hash(1),
             prev_hash: Hash256::ZERO,
@@ -672,7 +673,7 @@ mod tests {
         let mut h2 = make_header(1);
         h2.set_prev_block(make_block_hash(1));
         eng.write_block(&CommitBlockReq {
-            token: crate::types::ReqToken(2),
+            token: mantle_storage::types::ReqToken(2),
             height: BlockHeight::new(2),
             hash: make_block_hash(2),
             prev_hash: make_block_hash(1),
@@ -691,7 +692,7 @@ mod tests {
         let mut h3 = make_header(2);
         h3.set_prev_block(make_block_hash(2));
         eng.write_block(&CommitBlockReq {
-            token: crate::types::ReqToken(3),
+            token: mantle_storage::types::ReqToken(3),
             height: BlockHeight::new(3),
             hash: make_block_hash(3),
             prev_hash: make_block_hash(2),
@@ -713,7 +714,7 @@ mod tests {
         let mut h4 = make_header(3);
         h4.set_prev_block(make_block_hash(3));
         eng.write_block(&CommitBlockReq {
-            token: crate::types::ReqToken(4),
+            token: mantle_storage::types::ReqToken(4),
             height: BlockHeight::new(4),
             hash: make_block_hash(4),
             prev_hash: make_block_hash(3),
@@ -768,7 +769,7 @@ mod tests {
         let op2 = OutPoint { txid, vout: 2 };
 
         eng.write_block(&CommitBlockReq {
-            token: crate::types::ReqToken(1),
+            token: mantle_storage::types::ReqToken(1),
             height: BlockHeight::new(1),
             hash: make_block_hash(1),
             prev_hash: Hash256::ZERO,

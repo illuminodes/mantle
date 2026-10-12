@@ -6,12 +6,12 @@ use mantle::primitives::{
     BlockHeader, BlockHeight, Hash256, OutPoint,
 };
 use mantle_consensus::chain_view::{Coin, TipInfo};
+use mantle_storage::engine::header_io::HeaderStore;
+use mantle_storage::engine::{Engine, EngineError};
+use mantle_storage::types::{CommitBlockReq, Durability};
 use mantle_utxo_set::{ConnectScratch, UtxoSet};
 
-use super::header_io::HeaderStore;
-use super::wal_io::{read_wal_entry, write_wal_create, write_wal_spend, WalEntry};
-use super::{Engine, EngineError};
-use crate::types::{CommitBlockReq, Durability};
+use crate::wal_io::{read_wal_entry, write_wal_create, write_wal_spend, WalEntry};
 
 const WRITE_BUF_BYTES: usize = 256 * 1024;
 
@@ -219,7 +219,7 @@ mod tests {
             height: BlockHeight::new(1),
         };
         let req = CommitBlockReq {
-            token: crate::types::ReqToken(1),
+            token: mantle_storage::types::ReqToken(1),
             height: BlockHeight::new(1),
             hash: make_block_hash(1),
             prev_hash: Hash256::ZERO,
@@ -248,7 +248,7 @@ mod tests {
             height: BlockHeight::new(10),
         };
         let req1 = CommitBlockReq {
-            token: crate::types::ReqToken(1),
+            token: mantle_storage::types::ReqToken(1),
             height: BlockHeight::new(10),
             hash: make_block_hash(10),
             prev_hash: Hash256::ZERO,
@@ -264,7 +264,7 @@ mod tests {
         let mut h2 = make_header(1);
         h2.set_prev_block(make_block_hash(10));
         let req2 = CommitBlockReq {
-            token: crate::types::ReqToken(2),
+            token: mantle_storage::types::ReqToken(2),
             height: BlockHeight::new(11),
             hash: make_block_hash(11),
             prev_hash: make_block_hash(10),
@@ -314,7 +314,7 @@ mod tests {
                 height: BlockHeight::new(5),
             };
             let req = CommitBlockReq {
-                token: crate::types::ReqToken(1),
+                token: mantle_storage::types::ReqToken(1),
                 height: BlockHeight::new(5),
                 hash: make_block_hash(5),
                 prev_hash: Hash256::ZERO,
@@ -350,7 +350,7 @@ mod tests {
                 coinbase: false, height: BlockHeight::new(1),
             };
             let req1 = CommitBlockReq {
-                token: crate::types::ReqToken(1),
+                token: mantle_storage::types::ReqToken(1),
                 height: BlockHeight::new(1),
                 hash: make_block_hash(1),
                 prev_hash: Hash256::ZERO,
@@ -363,7 +363,7 @@ mod tests {
             let mut h2 = make_header(1);
             h2.set_prev_block(make_block_hash(1));
             let req2 = CommitBlockReq {
-                token: crate::types::ReqToken(2),
+                token: mantle_storage::types::ReqToken(2),
                 height: BlockHeight::new(2),
                 hash: make_block_hash(2),
                 prev_hash: make_block_hash(1),

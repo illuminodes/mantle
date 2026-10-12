@@ -15,14 +15,14 @@ use mantle::primitives::{
 };
 use mantle_consensus::chain_view::NewCoin;
 use mantle_storage::engine::flat::FlatEngine;
-use mantle_storage::engine::production::ProductionEngine;
+use mantle_storage_engines::production::ProductionEngine;
 use mantle_storage::engine::robin_hood::RobinHoodEngine;
-use mantle_storage::engine::tx_grouped::TxGroupedEngine;
+use mantle_storage_engines::tx_grouped::TxGroupedEngine;
 use mantle_storage::engine::Engine;
 use mantle_storage::types::{CommitBlockReq, Durability, ReqToken};
 use mantle_utxo_set::{ArenaUtxoSet, ConnectScratch};
 
-#[path = "../pprof_common.rs"]
+#[path = "pprof_common.rs"]
 mod pprof_common;
 use pprof_common::print_top;
 
@@ -45,7 +45,7 @@ struct Corpus {
 
 fn ordinals_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures")
+        .join("../../bench/fixtures")
         .join("ordinals")
 }
 

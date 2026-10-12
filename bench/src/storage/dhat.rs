@@ -9,7 +9,7 @@
 mod fixtures;
 
 use fixtures::{
-    make_block_hash, make_coin, make_header, make_outpoint, seed_flat, seed_production,
+    make_block_hash, make_coin, make_header, make_outpoint, seed_flat,
     ITERS_LARGE, ITERS_SMALL, P2WPKH_SPK,
 };
 use mantle::primitives::{BlockHeight, Hash256, OutPoint, Satoshi};
@@ -145,66 +145,6 @@ fn main() {
             prev = block_hash;
         }
         eprintln!("robin_hood_write_block: 1000 blocks done");
-    }
-
-    // ── ProductionEngine: write_block (1000 blocks) ─────────────────────────
-    {
-        let dir = tempfile::tempdir().unwrap();
-        let mut eng = mantle_storage::engine::production::ProductionEngine::open(dir.path()).unwrap();
-        let mut prev = Hash256::ZERO;
-        for h in 1..=1000u32 {
-            let op = make_outpoint(h);
-            let block_hash = make_block_hash(h);
-            let created = [NewCoin {
-                outpoint: op,
-                value: Satoshi::new(5_000_000_000),
-                script_pubkey: &P2WPKH_SPK,
-                coinbase: true,
-                height: BlockHeight::new(h),
-            }];
-            let mut header = make_header(h);
-            header.set_prev_block(prev);
-            eng.write_block(&CommitBlockReq {
-                token: ReqToken(u64::from(h)),
-                height: BlockHeight::new(h),
-                hash: block_hash,
-                prev_hash: prev,
-                header,
-                created: &created,
-                spent: &[],
-                block_bytes: None,
-                durability: Durability::Memory,
-            })
-            .unwrap();
-            prev = block_hash;
-        }
-        eprintln!("production_write_block: 1000 blocks done");
-    }
-
-    // ── ProductionEngine: read_coins batch (500 iters, 100 ops) ───────────
-    {
-        let dir = tempfile::tempdir().unwrap();
-        let mut eng = seed_production(dir.path(), 1000);
-        let ops: Vec<OutPoint> = (1..=100).map(make_outpoint).collect();
-        let mut out: Vec<LookupResult> = Vec::new();
-        for _ in 0..ITERS_SMALL {
-            out.clear();
-            eng.read_coins(&ops, &mut out).unwrap();
-        }
-        eprintln!("production_read_coins(100): {ITERS_SMALL} iters done");
-    }
-
-    // ── ProductionEngine: recover (10 iters) ──────────────────────────────
-    {
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let mut eng = seed_production(dir.path(), 500);
-            eng.flush(Durability::Synced).unwrap();
-        }
-        for _ in 0..10u32 {
-            let _ = mantle_storage::engine::production::ProductionEngine::open(dir.path()).unwrap();
-        }
-        eprintln!("production_recover(500 blocks): 10 iters done");
     }
 
     // ── with_storage handle: commit + lookup (500 iters) ───────────────────

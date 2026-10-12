@@ -12,8 +12,8 @@
 mod fixtures;
 
 use fixtures::{
-    make_block_hash, make_coin, make_header, make_outpoint, seed_flat, seed_production,
-    seed_robin_hood, P2WPKH_SPK,
+    make_block_hash, make_coin, make_header, make_outpoint, seed_flat, seed_robin_hood,
+    P2WPKH_SPK,
 };
 use mantle::primitives::{BlockHeight, Hash256, OutPoint, Satoshi};
 use mantle_consensus::chain_view::NewCoin;
@@ -209,87 +209,6 @@ fn run_rh_engine_flush() {
     });
 }
 
-fn run_production_write_block() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut eng = mantle_storage::engine::production::ProductionEngine::open(dir.path()).unwrap();
-    let mut h = 1u32;
-    let mut prev = Hash256::ZERO;
-    profile("production_write_block", 3, || {
-        let op = make_outpoint(h);
-        let block_hash = make_block_hash(h);
-        let created = [NewCoin {
-            outpoint: op,
-            value: Satoshi::new(5_000_000_000),
-            script_pubkey: &P2WPKH_SPK,
-            coinbase: true,
-            height: BlockHeight::new(h),
-        }];
-        let mut header = make_header(h);
-        header.set_prev_block(prev);
-        eng.write_block(black_box(&CommitBlockReq {
-            token: ReqToken(u64::from(h)),
-            height: BlockHeight::new(h),
-            hash: block_hash,
-            prev_hash: prev,
-            header,
-            created: &created,
-            spent: &[],
-            block_bytes: None,
-            durability: Durability::Memory,
-        }))
-        .unwrap();
-        prev = block_hash;
-        h += 1;
-    });
-}
-
-fn run_production_read_coins() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut eng = seed_production(dir.path(), 2000);
-    eng.flush(Durability::Synced).unwrap();
-    let ops: Vec<OutPoint> = (1..=100).map(make_outpoint).collect();
-    let mut out: Vec<LookupResult> = Vec::new();
-    profile("production_read_coins(100, all disk)", 5, || {
-        out.clear();
-        eng.read_coins(black_box(&ops), &mut out).unwrap();
-    });
-}
-
-fn run_production_flush() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut eng = mantle_storage::engine::production::ProductionEngine::open(dir.path()).unwrap();
-    let mut prev = Hash256::ZERO;
-    for h in 1..=5000u32 {
-        let op = make_outpoint(h);
-        let block_hash = make_block_hash(h);
-        let created = [NewCoin {
-            outpoint: op,
-            value: Satoshi::new(5_000_000_000),
-            script_pubkey: &P2WPKH_SPK,
-            coinbase: true,
-            height: BlockHeight::new(h),
-        }];
-        let mut header = make_header(h);
-        header.set_prev_block(prev);
-        eng.write_block(&CommitBlockReq {
-            token: ReqToken(u64::from(h)),
-            height: BlockHeight::new(h),
-            hash: block_hash,
-            prev_hash: prev,
-            header,
-            created: &created,
-            spent: &[],
-            block_bytes: None,
-            durability: Durability::Memory,
-        })
-        .unwrap();
-        prev = block_hash;
-    }
-    profile("production_flush(5000 coins)", 5, || {
-        eng.flush(Durability::Synced).unwrap();
-    });
-}
-
 fn run_handle_commit_lookup() {
     let dir = tempfile::tempdir().unwrap();
     let eng = mantle_storage::engine::flat::FlatEngine::open(dir.path()).unwrap();
@@ -349,9 +268,6 @@ fn main() {
         ("rh_engine_read_coins", run_rh_engine_read_coins),
         ("rh_engine_read_coins_mixed", run_rh_engine_read_coins_mixed),
         ("rh_engine_flush", run_rh_engine_flush),
-        ("production_write_block", run_production_write_block),
-        ("production_read_coins", run_production_read_coins),
-        ("production_flush", run_production_flush),
         ("handle_commit_lookup", run_handle_commit_lookup),
     ];
 

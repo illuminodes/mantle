@@ -1,0 +1,36 @@
+[package]
+name = "mantle-storage-engines"
+version.workspace = true
+edition.workspace = true
+publish = false
+autobins = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "storage-engines-dhat"
+path = "src/bin/engines_dhat.rs"
+
+[[bin]]
+name = "storage-engines-pprof"
+path = "src/bin/engines_pprof.rs"
+
+[[bench]]
+name = "utxo_set"
+harness = false
+
+[dependencies]
+mantle = { path = "../../crates/mantle" }
+mantle-consensus = { path = "../../crates/consensus" }
+mantle-storage = { path = "../../crates/storage" }
+mantle-bloom = { path = "../bloom" }
+mantle-lru = { path = "../lru-cache" }
+mantle-utxo-set = { path = "../utxo-set" }
+ququmatz.workspace = true
+dhat = "0.3"
+pprof = { version = "0.14", features = ["flamegraph"] }
+tempfile = "3"
+
+[dev-dependencies]
+divan = "0.1"

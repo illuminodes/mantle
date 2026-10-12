@@ -9,12 +9,12 @@ use mantle::primitives::{
     OutPoint, Satoshi, TxHash,
 };
 use mantle_consensus::chain_view::NewCoin;
-use mantle_storage::engine::arena::ArenaEngine;
-use mantle_storage::engine::disk_arena::DiskArenaEngine;
 use mantle_storage::engine::flat::FlatEngine;
-use mantle_storage::engine::production::ProductionEngine;
 use mantle_storage::engine::robin_hood::RobinHoodEngine;
-use mantle_storage::engine::tx_grouped::TxGroupedEngine;
+use mantle_storage_engines::arena::ArenaEngine;
+use mantle_storage_engines::disk_arena::DiskArenaEngine;
+use mantle_storage_engines::production::ProductionEngine;
+use mantle_storage_engines::tx_grouped::TxGroupedEngine;
 use mantle_storage::engine::Engine;
 use mantle_storage::types::{CommitBlockReq, Durability, LookupResult, ReqToken};
 
@@ -402,7 +402,7 @@ mod ordinals_replay {
 
     fn ordinals_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures")
+            .join("../../bench/fixtures")
             .join("ordinals")
     }
 

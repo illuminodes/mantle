@@ -448,19 +448,19 @@ impl RobinHoodTable {
     }
 
     fn backshift(&self, removed_slot: u64) -> io::Result<()> {
-        mantle_utxo_set::robin_hood::backshift(
-            removed_slot,
-            self.mask,
-            |slot| self.read_bucket(slot),
-            |slot, bucket| self.write_bucket(slot, bucket),
-            |slot| self.write_empty(slot),
-            |b| b.is_empty() || b.probe_distance == 1,
-            |b| {
-                let mut shifted = b.clone();
-                shifted.probe_distance -= 1;
-                shifted
-            },
-        )
+        let mut prev = removed_slot;
+        let mut slot = (removed_slot + 1) & self.mask;
+        loop {
+            let bucket = self.read_bucket(slot)?;
+            if bucket.is_empty() || bucket.probe_distance == 1 {
+                return self.write_empty(prev);
+            }
+            let mut shifted = bucket.clone();
+            shifted.probe_distance -= 1;
+            self.write_bucket(prev, &shifted)?;
+            prev = slot;
+            slot = (slot + 1) & self.mask;
+        }
     }
 
     fn resize(&mut self) -> io::Result<()> {
@@ -1077,7 +1077,7 @@ impl RobinHoodTable {
 // ── RobinHoodEngine — Engine trait impl ──────────────────────────────────────
 
 use super::header_io::{
-    io_err, parse_header_record, HeaderStore,
+    parse_header_record, HeaderStore,
     HEADER_RECORD_SIZE, HEADER_RECORD_SIZE_U64,
 };
 
@@ -1233,7 +1233,7 @@ impl Engine for RobinHoodEngine {
             Some(BufferEntry::Live(coin)) => return Ok(Some(coin.clone())),
             None => {}
         }
-        self.table.get(op).map_err(io_err)
+        self.table.get(op).map_err(EngineError::from)
     }
 
     fn read_coins(

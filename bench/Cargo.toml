@@ -51,10 +51,6 @@ harness = false
 name = "replay_parity_ordinals"
 harness = false
 
-[[bench]]
-name = "utxo_set"
-harness = false
-
 [[bin]]
 name = "consensus-dhat"
 path = "src/consensus/dhat.rs"
@@ -96,14 +92,6 @@ name = "block-io-pprof"
 path = "src/block_io/pprof.rs"
 
 [[bin]]
-name = "utxo-set-dhat"
-path = "src/utxo_set/dhat.rs"
-
-[[bin]]
-name = "utxo-set-pprof"
-path = "src/utxo_set/pprof.rs"
-
-[[bin]]
 name = "parity-dhat"
 path = "src/parity_dhat.rs"
 
@@ -122,7 +110,6 @@ mantle-storage = { path = "../crates/storage" }
 mantle-transport = { path = "../crates/transport" }
 mantle-validator = { path = "../crates/validator" }
 mantle-block-io = { path = "../crates/block-io" }
-mantle-utxo-set = { path = "../crates/utxo-set" }
 ququmatz.workspace = true
 dhat = "0.3"
 tempfile = "3"

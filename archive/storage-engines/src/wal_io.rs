@@ -5,7 +5,7 @@ use mantle::hash::ByteSliceExt;
 use mantle::primitives::{BlockHeight, Hash256, OutPoint, Satoshi};
 use mantle_consensus::chain_view::NewCoin;
 
-use super::EngineError;
+use mantle_storage::engine::EngineError;
 
 // ── WAL record format ────────────────────────────────────────────────────────
 //
