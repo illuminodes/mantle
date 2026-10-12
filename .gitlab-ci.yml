@@ -11,7 +11,7 @@ variables:
 full-chain-verify:
   stage: verify
   tags:
-    - ansibler
+    - ansible
   rules:
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "full-chain-verify"'
   timeout: 7d
