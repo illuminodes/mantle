@@ -19,6 +19,7 @@
 //! CLI: `mantle-replay [--data-dir DIR] [--network NAME] [--peer HOST:PORT]…
 //!                    [--skip-script] [--start-height N] [--stop-height N] [--help]`.
 
+mod block_feed;
 mod failures;
 mod report;
 mod stage_clock;
@@ -39,9 +40,9 @@ use mantle_validator::{
 };
 
 use crate::failures::{FailureLog, FailureStage};
+use crate::block_feed::{BlockFeed, FedBlock, FeedItem, FeedPlan};
 use crate::report::Reporter;
 use crate::stage_clock::{Stage, StageClock};
-use mantle_fetcher::Fetcher;
 use mantle_replay::block_files::BlockFiles;
 use mantle_replay::peer_list::PeerList;
 use mantle_replay::utxo_hash_check::{UtxoHashReference, UtxoHashTracker, UtxoHashVerdict};
@@ -63,7 +64,6 @@ struct ReplayCtx {
 /// Block at which `Durability::Synced` flushes everything to disk. Matches
 /// difficulty-adjustment-period boundaries — a natural checkpoint cadence.
 const SYNC_EVERY: u32 = 2_016;
-const FETCH_ATTEMPTS: u32 = 5;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -610,8 +610,6 @@ fn run(args: &Args) -> Result<u64, String> {
         .unwrap_or(&args.data_dir);
     std::fs::create_dir_all(block_cache_dir)
         .map_err(|e| format!("create block cache dir {}: {e}", block_cache_dir.display()))?;
-    let mut fetcher = Fetcher::new(args.network, args.extra_peers.addrs().to_vec(), block_cache_dir)
-        .map_err(|e| format!("fetcher init: {e}"))?;
 
     // ── Phase 1: sync all headers to tip ──────────────────────────────────
     let locator = if let Some(locator_hash) = args.locator_hash {
@@ -638,9 +636,25 @@ fn run(args: &Args) -> Result<u64, String> {
         },
     );
 
-    let header_pairs = fetcher
-        .sync_headers(start_height, stop_height, locator)
-        .map_err(|e| format!("sync headers: {e:?}"))?;
+    let mut feed = BlockFeed::spawn(FeedPlan {
+        network: args.network,
+        peers: args.extra_peers.addrs().to_vec(),
+        cache_dir: block_cache_dir.to_owned(),
+        start: start_height,
+        stop: stop_height,
+        locator,
+        window: args.verify.window,
+        discard_windows: args.verify.ephemeral,
+        download_only: args.download_only,
+    })
+    .map_err(|e| format!("spawn block feed: {e}"))?;
+    let header_pairs = match feed.next() {
+        Some(FeedItem::Headers(headers)) => headers,
+        Some(FeedItem::Failed(e)) => return Err(e),
+        Some(FeedItem::Block(_)) | None => {
+            return Err("block feed ended before sending headers".to_string());
+        }
+    };
 
     if header_pairs.is_empty() {
         eprintln!("  no new headers from peers — already at tip");
@@ -658,9 +672,9 @@ fn run(args: &Args) -> Result<u64, String> {
 
     if args.download_only {
         eprintln!("  downloading blocks…");
-        fetcher
-            .fetch_blocks(&header_pairs)
-            .map_err(|e| format!("fetch blocks: {e:?}"))?;
+        if let Some(FeedItem::Failed(e)) = feed.next() {
+            return Err(e);
+        }
         eprintln!(
             "download complete: cached blocks {}..={} (no replay performed)",
             start_height.to_u32(),
@@ -702,10 +716,11 @@ fn run(args: &Args) -> Result<u64, String> {
     let last_committed = ctx.replay_range(
         &header_pairs,
         &args.verify,
-        &mut fetcher,
+        &mut feed,
         &snapshot,
         &mut reporter,
     )?;
+    drop(feed);
     reporter.done(last_committed);
 
     eprintln!("IBD complete at height {}", last_committed.to_u32());
@@ -717,81 +732,62 @@ fn run(args: &Args) -> Result<u64, String> {
 }
 
 impl ReplayCtx {
-    fn replay_range<RReq, RResp>(
+    fn replay_range(
         &mut self,
         header_pairs: &[(BlockHeight, BlockHeader)],
         verify: &VerifyOpts,
-        fetcher: &mut Fetcher<RReq, RResp>,
+        feed: &mut BlockFeed,
         snapshot: &HeaderSnapshot,
         reporter: &mut Reporter,
-    ) -> Result<BlockHeight, String>
-    where
-        RReq: std::ops::Deref<Target = quetzalcoatl::mpsc::RingBuffer<mantle_block_io::FileReq>>,
-        RResp: std::ops::Deref<Target = quetzalcoatl::spsc::RingBuffer<mantle_block_io::FileResp>>,
-    {
+    ) -> Result<BlockHeight, String> {
         let mut last_committed = self.storage.tip().height;
         for window in header_pairs.chunks(verify.window) {
-            let (first, _) = window[0];
-            let (last, _) = window[window.len() - 1];
-            eprintln!(
-                "  downloading blocks {}..={}…",
-                first.to_u32(),
-                last.to_u32()
-            );
-            let mut attempt = 1;
-            while let Err(e) = self.clock.time(Stage::Download, || fetcher.fetch_blocks(window)) {
-                if attempt >= FETCH_ATTEMPTS {
-                    return Err(format!("fetch blocks: {e:?} after {attempt} attempts"));
+            for &(height, _) in window {
+                let block = match self.clock.time(Stage::Wait, || feed.next()) {
+                    Some(FeedItem::Block(block)) => block,
+                    Some(FeedItem::Failed(e)) => return Err(e),
+                    Some(FeedItem::Headers(_)) | None => {
+                        return Err(format!(
+                            "block feed ended before height {}",
+                            height.to_u32()
+                        ));
+                    }
+                };
+                if block.height != height {
+                    return Err(format!(
+                        "block feed sent height {}, expected {}",
+                        block.height.to_u32(),
+                        height.to_u32()
+                    ));
                 }
-                eprintln!(
-                    "  fetch retry {attempt}/{FETCH_ATTEMPTS} for {}..={}: {e:?}",
-                    first.to_u32(),
-                    last.to_u32()
-                );
-                attempt += 1;
+                self.replay_block(&block, snapshot)?;
+                last_committed = height;
+                reporter.tick(height);
             }
-            for (height, header) in window {
-                self.replay_block(*height, *header, fetcher, snapshot)?;
-                last_committed = *height;
-                reporter.tick(*height);
-            }
-            if verify.ephemeral {
-                self.clock
-                    .time(Stage::Discard, || fetcher.discard_cached_blocks())
-                    .map_err(|e| format!("discard blocks: {e}"))?;
-            }
-            eprintln!("  window {}..={}: {}", first.to_u32(), last.to_u32(), self.clock.take_line());
+            eprintln!(
+                "  window {}..={}: {}",
+                window[0].0.to_u32(),
+                window[window.len() - 1].0.to_u32(),
+                self.clock.take_line()
+            );
         }
         Ok(last_committed)
     }
 
-    fn replay_block<RReq, RResp>(
-        &mut self,
-        height: BlockHeight,
-        header: BlockHeader,
-        fetcher: &mut Fetcher<RReq, RResp>,
-        snapshot: &HeaderSnapshot,
-    ) -> Result<(), String>
-    where
-        RReq: std::ops::Deref<Target = quetzalcoatl::mpsc::RingBuffer<mantle_block_io::FileReq>>,
-        RResp: std::ops::Deref<Target = quetzalcoatl::spsc::RingBuffer<mantle_block_io::FileResp>>,
-    {
-        let hash = header.hash();
-        let block = self
-            .clock
-            .time(Stage::Read, || fetcher.read_block_decoded(height, hash))
-            .map_err(|e| format!("read block {}: {e}", height.to_u32()))?;
+    fn replay_block(&mut self, fed: &FedBlock, snapshot: &HeaderSnapshot) -> Result<(), String> {
+        let (height, hash) = (fed.height, fed.hash);
+        let block = self.clock.time(Stage::Decode, || fed.decode())?;
 
         let mut saved = false;
         if let Err(e) = validate_block_structure(&block) {
-            self.save_failed_block(height, hash, fetcher, &mut saved);
+            self.save_failed_block(fed, &mut saved);
             self.fail(height, hash, FailureStage::Structure, &e)?;
         }
 
         let empty_coins = PrehashedMap::with_hasher(BuildPrehashedHasher);
         let context_view = PrefetchedView::new(&empty_coins, snapshot, self.storage.tip());
         if let Err(e) = validate_block_context(&block, &context_view, self.allow_min_difficulty) {
-            self.save_failed_block(height, hash, fetcher, &mut saved);
+            self.save_failed_block(fed, &mut saved);
             self.fail(height, hash, FailureStage::Context, &e)?;
         }
 
@@ -824,7 +820,7 @@ impl ReplayCtx {
         match connected {
             Ok(_) => self.check_utxo_hash(height, hash),
             Err(PipelineError::Validation(e)) => {
-                self.save_failed_block(height, hash, fetcher, &mut saved);
+                self.save_failed_block(fed, &mut saved);
                 self.fail(height, hash, FailureStage::Connect, &e)?;
                 if let Some(tracker) = &mut self.utxo_hash {
                     tracker.stop(height);
@@ -837,25 +833,15 @@ impl ReplayCtx {
         }
     }
 
-    fn save_failed_block<RReq, RResp>(
-        &self,
-        height: BlockHeight,
-        hash: Hash256,
-        fetcher: &mut Fetcher<RReq, RResp>,
-        saved: &mut bool,
-    ) where
-        RReq: std::ops::Deref<Target = quetzalcoatl::mpsc::RingBuffer<mantle_block_io::FileReq>>,
-        RResp: std::ops::Deref<Target = quetzalcoatl::spsc::RingBuffer<mantle_block_io::FileResp>>,
-    {
+    fn save_failed_block(&self, fed: &FedBlock, saved: &mut bool) {
         let Some(blocks) = &self.failure_blocks else {
             return;
         };
         if std::mem::replace(saved, true) {
             return;
         }
-        let written = fetcher
-            .read_block_bytes(height)
-            .and_then(|bytes| blocks.save(Some(height), hash, &bytes));
+        let height = fed.height;
+        let written = blocks.save(Some(height), fed.hash, &fed.bytes);
         match written {
             Ok(path) => eprintln!("  saved failing block to {}", path.display()),
             Err(e) => eprintln!(
