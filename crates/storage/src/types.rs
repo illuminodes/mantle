@@ -110,8 +110,6 @@ pub enum StorageError {
     ScriptPubKeyTooLarge,
     /// A stored script pubkey length field overflows `usize` on this platform.
     ScriptLenOverflow,
-    /// The request ring was full.
-    RingFull,
     /// The storage thread exited unexpectedly.
     ThreadGone,
     /// A response arrived for a different request variant than expected.
@@ -134,7 +132,6 @@ impl std::fmt::Display for StorageError {
             Self::Io(k) => write!(f, "storage I/O error: {k}"),
             Self::ScriptPubKeyTooLarge => f.write_str("script_pubkey exceeds 4 GiB"),
             Self::ScriptLenOverflow => f.write_str("script_pubkey length overflows usize"),
-            Self::RingFull => f.write_str("storage request ring full"),
             Self::ThreadGone => f.write_str("storage thread exited unexpectedly"),
             Self::UnexpectedResponse => f.write_str("unexpected response from storage thread"),
         }
@@ -197,7 +194,7 @@ mod tests {
 
     #[test]
     fn token_returns_none_for_err_and_shutdown() {
-        let err = StorageError::RingFull;
+        let err = StorageError::ThreadGone;
 
         assert!(StorageResp::LookupCoins(Err(err)).token().is_none());
         assert!(StorageResp::CommitBlock(Err(err)).token().is_none());
@@ -211,7 +208,6 @@ mod tests {
             StorageError::Io(std::io::ErrorKind::NotFound),
             StorageError::ScriptPubKeyTooLarge,
             StorageError::ScriptLenOverflow,
-            StorageError::RingFull,
             StorageError::ThreadGone,
             StorageError::UnexpectedResponse,
         ];
@@ -239,10 +235,6 @@ mod tests {
         assert_eq!(
             format!("{}", StorageError::ScriptLenOverflow),
             "script_pubkey length overflows usize"
-        );
-        assert_eq!(
-            format!("{}", StorageError::RingFull),
-            "storage request ring full"
         );
         assert_eq!(
             format!("{}", StorageError::ThreadGone),

@@ -685,7 +685,7 @@ mod tests {
 
     #[test]
     fn pipeline_error_display_storage() {
-        let err = PipelineError::Storage(StorageError::RingFull);
+        let err = PipelineError::Storage(StorageError::ThreadGone);
         let msg = format!("{err}");
         assert!(msg.starts_with("storage:"), "got: {msg}");
     }

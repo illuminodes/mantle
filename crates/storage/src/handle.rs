@@ -220,7 +220,7 @@ where
     }
 
     fn send(&self, req: StorageReq<'a>) -> Result<(), StorageError> {
-        self.req_tx.push(req).map_err(|_| StorageError::RingFull)
+        self.req_tx.push_block(req).map_err(|_| StorageError::ThreadGone)
     }
 
     /// Send a request whose lifetime has been erased to `'static` via transmute.
@@ -231,7 +231,7 @@ where
         // sending its response.
         let req_a: StorageReq<'a> =
             unsafe { std::mem::transmute::<StorageReq<'static>, StorageReq<'a>>(req) };
-        self.req_tx.push(req_a).map_err(|_| StorageError::RingFull)
+        self.req_tx.push_block(req_a).map_err(|_| StorageError::ThreadGone)
     }
 
     fn recv(&mut self) -> Result<StorageResp, StorageError> {

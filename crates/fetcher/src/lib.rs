@@ -728,8 +728,7 @@ where
                 }
             }
             if self.peers.live_count() == 0 {
-                eprintln!("  iouring-fetcher: all header peers dead, recycling pool in 5s…");
-                std::thread::sleep(Duration::from_secs(5));
+                eprintln!("  iouring-fetcher: all header peers dead, recycling the pool");
                 self.peer_book.reset();
                 self.ensure_peers()?;
                 if self.peers.is_empty() {
@@ -1158,8 +1157,7 @@ where
                 return Ok(());
             }
             if self.peers.live_count() == 0 {
-                eprintln!("  iouring-fetcher: all peers dead, recycling pool in 5s…");
-                std::thread::sleep(Duration::from_secs(5));
+                eprintln!("  iouring-fetcher: all peers dead, recycling the pool");
                 self.peer_book.reset();
                 self.ensure_peers()?;
                 if self.peers.is_empty() {

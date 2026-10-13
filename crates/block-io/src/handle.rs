@@ -89,10 +89,16 @@ where
         Self { tx, rx }
     }
 
-    pub fn write_block(&mut self, height: BlockHeight, data: Vec<u8>) -> io::Result<()> {
+    /// Queue `req`, blocking while the request ring is full. Fails only once
+    /// the worker has exited.
+    fn send(&self, req: FileReq) -> io::Result<()> {
         self.tx
-            .push(FileReq::WriteBlock { height, data })
-            .map_err(|_| io::Error::other("file-io ring full"))?;
+            .push_block(req)
+            .map_err(|_| io::Error::other("file-io worker has exited"))
+    }
+
+    pub fn write_block(&mut self, height: BlockHeight, data: Vec<u8>) -> io::Result<()> {
+        self.send(FileReq::WriteBlock { height, data })?;
         match self.rx.pop_block() {
             Some(FileResp::Ok) => Ok(()),
             Some(FileResp::Err(e)) => Err(e),
@@ -101,15 +107,11 @@ where
     }
 
     pub fn write_block_async(&self, height: BlockHeight, data: Vec<u8>) -> io::Result<()> {
-        self.tx
-            .push(FileReq::WriteBlockAsync { height, data })
-            .map_err(|_| io::Error::other("file-io ring full"))
+        self.send(FileReq::WriteBlockAsync { height, data })
     }
 
     pub fn read_block(&mut self, height: BlockHeight) -> io::Result<Vec<u8>> {
-        self.tx
-            .push(FileReq::ReadBlock { height })
-            .map_err(|_| io::Error::other("file-io ring full"))?;
+        self.send(FileReq::ReadBlock { height })?;
         match self.rx.pop_block() {
             Some(FileResp::BlockData(data)) => Ok(data),
             Some(FileResp::Err(e)) => Err(e),
@@ -122,12 +124,10 @@ where
         height: BlockHeight,
         expected_hash: Hash256,
     ) -> io::Result<Block> {
-        self.tx
-            .push(FileReq::ReadBlockDecoded {
-                height,
-                expected_hash,
-            })
-            .map_err(|_| io::Error::other("file-io ring full"))?;
+        self.send(FileReq::ReadBlockDecoded {
+            height,
+            expected_hash,
+        })?;
         match self.rx.pop_block() {
             Some(FileResp::DecodedBlock(block)) => Ok(block),
             Some(FileResp::Err(e)) => Err(e),
@@ -143,9 +143,7 @@ where
     /// back via [`release_slab`](Self::release_slab) so the worker can
     /// reuse it.
     pub fn read_block_slab(&mut self, height: BlockHeight) -> io::Result<crate::slab::SlabToken> {
-        self.tx
-            .push(FileReq::ReadBlockSlab { height })
-            .map_err(|_| io::Error::other("file-io ring full"))?;
+        self.send(FileReq::ReadBlockSlab { height })?;
         match self.rx.pop_block() {
             Some(FileResp::SlabReady(token)) => Ok(token),
             Some(FileResp::Err(e)) => Err(e),
@@ -154,13 +152,11 @@ where
     }
 
     pub fn release_slab(&self, slot: u16) {
-        let _ = self.tx.push(FileReq::ReleaseSlab { slot });
+        let _ = self.send(FileReq::ReleaseSlab { slot });
     }
 
     pub fn write_headers(&mut self, start: BlockHeight, data: Vec<u8>) -> io::Result<()> {
-        self.tx
-            .push(FileReq::WriteHeaders { start, data })
-            .map_err(|_| io::Error::other("file-io ring full"))?;
+        self.send(FileReq::WriteHeaders { start, data })?;
         match self.rx.pop_block() {
             Some(FileResp::Ok) => Ok(()),
             Some(FileResp::Err(e)) => Err(e),
@@ -169,9 +165,7 @@ where
     }
 
     pub fn append_headers(&mut self, data: Vec<u8>) -> io::Result<()> {
-        self.tx
-            .push(FileReq::AppendHeaders { data })
-            .map_err(|_| io::Error::other("file-io ring full"))?;
+        self.send(FileReq::AppendHeaders { data })?;
         match self.rx.pop_block() {
             Some(FileResp::Ok) => Ok(()),
             Some(FileResp::Err(e)) => Err(e),
@@ -180,9 +174,7 @@ where
     }
 
     pub fn flush_block_index(&mut self) -> io::Result<()> {
-        self.tx
-            .push(FileReq::FlushBlockIndex)
-            .map_err(|_| io::Error::other("file-io ring full"))?;
+        self.send(FileReq::FlushBlockIndex)?;
         match self.rx.pop_block() {
             Some(FileResp::Ok) => Ok(()),
             Some(FileResp::Err(e)) => Err(e),
@@ -191,9 +183,7 @@ where
     }
 
     pub fn discard_blocks(&mut self) -> io::Result<()> {
-        self.tx
-            .push(FileReq::DiscardBlocks)
-            .map_err(|_| io::Error::other("file-io ring full"))?;
+        self.send(FileReq::DiscardBlocks)?;
         match self.rx.pop_block() {
             Some(FileResp::Ok) => Ok(()),
             Some(FileResp::Err(e)) => Err(e),
@@ -202,7 +192,7 @@ where
     }
 
     pub fn has_block(&mut self, height: BlockHeight) -> bool {
-        if self.tx.push(FileReq::HasBlock { height }).is_err() {
+        if self.send(FileReq::HasBlock { height }).is_err() {
             return false;
         }
         matches!(self.rx.pop_block(), Some(FileResp::Bool(true)))
@@ -212,9 +202,7 @@ where
         &mut self,
         start: BlockHeight,
     ) -> io::Result<Vec<(BlockHeight, BlockHeader)>> {
-        self.tx
-            .push(FileReq::LoadCachedHeaders { start })
-            .map_err(|_| io::Error::other("file-io ring full"))?;
+        self.send(FileReq::LoadCachedHeaders { start })?;
         match self.rx.pop_block() {
             Some(FileResp::Headers(h)) => Ok(h),
             Some(FileResp::Err(e)) => Err(e),
@@ -223,7 +211,7 @@ where
     }
 
     pub fn shutdown(&mut self) {
-        let _ = self.tx.push(FileReq::Shutdown);
+        let _ = self.send(FileReq::Shutdown);
         let _ = self.rx.pop_block();
     }
 }
@@ -357,12 +345,12 @@ where
                     continue;
                 }
                 FileReq::Shutdown => {
-                    let _ = self.resp_tx.push(FileResp::Ok);
+                    let _ = self.resp_tx.push_block(FileResp::Ok);
                     return;
                 }
             };
-            if self.resp_tx.push(resp).is_err() {
-                eprintln!("[file-io] FAILED to push response!");
+            if self.resp_tx.push_block(resp).is_err() {
+                return;
             }
         }
     }
