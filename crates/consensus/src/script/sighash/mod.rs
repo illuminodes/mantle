@@ -16,7 +16,7 @@
 //!    - Replace every input's `script_sig` with the empty script.
 //!    - Replace input `n_in`'s `script_sig` with `script_code` (after
 //!      `FindAndDelete` of the signature being checked — see
-//!      `find_and_delete_sig`).
+//!      [`FindAndDelete`]) with every `OP_CODESEPARATOR` removed.
 //!    - Apply the `hash_type` modifications:
 //!      - `SIGHASH_NONE`: clear all outputs and zero every other input's sequence.
 //!      - `SIGHASH_SINGLE`: keep only output `n_in`; if `n_in >= n_outputs`,
@@ -64,6 +64,12 @@ use mantle::primitives::{Transaction, TxIn, TxOut, Witness};
 
 use super::consensus_crypto::Schnorr;
 use crate::tx_view::{InputView, OutputView, TxView};
+
+mod find_and_delete;
+mod legacy_script_code;
+
+pub use find_and_delete::FindAndDelete;
+use legacy_script_code::LegacyScriptCode;
 
 thread_local! {
     /// Reusable scratch buffer for the legacy preimage. Cleared and refilled per
@@ -369,8 +375,7 @@ fn encode_legacy_preimage<T: TxView>(
         let _ = VarInt::new(1).encode(buf);
         let input = tx.input(n_in);
         let _ = input.previous_output().encode(buf);
-        let _ = VarInt::from(script_code.len()).encode(buf);
-        buf.extend_from_slice(script_code);
+        LegacyScriptCode::new(script_code).encode(buf);
         buf.extend_from_slice(&input.sequence().to_le_bytes());
     } else {
         let n_inputs = tx.input_count();
@@ -378,8 +383,7 @@ fn encode_legacy_preimage<T: TxView>(
         for (i, input) in tx.inputs().enumerate() {
             let _ = input.previous_output().encode(buf);
             if i == n_in {
-                let _ = VarInt::from(script_code.len()).encode(buf);
-                buf.extend_from_slice(script_code);
+                LegacyScriptCode::new(script_code).encode(buf);
             } else {
                 // Empty scriptSig.
                 buf.push(0x00);
@@ -499,114 +503,6 @@ fn build_modified_tx(
         inputs,
         outputs,
         locktime: tx.locktime,
-    }
-}
-
-/// Apply BIP-style `FindAndDelete` of `sig` from `script`.
-///
-/// The legacy sighash subroutine removes every push of the signature being
-/// checked from the `scriptCode` before hashing. The match is a *pushdata*
-/// match: a push opcode whose payload exactly equals `sig`, found at a
-/// script-program boundary. Bytes that happen to contain `sig`'s pattern
-/// inside another push body are not removed.
-///
-/// This matches Core's `FindAndDelete`: walk the script, copy every push or
-/// opcode unchanged unless the entire pushed payload byte-for-byte matches
-/// `sig`. Non-push opcodes are copied as-is.
-///
-/// Returns the script with all matching pushes removed.
-#[must_use]
-pub fn find_and_delete_sig(script: &[u8], sig: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(script.len());
-    let mut i = 0;
-    while i < script.len() {
-        let op = script[i];
-        // Determine the (data_start, data_end) span pushed by this opcode, if any.
-        let span = pushed_span(script, i);
-        if let Some((data_start, data_end, op_end)) = span {
-            if &script[data_start..data_end] == sig {
-                // Skip this push entirely.
-                i = op_end;
-                continue;
-            }
-            // Copy the whole opcode + payload.
-            out.extend_from_slice(&script[i..op_end]);
-            i = op_end;
-        } else {
-            // Non-push opcode: copy one byte.
-            out.push(op);
-            i += 1;
-        }
-    }
-    out
-}
-
-/// If `script[i]` is a push opcode, return `(data_start, data_end, op_end)`
-/// — the absolute byte indices of the pushed payload and one past the
-/// last consumed byte. Returns `None` for non-push opcodes or truncated
-/// pushes (truncated pushes are passed through as a single byte in
-/// `find_and_delete_sig`, mirroring Core's tolerant parser there).
-fn pushed_span(script: &[u8], i: usize) -> Option<(usize, usize, usize)> {
-    let op = script[i];
-    // OP_0 (0x00) falls through to the wildcard `None` — `FindAndDelete` only
-    // matches non-empty data pushes, so OP_0 is treated as a regular opcode.
-    match op {
-        // 0x01..=0x4b: direct push of N bytes.
-        n @ 0x01..=0x4b => {
-            let len = usize::from(n);
-            let data_start = i + 1;
-            let data_end = data_start + len;
-            if data_end > script.len() {
-                None
-            } else {
-                Some((data_start, data_end, data_end))
-            }
-        }
-        // OP_PUSHDATA1
-        0x4c => {
-            if i + 1 >= script.len() {
-                return None;
-            }
-            let len = usize::from(script[i + 1]);
-            let data_start = i + 2;
-            let data_end = data_start + len;
-            if data_end > script.len() {
-                None
-            } else {
-                Some((data_start, data_end, data_end))
-            }
-        }
-        // OP_PUSHDATA2
-        0x4d => {
-            if i + 2 >= script.len() {
-                return None;
-            }
-            let len = usize::from(u16::from_le_bytes([script[i + 1], script[i + 2]]));
-            let data_start = i + 3;
-            let data_end = data_start + len;
-            if data_end > script.len() {
-                None
-            } else {
-                Some((data_start, data_end, data_end))
-            }
-        }
-        // OP_PUSHDATA4
-        0x4e => {
-            if i + 4 >= script.len() {
-                return None;
-            }
-            let len =
-                u32::from_le_bytes([script[i + 1], script[i + 2], script[i + 3], script[i + 4]])
-                    as usize;
-            let data_start = i + 5;
-            let data_end = data_start + len;
-            if data_end > script.len() {
-                None
-            } else {
-                Some((data_start, data_end, data_end))
-            }
-        }
-        _ => None,
     }
 }
 

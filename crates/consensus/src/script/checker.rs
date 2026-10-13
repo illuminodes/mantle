@@ -16,7 +16,7 @@ use super::consensus_crypto::{Ecdsa, Schnorr};
 use super::flags::ScriptFlags;
 use super::sig_version::SigVersion;
 use super::sighash::{
-    Bip143Cache, Bip341Cache, SigHashType, TaprootSigHashType, TxSighash, find_and_delete_sig,
+    Bip143Cache, Bip341Cache, FindAndDelete, SigHashType, TaprootSigHashType, TxSighash,
 };
 use crate::tx_view::{InputView, TxView};
 
@@ -160,7 +160,7 @@ impl<T: TxView> SignatureChecker for TxSigChecker<'_, T> {
             SigVersion::Base => {
                 // FindAndDelete: legacy regime removes any push of the exact
                 // `sig` bytes from `script_code` before hashing.
-                let cleaned_code = find_and_delete_sig(script_code, sig);
+                let cleaned_code = FindAndDelete::for_push(sig).apply(script_code);
                 self.tx.legacy_sighash(self.n_in, &cleaned_code, hash_type)
             }
             SigVersion::WitnessV0 => {

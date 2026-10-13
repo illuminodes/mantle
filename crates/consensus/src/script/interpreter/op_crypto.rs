@@ -16,7 +16,8 @@ use crate::script::checker::SignatureChecker;
 use crate::script::consensus_crypto::Ecdsa;
 use crate::script::error::ScriptError;
 use crate::script::flags::ScriptFlags;
-use crate::script::sighash::script_code_after_codeseparator;
+use crate::script::sig_version::SigVersion;
+use crate::script::sighash::{FindAndDelete, script_code_after_codeseparator};
 
 use super::Interpreter;
 
@@ -303,7 +304,17 @@ impl<C: SignatureChecker> Interpreter<'_, C> {
         } else {
             self.last_codeseparator
         };
-        let script_code = script_code_after_codeseparator(script, codesep);
+        let mut script_code =
+            std::borrow::Cow::Borrowed(script_code_after_codeseparator(script, codesep));
+        if self.sig_version == SigVersion::Base {
+            for s in &sigs {
+                if let std::borrow::Cow::Owned(cleaned) =
+                    FindAndDelete::for_push(s.as_slice()).apply(&script_code)
+                {
+                    script_code = std::borrow::Cow::Owned(cleaned);
+                }
+            }
+        }
         let mut sig_idx = 0;
         let mut pk_idx = 0;
         let mut ok = true;
@@ -317,7 +328,7 @@ impl<C: SignatureChecker> Interpreter<'_, C> {
             let pubkey = pubkeys[n_pubkeys - 1 - pk_idx].as_slice();
             if self
                 .checker
-                .check_ecdsa_sig(sig, pubkey, script_code, self.sig_version)
+                .check_ecdsa_sig(sig, pubkey, &script_code, self.sig_version)
             {
                 sig_idx += 1;
             }
