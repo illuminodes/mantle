@@ -49,8 +49,9 @@ impl HeaderStore {
 
         let header_file = OpenOptions::new()
             .read(true)
-            .append(true)
+            .write(true)
             .create(true)
+            .truncate(false)
             .open(&header_path)
             ?;
 
@@ -211,10 +212,13 @@ impl HeaderStore {
     }
 }
 
-/// Write a single header record. Returns the new logical end-of-file position.
+/// Write the record for height `h` at its fixed offset `h * 116`, replacing
+/// whatever was there, and return the new logical end of file. Writing in
+/// place matters after a restart: records past the last checkpoint are stale
+/// and must be overwritten, not followed.
 ///
 /// # Errors
-/// Returns `EngineError::Io` on truncate or write failure.
+/// Returns `EngineError::Io` on write failure.
 pub fn write_header_record(
     f: &mut File,
     h: BlockHeight,
@@ -222,22 +226,19 @@ pub fn write_header_record(
     hash: Hash256,
     file_len: u64,
 ) -> Result<u64, EngineError> {
+    use std::os::unix::fs::FileExt;
     let offset = u64::from(h.to_u32()) * HEADER_RECORD_SIZE_U64;
-    let new_len = if offset > file_len {
-        f.set_len(offset)?;
-        offset
-    } else {
-        file_len
-    };
-    f.write_all(hash.as_bytes())?;
-    f.write_all(&header.version().to_le_bytes())?;
-    f.write_all(header.prev_block().as_bytes())?;
-    f.write_all(header.merkle_root().as_bytes())?;
-    f.write_all(&header.time().to_le_bytes())?;
-    f.write_all(&header.bits().to_le_bytes())?;
-    f.write_all(&header.nonce().to_le_bytes())?;
-    f.write_all(&h.to_u32().to_le_bytes())?;
-    Ok(new_len + HEADER_RECORD_SIZE_U64)
+    let mut buf = [0u8; HEADER_RECORD_SIZE];
+    buf[0..32].copy_from_slice(hash.as_bytes());
+    buf[32..36].copy_from_slice(&header.version().to_le_bytes());
+    buf[36..68].copy_from_slice(header.prev_block().as_bytes());
+    buf[68..100].copy_from_slice(header.merkle_root().as_bytes());
+    buf[100..104].copy_from_slice(&header.time().to_le_bytes());
+    buf[104..108].copy_from_slice(&header.bits().to_le_bytes());
+    buf[108..112].copy_from_slice(&header.nonce().to_le_bytes());
+    buf[112..116].copy_from_slice(&h.to_u32().to_le_bytes());
+    f.write_all_at(&buf, offset)?;
+    Ok(file_len.max(offset + HEADER_RECORD_SIZE_U64))
 }
 
 /// Read exactly one header record from the current file position.
@@ -274,8 +275,9 @@ mod tests {
         let path = dir.path().join("headers.bin");
         let f = std::fs::OpenOptions::new()
             .read(true)
-            .append(true)
+            .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)
             .expect("failed to create temp file");
         (f, dir)
@@ -378,6 +380,55 @@ mod tests {
 
         let got = store.read_header(&hash).unwrap().unwrap();
         assert_eq!(got.prev_block(), header.prev_block());
+    }
+
+    fn chained(count: u32, nonce_base: u32) -> Vec<BlockHeader> {
+        let mut prev = Hash256::ZERO;
+        (0..count)
+            .map(|i| {
+                let header = BlockHeader::new(
+                    BlockVersion::new(1),
+                    prev,
+                    Hash256::from_bytes([0x11; 32]),
+                    BlockTime::new(1_700_000_000 + i),
+                    CompactBits::new(0x1d00_ffff),
+                    Nonce::new(nonce_base + i),
+                );
+                prev = header.hash();
+                header
+            })
+            .collect()
+    }
+
+    #[test]
+    fn headers_written_after_a_restart_replace_the_unsynced_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let headers = chained(10, 0);
+        let mut written = headers[..5].to_vec();
+        written.extend_from_slice(&chained(8, 1_000)[5..]);
+        {
+            let mut store = HeaderStore::open(dir.path()).unwrap();
+            for (h, header) in (0u32..).zip(&written) {
+                store
+                    .write_block_header(BlockHeight::new(h), header, header.hash())
+                    .unwrap();
+                if h == 4 {
+                    store.sync_checkpoint().unwrap();
+                }
+            }
+        }
+        let mut store = HeaderStore::open(dir.path()).unwrap();
+        store.recover().unwrap();
+        assert_eq!(store.tip.height, BlockHeight::new(4));
+        for (h, header) in (5u32..).zip(&headers[5..]) {
+            store
+                .write_block_header(BlockHeight::new(h), header, header.hash())
+                .unwrap();
+        }
+        for (h, header) in (0u32..).zip(&headers) {
+            let got = store.read_header_at(BlockHeight::new(h)).unwrap().unwrap();
+            assert_eq!(got.hash(), header.hash(), "height {h}");
+        }
     }
 
     #[test]
