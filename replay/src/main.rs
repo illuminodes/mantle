@@ -21,6 +21,7 @@
 
 mod failures;
 mod report;
+mod stage_clock;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -39,6 +40,7 @@ use mantle_validator::{
 
 use crate::failures::{FailureLog, FailureStage};
 use crate::report::Reporter;
+use crate::stage_clock::{Stage, StageClock};
 use mantle_fetcher::Fetcher;
 use mantle_replay::block_files::BlockFiles;
 use mantle_replay::peer_list::PeerList;
@@ -55,6 +57,7 @@ struct ReplayCtx {
     failures: Option<FailureLog>,
     failure_blocks: Option<BlockFiles>,
     utxo_hash: Option<UtxoHashTracker>,
+    clock: StageClock,
 }
 
 /// Block at which `Durability::Synced` flushes everything to disk. Matches
@@ -683,6 +686,7 @@ fn run(args: &Args) -> Result<u64, String> {
         failures: args.verify.failure_log()?,
         failure_blocks: args.verify.failure_blocks()?,
         utxo_hash: args.verify.utxo_hash_tracker()?,
+        clock: StageClock::default(),
     };
 
     eprintln!(
@@ -735,7 +739,7 @@ impl ReplayCtx {
                 last.to_u32()
             );
             let mut attempt = 1;
-            while let Err(e) = fetcher.fetch_blocks(window) {
+            while let Err(e) = self.clock.time(Stage::Download, || fetcher.fetch_blocks(window)) {
                 if attempt >= FETCH_ATTEMPTS {
                     return Err(format!("fetch blocks: {e:?} after {attempt} attempts"));
                 }
@@ -752,10 +756,11 @@ impl ReplayCtx {
                 reporter.tick(*height);
             }
             if verify.ephemeral {
-                fetcher
-                    .discard_cached_blocks()
+                self.clock
+                    .time(Stage::Discard, || fetcher.discard_cached_blocks())
                     .map_err(|e| format!("discard blocks: {e}"))?;
             }
+            eprintln!("  window {}..={}: {}", first.to_u32(), last.to_u32(), self.clock.take_line());
         }
         Ok(last_committed)
     }
@@ -772,8 +777,9 @@ impl ReplayCtx {
         RResp: std::ops::Deref<Target = quetzalcoatl::spsc::RingBuffer<mantle_block_io::FileResp>>,
     {
         let hash = header.hash();
-        let block = fetcher
-            .read_block_decoded(height, hash)
+        let block = self
+            .clock
+            .time(Stage::Read, || fetcher.read_block_decoded(height, hash))
             .map_err(|e| format!("read block {}: {e}", height.to_u32()))?;
 
         let mut saved = false;
@@ -797,6 +803,7 @@ impl ReplayCtx {
         let token = ReqToken(self.token);
         self.token = self.token.saturating_add(1);
 
+        let validate_started = std::time::Instant::now();
         let connected = self.bufs.validate_and_commit(
             &block,
             height,
@@ -813,6 +820,7 @@ impl ReplayCtx {
                 utxo_hash: self.utxo_hash.as_mut().and_then(UtxoHashTracker::hash_mut),
             },
         );
+        self.clock.add(Stage::Validate, validate_started);
         match connected {
             Ok(_) => self.check_utxo_hash(height, hash),
             Err(PipelineError::Validation(e)) => {
