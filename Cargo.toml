@@ -46,6 +46,11 @@ style = "warn"
 [profile.release]
 debug = true
 
+[profile.replay]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
 [workspace.dependencies]
 sha2 = "0.11"
 sha1 = "0.11"
