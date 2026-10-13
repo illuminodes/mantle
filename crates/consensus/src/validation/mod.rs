@@ -129,6 +129,8 @@ mod tests;
 #[cfg(test)]
 mod tests_bip30;
 #[cfg(test)]
+mod tests_lax_der;
+#[cfg(test)]
 mod tests_block_rules;
 #[cfg(test)]
 mod tests_script_cache;

@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 
 use super::error::ScriptError;
 use super::flags::ScriptFlags;
+use super::lax_der::LaxDer;
 
 /// Half the curve order, in big-endian. `s` values strictly above this are
 /// rejected under `SCRIPT_VERIFY_LOW_S`. Source: BIP146 (the constant is the
@@ -110,9 +111,15 @@ impl Ecdsa {
     /// the curve math — otherwise legitimate pre-LOW_S signatures (every
     /// signature signed by Satoshi-era code that happened to land high)
     /// fail to verify. Mainnet block 183 contains the canonical regression.
+    ///
+    /// The signature is decoded with [`LaxDer`], as Core does: before BIP66
+    /// non-DER encodings were valid, and mainnet block 124,276 spends one.
     #[must_use]
     pub fn verify(sig_der: &[u8], pubkey_bytes: &[u8], sighash: &[u8; 32]) -> bool {
-        let Ok(sig) = EcdsaSig::from_der(sig_der) else {
+        let Some(compact) = LaxDer::parse(sig_der) else {
+            return false;
+        };
+        let Ok(sig) = EcdsaSig::from_slice(&compact) else {
             return false;
         };
         let Ok(vk) = VerifyingKey::from_sec1_bytes(pubkey_bytes) else {

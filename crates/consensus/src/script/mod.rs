@@ -12,6 +12,7 @@ pub mod consensus_crypto;
 pub mod error;
 pub mod flags;
 pub mod interpreter;
+pub mod lax_der;
 pub mod num;
 pub mod opcodes;
 pub mod sig_version;
