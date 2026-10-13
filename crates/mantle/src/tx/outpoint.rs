@@ -10,20 +10,32 @@ pub struct OutPoint {
 }
 
 impl std::hash::Hash for OutPoint {
+    /// Writes one 8-byte word: the txid's first 8 bytes with the vout spread
+    /// across all 64 bits. A prehashing hasher keeps only the first 8 bytes it
+    /// is given, so without the vout every output of one transaction would
+    /// share a bucket.
     #[inline]
     fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
-        // Write txid + vout as one contiguous slice. PrehashedHasher takes the
-        // first 8 bytes in a single write call; two separate writes (derive)
-        // would let the vout write overwrite the txid bytes entirely.
-        let mut buf = [0u8; 36];
-        buf[..32].copy_from_slice(self.txid.as_bytes());
-        buf[32..].copy_from_slice(&self.vout.to_le_bytes());
-        h.write(&buf);
+        h.write(&self.spread_key().to_le_bytes());
     }
 }
 
 impl OutPoint {
     pub const ENCODED_LEN: usize = 36;
+
+    const VOUT_SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    /// The txid's first 8 bytes, xored with the vout times a 64-bit odd
+    /// constant, so outputs of one transaction get unrelated keys.
+    #[inline]
+    #[must_use]
+    pub fn spread_key(&self) -> u64 {
+        let bytes = self.txid.as_bytes();
+        let txid = u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
+        txid ^ u64::from(self.vout).wrapping_mul(Self::VOUT_SPREAD)
+    }
 }
 
 impl Encode for OutPoint {
@@ -99,6 +111,16 @@ mod tests {
     fn outpoint_truncated_txid() {
         let e = decode_err::<OutPoint>(&[0u8; 16]);
         assert!(matches!(e, Error::UnexpectedEof | Error::Io(_)));
+    }
+
+    #[test]
+    fn outputs_of_one_transaction_hash_to_different_prehashed_keys() {
+        use std::hash::BuildHasher;
+        let txid = Hash256::hash(b"fan-out");
+        let keys: std::collections::HashSet<u64> = (0..1_000)
+            .map(|vout| crate::collections::BuildPrehashedHasher.hash_one(OutPoint { txid, vout }))
+            .collect();
+        assert_eq!(keys.len(), 1_000);
     }
 
     #[test]

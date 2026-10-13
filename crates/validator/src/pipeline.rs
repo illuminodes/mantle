@@ -246,7 +246,7 @@ impl ReplayBufs {
             view: &view,
             scratch: &mut self.txid_scratch,
             connect_scratch: &mut self.connect_scratch,
-            txids: None,
+            txids: (self.txids.len() == block.transactions.len()).then_some(self.txids.as_slice()),
         })?;
 
         let resp = storage.commit_block_borrowed(CommitBlockReq {

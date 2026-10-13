@@ -160,11 +160,8 @@ impl Bucket {
 
 // ── Hash function ────────────────────────────────────────────────────────────
 
-const VOUT_SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
-
 fn hash_outpoint(op: &OutPoint) -> u64 {
-    let txid_bits = u64::from_le_bytes(op.txid.as_bytes()[..8].try_into().unwrap());
-    txid_bits ^ u64::from(op.vout).wrapping_mul(VOUT_SPREAD)
+    op.spread_key()
 }
 
 // ── File header ──────────────────────────────────────────────────────────────
