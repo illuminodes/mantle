@@ -15,8 +15,11 @@ full-chain-verify:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "full-chain-verify"'
   timeout: 7d
+  resource_group: full-chain-verify
+  interruptible: true
   before_script:
     - export PATH="$HOME/.cargo/bin:$PATH"
+    - pkill -f '/42pupusas/mantle/target/.*/mantle-replay' && sleep 5 || true
     - command -v cargo >/dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
     - test "$(cat /proc/sys/kernel/io_uring_disabled)" != 2 || { echo "io_uring is disabled on this host"; exit 1; }
     - rm -rf "$VERIFY_DIR" && mkdir -p "$VERIFY_DIR"
@@ -40,8 +43,9 @@ full-chain-verify:
       --progress-secs "$VERIFY_PROGRESS_SECS"
       $STOP_ARGS
       2>&1 | tee "$VERIFY_DIR/replay.log"
-      | grep --line-buffered -E 'CONSENSUS FAILURE|^ *\[ *[0-9]+/|fatal|complete|consensus failures|^  (structure|context|connect) |removed ephemeral|saved failing block'
+      | grep --line-buffered -E 'replaying|CONSENSUS FAILURE|^ *\[ *[0-9]+/|fatal|complete|consensus failures|^  (structure|context|connect) |removed ephemeral|saved failing block'
   after_script:
+    - pkill -f "$CI_PROJECT_DIR/target/.*/mantle-replay" || true
     - rm -rf "$CI_PROJECT_DIR/verify-run/chain"
   artifacts:
     when: always
