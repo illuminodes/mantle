@@ -1,20 +1,23 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Cursor};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use mantle::network::{AddrMsg, AddrV2Addr, AddrV2Msg, Command, CommandName};
 
 pub struct PeerBook {
     addresses: Vec<SocketAddrV4>,
     known: HashSet<SocketAddrV4>,
-    banned: HashSet<SocketAddrV4>,
+    banned: HashMap<SocketAddrV4, Instant>,
     next_index: usize,
     path: Option<PathBuf>,
 }
 
 impl PeerBook {
+    const BAN_DURATION: Duration = Duration::from_mins(10);
+
     pub fn memory(seeds: Vec<SocketAddrV4>) -> Self {
         Self::from_parts(seeds, None)
     }
@@ -47,16 +50,29 @@ impl PeerBook {
     }
 
     pub fn ban(&mut self, address: SocketAddrV4) {
-        self.banned.insert(address);
+        self.ban_at(address, Instant::now());
+    }
+
+    pub fn banned_count(&self) -> usize {
+        self.banned.len()
     }
 
     pub fn next_avoiding(&mut self, avoid: &[SocketAddrV4]) -> Option<SocketAddrV4> {
+        self.next_avoiding_at(avoid, Instant::now())
+    }
+
+    fn ban_at(&mut self, address: SocketAddrV4, now: Instant) {
+        self.banned.insert(address, now + Self::BAN_DURATION);
+    }
+
+    fn next_avoiding_at(&mut self, avoid: &[SocketAddrV4], now: Instant) -> Option<SocketAddrV4> {
+        self.banned.retain(|_, until| *until > now);
         let len = self.addresses.len();
         for _ in 0..len {
             let index = self.next_index % len;
             self.next_index = index.wrapping_add(1);
             let address = self.addresses[index];
-            if !avoid.contains(&address) && !self.banned.contains(&address) {
+            if !avoid.contains(&address) && !self.banned.contains_key(&address) {
                 return Some(address);
             }
         }
@@ -100,7 +116,7 @@ impl PeerBook {
         Self {
             addresses,
             known,
-            banned: HashSet::new(),
+            banned: HashMap::new(),
             next_index: 0,
             path,
         }
@@ -171,6 +187,20 @@ mod tests {
         assert_eq!(book.next_avoiding(&[]), None);
         book.reset();
         assert_eq!(book.next_avoiding(&[]), Some(bad));
+    }
+
+    #[test]
+    fn bans_expire() {
+        let address: std::net::SocketAddrV4 = "127.0.0.1:8333".parse().unwrap();
+        let mut book = PeerBook::memory(vec![address]);
+        let start = std::time::Instant::now();
+        book.ban_at(address, start);
+        assert_eq!(book.next_avoiding_at(&[], start), None);
+        assert_eq!(
+            book.next_avoiding_at(&[], start + PeerBook::BAN_DURATION),
+            Some(address)
+        );
+        assert_eq!(book.banned_count(), 0);
     }
 
     #[test]

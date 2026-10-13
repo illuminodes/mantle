@@ -13,7 +13,6 @@ impl PeerScore {
     const MIN_FLEET: usize = 8;
     const SLOW_FACTOR: u64 = 4;
     const SLOW_FLOOR_MS: u64 = 5_000;
-    const STALL_FLOOR_MS: u64 = 20_000;
     const BASE_CAP: usize = 2;
     const FAST_CAP: usize = 4;
 
@@ -61,17 +60,10 @@ impl PeerScore {
             return false;
         };
         self.is_proven()
-            && self.latency_ms > median.saturating_mul(Self::SLOW_FACTOR).max(Self::SLOW_FLOOR_MS)
-    }
-
-    pub(crate) fn is_stalled(oldest_request: Duration, fleet_median_ms: Option<u64>) -> bool {
-        let Some(median) = fleet_median_ms else {
-            return false;
-        };
-        let limit_ms = median
-            .saturating_mul(Self::SLOW_FACTOR * 2)
-            .max(Self::STALL_FLOOR_MS);
-        oldest_request > Duration::from_millis(limit_ms)
+            && self.latency_ms
+                > median
+                    .saturating_mul(Self::SLOW_FACTOR)
+                    .max(Self::SLOW_FLOOR_MS)
     }
 
     pub(crate) fn inflight_cap(&self, fleet_median_ms: Option<u64>) -> usize {
@@ -149,18 +141,22 @@ mod tests {
     }
 
     #[test]
-    fn old_requests_stall_only_past_the_floor_and_scaled_median() {
-        assert!(!PeerScore::is_stalled(Duration::from_secs(19), Some(1_000)));
-        assert!(PeerScore::is_stalled(Duration::from_secs(21), Some(1_000)));
-        assert!(!PeerScore::is_stalled(Duration::from_secs(21), Some(5_000)));
-        assert!(!PeerScore::is_stalled(Duration::from_mins(5), None));
-    }
-
-    #[test]
     fn only_proven_fast_peers_get_the_deep_pipeline() {
-        assert_eq!(ScoreFixture::proven(500).inflight_cap(Some(1_000)), PeerScore::FAST_CAP);
-        assert_eq!(ScoreFixture::proven(2_000).inflight_cap(Some(1_000)), PeerScore::BASE_CAP);
-        assert_eq!(PeerScore::new().inflight_cap(Some(1_000)), PeerScore::BASE_CAP);
-        assert_eq!(ScoreFixture::proven(500).inflight_cap(None), PeerScore::BASE_CAP);
+        assert_eq!(
+            ScoreFixture::proven(500).inflight_cap(Some(1_000)),
+            PeerScore::FAST_CAP
+        );
+        assert_eq!(
+            ScoreFixture::proven(2_000).inflight_cap(Some(1_000)),
+            PeerScore::BASE_CAP
+        );
+        assert_eq!(
+            PeerScore::new().inflight_cap(Some(1_000)),
+            PeerScore::BASE_CAP
+        );
+        assert_eq!(
+            ScoreFixture::proven(500).inflight_cap(None),
+            PeerScore::BASE_CAP
+        );
     }
 }
