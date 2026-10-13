@@ -1096,6 +1096,7 @@ impl RobinHoodEngine {
                 &mut self.wb_del_resolved,
             )?;
         self.pending_disk_deletes = deletes;
+        self.pending_disk_deletes.clear();
 
         Ok(())
     }
@@ -2284,6 +2285,54 @@ mod tests {
         let missing: Vec<_> = out.iter().filter(|r| r.coin.is_none()).collect();
         assert!(missing.is_empty(), "{} of {} live coins lost", missing.len(), live.len());
         assert_eq!(eng.table.len(), u64::try_from(live.len()).unwrap());
+    }
+
+    #[test]
+    fn a_synced_flush_drains_the_pending_disk_deletes() {
+        let dir = TmpFile::new("drain-deletes");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let mut eng = RobinHoodEngine::open(dir.path()).unwrap();
+        let op = make_op(7);
+        let mut header = make_header(1);
+        let created = [mantle_consensus::chain_view::NewCoin {
+            outpoint: op,
+            value: Satoshi::new(1),
+            script_pubkey: &[0x51],
+            coinbase: false,
+            height: BlockHeight::new(1),
+        }];
+        eng.write_block(&CommitBlockReq {
+            token: crate::types::ReqToken(1),
+            height: BlockHeight::new(1),
+            hash: Hash256::from_bytes([1; 32]),
+            prev_hash: Hash256::ZERO,
+            header,
+            created: &created,
+            spent: &[],
+            block_bytes: None,
+            durability: Durability::Synced,
+        })
+        .unwrap();
+        eng.flush(Durability::Synced).unwrap();
+
+        header.set_prev_block(Hash256::from_bytes([1; 32]));
+        eng.write_block(&CommitBlockReq {
+            token: crate::types::ReqToken(2),
+            height: BlockHeight::new(2),
+            hash: Hash256::from_bytes([2; 32]),
+            prev_hash: Hash256::from_bytes([1; 32]),
+            header,
+            created: &[],
+            spent: &[op],
+            block_bytes: None,
+            durability: Durability::Synced,
+        })
+        .unwrap();
+        assert_eq!(eng.pending_disk_deletes.len(), 1);
+        eng.flush(Durability::Synced).unwrap();
+
+        assert!(eng.pending_disk_deletes.is_empty());
+        assert!(eng.table.is_empty());
     }
 
     #[test]
