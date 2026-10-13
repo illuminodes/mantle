@@ -2,8 +2,9 @@
 //!
 //! Fixed 88-byte buckets stored in `utxo_table.bin`. Power-of-two slot count.
 //! Standard scriptPubKeys (≤34 bytes) stored inline; nonstandard overflow to
-//! a sidecar file. Phase 1 uses synchronous `pread`/`pwrite`; Phase 2 replaces
-//! with `io_uring` batched I/O.
+//! a sidecar file. Lookups probe with batched `io_uring` reads; write-buffer
+//! flushes sweep the table in slot order ([`FlushPass`]); growth rewrites it
+//! in one sequential pass ([`TableGrowth`]).
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
@@ -18,10 +19,13 @@ use mantle_consensus::chain_view::{Coin, TipInfo};
 use super::{Engine, EngineError};
 use crate::types::{CommitBlockReq, Durability, LookupResult};
 
+mod chunk_cache;
+mod flush_pass;
 mod growth;
 mod placement_stream;
 mod slot_window;
 
+use flush_pass::FlushPass;
 use growth::TableGrowth;
 
 const BUCKET_SIZE: usize = 88;
@@ -152,15 +156,6 @@ impl Bucket {
             script_pubkey,
         }
     }
-}
-
-// ── Insert state (used by insert_batch_uring) ────────────────────────────────
-
-pub struct InsertState {
-    bucket: Bucket,
-    slot: u64,
-    ideal: u64,
-    resolved: bool,
 }
 
 // ── Hash function ────────────────────────────────────────────────────────────
@@ -503,6 +498,31 @@ impl RobinHoodTable {
         self.flush_header()
     }
 
+    /// Remove `deletes`, then insert `pairs`, reading and writing each touched
+    /// run of slots once.
+    ///
+    /// # Errors
+    /// Returns an error on I/O failure.
+    ///
+    /// # Panics
+    /// Panics if the table fills despite the load-factor check.
+    pub fn apply_flush(
+        &mut self,
+        ring: &mut ququmatz::IoUring,
+        deletes: &[OutPoint],
+        pairs: &[(OutPoint, Coin)],
+    ) -> io::Result<()> {
+        let incoming = u64::try_from(pairs.len()).expect("batch fits u64");
+        while (self.live_count + incoming) * LOAD_FACTOR_DEN > self.slot_count * LOAD_FACTOR_NUM {
+            self.resize()?;
+        }
+        let inserts = pairs
+            .iter()
+            .map(|(op, coin)| Bucket::from_outpoint_and_coin(op, coin, 1, &mut self.overflow))
+            .collect::<io::Result<Vec<_>>>()?;
+        FlushPass::new(self).apply(ring, deletes, inserts)
+    }
+
     #[must_use]
     pub fn len(&self) -> u64 {
         self.live_count
@@ -519,319 +539,6 @@ impl RobinHoodTable {
         self.flush_header()?;
         self.overflow.sync_all()?;
         self.file.sync_all()
-    }
-
-    /// Batched insert using `io_uring`.
-    ///
-    /// Inserts all `(OutPoint, Coin)` pairs via wave-based Robin Hood probing.
-    /// Each wave submits one `pread` per pending entry (its current probe slot),
-    /// waits for all completions, then either writes the entry into an empty slot,
-    /// displaces a weaker incumbent (Robin Hood steal), or advances to the next
-    /// probe slot.  Typically completes in 2–4 waves for realistic load factors.
-    ///
-    /// Scratch vecs (`arena`, `states`) are passed in by the caller so they can
-    /// be reused across calls without re-allocating.
-    ///
-    /// # Errors
-    /// Returns an error on I/O failure.
-    ///
-    /// # Panics
-    /// Panics if the table fills despite the load-factor check (bug in resize
-    /// logic) or if the `live_count` would overflow.
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_lines)]
-    pub fn insert_batch_uring(
-        &mut self,
-        pairs: &[(OutPoint, Coin)],
-        ring: &mut ququmatz::IoUring,
-        arena: &mut Vec<u8>,
-        write_arena: &mut Vec<u8>,
-        states: &mut Vec<InsertState>,
-    ) -> io::Result<()> {
-        if pairs.is_empty() {
-            return Ok(());
-        }
-
-        let incoming = u64::try_from(pairs.len()).expect("batch fits u64");
-        while (self.live_count + incoming) * LOAD_FACTOR_DEN > self.slot_count * LOAD_FACTOR_NUM {
-            self.resize()?;
-        }
-
-        let fd = self.uring_fd();
-
-        states.clear();
-        for (op, coin) in pairs {
-            let ideal = self.ideal_slot(op);
-            states.push(InsertState {
-                bucket: Bucket::from_outpoint_and_coin(op, coin, 1, &mut self.overflow)?,
-                slot: ideal,
-                ideal,
-                resolved: false,
-            });
-        }
-
-        let n = states.len();
-        let needed = n * BUCKET_SIZE;
-        arena.clear();
-        arena.resize(needed, 0u8);
-        write_arena.clear();
-        write_arena.resize(needed, 0u8);
-
-        let mut claimed: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        loop {
-            let mut submitted = 0u32;
-            claimed.clear();
-            for (i, state) in states.iter().enumerate() {
-                if state.resolved || claimed.contains(&state.slot) {
-                    continue;
-                }
-                let offset = Self::slot_offset(state.slot);
-                let buf_start = i * BUCKET_SIZE;
-                let sqe = unsafe {
-                    ququmatz::Sqe::read_ptr(
-                        fd,
-                        arena[buf_start..].as_mut_ptr(),
-                        u32::try_from(BUCKET_SIZE).expect("BUCKET_SIZE fits u32"),
-                        offset,
-                    )
-                }
-                .user_data(u64::try_from(i).expect("index fits u64"));
-                if !self.try_push_read(ring, sqe)? {
-                    break;
-                }
-                claimed.insert(state.slot);
-                submitted += 1;
-            }
-
-            if submitted == 0 {
-                break;
-            }
-
-            ring.submit_and_wait(submitted).map_err(uring_err)?;
-
-            let mut writes: Vec<u64> = Vec::new();
-            let mut write_cursor: usize = 0;
-
-            while let Some(cqe) = ring.complete() {
-                let i = usize::try_from(cqe.user_data()).expect("user_data index fits usize");
-                if i >= n {
-                    continue;
-                }
-                let res = cqe.raw_result();
-                if res < 0 {
-                    return Err(io::Error::from_raw_os_error(-res));
-                }
-
-                let buf_start = i * BUCKET_SIZE;
-                let buf: &[u8; BUCKET_SIZE] = arena[buf_start..buf_start + BUCKET_SIZE]
-                    .try_into()
-                    .expect("bucket-aligned slice");
-                let existing = Bucket::decode(buf);
-
-                let state = &mut states[i];
-
-                let write_to_slot = if existing.is_empty() {
-                    self.live_count += 1;
-                    state.resolved = true;
-                    Some(state.slot)
-                } else if existing.matches(&state.bucket.outpoint()) {
-                    state.bucket.probe_distance = existing.probe_distance;
-                    state.resolved = true;
-                    Some(state.slot)
-                } else if existing.probe_distance < state.bucket.probe_distance {
-                    let slot = state.slot;
-                    let to_write = std::mem::replace(&mut state.bucket, existing);
-                    state.bucket.probe_distance += 1;
-                    state.slot = (state.slot + 1) & self.mask;
-                    state.ideal = state.slot;
-                    // Encode the entry we're placing (not the displaced one).
-                    let wb = write_cursor * BUCKET_SIZE;
-                    if wb + BUCKET_SIZE > write_arena.len() {
-                        write_arena.resize(wb + BUCKET_SIZE, 0);
-                    }
-                    to_write.encode((&mut write_arena[wb..wb + BUCKET_SIZE]).try_into().expect("bucket-aligned slice"));
-                    writes.push(slot);
-                    write_cursor += 1;
-                    None // already handled
-                } else {
-                    state.bucket.probe_distance += 1;
-                    state.slot = (state.slot + 1) & self.mask;
-                    assert!(
-                        state.slot != state.ideal,
-                        "insert_batch_uring: table full despite load-factor check"
-                    );
-                    None
-                };
-
-                if let Some(slot) = write_to_slot {
-                    let wb = write_cursor * BUCKET_SIZE;
-                    if wb + BUCKET_SIZE > write_arena.len() {
-                        write_arena.resize(wb + BUCKET_SIZE, 0);
-                    }
-                    state
-                        .bucket
-                        .encode((&mut write_arena[wb..wb + BUCKET_SIZE]).try_into().expect("bucket-aligned slice"));
-                    writes.push(slot);
-                    write_cursor += 1;
-                }
-            }
-
-            let mut write_count = 0u32;
-            for (w_idx, slot) in writes.iter().enumerate() {
-                let buf_start = w_idx * BUCKET_SIZE;
-                let offset = Self::slot_offset(*slot);
-                let sqe = unsafe {
-                    ququmatz::Sqe::write_ptr(
-                        fd,
-                        write_arena[buf_start..].as_ptr(),
-                        u32::try_from(BUCKET_SIZE).expect("BUCKET_SIZE fits u32"),
-                        offset,
-                    )
-                }
-                .user_data(u64::MAX);
-                flush_if_full(ring, self.apply_fd_flags(sqe), &mut write_count)?;
-            }
-
-            if write_count > 0 {
-                ring.submit_and_wait(write_count).map_err(uring_err)?;
-                while ring.complete().is_some() {}
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Batched delete.
-    ///
-    /// Locates every target with batched `io_uring` reads, then removes the
-    /// found entries one at a time. Each backshift reads the table as the
-    /// previous one left it; running backshifts concurrently corrupts
-    /// chains that overlap.
-    ///
-    /// Scratch vecs are passed in by the caller for reuse.
-    ///
-    /// # Errors
-    /// Returns an error on I/O failure.
-    ///
-    /// # Panics
-    /// Panics only on internal invariant violations that cannot occur in
-    /// correct usage (infallible `u32`/`usize` casts on compile-time constants).
-    #[allow(clippy::too_many_arguments)]
-    pub fn remove_batch_uring(
-        &mut self,
-        ops: &[OutPoint],
-        ring: &mut ququmatz::IoUring,
-        arena: &mut Vec<u8>,
-        slots: &mut Vec<u64>,
-        dists: &mut Vec<u16>,
-        resolved: &mut Vec<bool>,
-    ) -> io::Result<()> {
-        if ops.is_empty() {
-            return Ok(());
-        }
-
-        let found_slots =
-            self.remove_probe_phase(ops, ring, arena, slots, dists, resolved)?;
-
-        for (op, found) in ops.iter().zip(&found_slots) {
-            if found.is_some() {
-                self.remove(op)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Phase 1 of [`remove_batch_uring`]: probe the table to locate each
-    /// target slot (mirrors `get_batch_uring`).
-    ///
-    /// Returns `found_slots` where `found_slots[i] == Some(slot)` once the
-    /// entry for `ops[i]` has been located.
-    #[allow(clippy::too_many_arguments)]
-    fn remove_probe_phase(
-        &self,
-        ops: &[OutPoint],
-        ring: &mut ququmatz::IoUring,
-        arena: &mut Vec<u8>,
-        slots: &mut Vec<u64>,
-        dists: &mut Vec<u16>,
-        resolved: &mut Vec<bool>,
-    ) -> io::Result<Vec<Option<u64>>> {
-        let n = ops.len();
-        let fd = self.uring_fd();
-
-        slots.clear();
-        slots.extend(ops.iter().map(|op| self.ideal_slot(op)));
-        dists.clear();
-        dists.resize(n, 1);
-        resolved.clear();
-        resolved.resize(n, false);
-
-        let mut found_slots: Vec<Option<u64>> = vec![None; n];
-
-        let needed = n * BUCKET_SIZE;
-        arena.clear();
-        arena.resize(needed, 0u8);
-
-        loop {
-            let mut submitted = 0u32;
-            for i in 0..n {
-                if resolved[i] {
-                    continue;
-                }
-                let offset = Self::slot_offset(slots[i]);
-                let buf_start = i * BUCKET_SIZE;
-                let sqe = unsafe {
-                    ququmatz::Sqe::read_ptr(
-                        fd,
-                        arena[buf_start..].as_mut_ptr(),
-                        u32::try_from(BUCKET_SIZE).expect("BUCKET_SIZE fits u32"),
-                        offset,
-                    )
-                }
-                .user_data(u64::try_from(i).expect("index fits u64"));
-                if !self.try_push_read(ring, sqe)? {
-                    break;
-                }
-                submitted += 1;
-            }
-
-            if submitted == 0 {
-                break;
-            }
-
-            ring.submit_and_wait(submitted).map_err(uring_err)?;
-
-            while let Some(cqe) = ring.complete() {
-                let i = usize::try_from(cqe.user_data()).expect("user_data index fits usize");
-                if i >= n {
-                    continue;
-                }
-                let res = cqe.raw_result();
-                if res < 0 {
-                    return Err(io::Error::from_raw_os_error(-res));
-                }
-
-                let buf_start = i * BUCKET_SIZE;
-                let buf: &[u8; BUCKET_SIZE] = arena[buf_start..buf_start + BUCKET_SIZE]
-                    .try_into()
-                    .expect("bucket-aligned slice");
-                let bucket = Bucket::decode(buf);
-
-                if bucket.is_empty() || bucket.probe_distance < dists[i] {
-                    resolved[i] = true; // not found
-                    continue;
-                }
-                if bucket.matches(&ops[i]) {
-                    found_slots[i] = Some(slots[i]);
-                    resolved[i] = true;
-                    continue;
-                }
-                dists[i] += 1;
-                slots[i] = (slots[i] + 1) & self.mask;
-            }
-        }
-
-        Ok(found_slots)
     }
 
     /// Batched UTXO lookup using `io_uring`.
@@ -994,12 +701,6 @@ pub struct RobinHoodEngine {
     uring_resolved: Vec<bool>,
     // Scratch buffers reused across flush_write_buffer calls.
     wb_pairs: Vec<(OutPoint, Coin)>,
-    wb_insert_arena: Vec<u8>,
-    wb_write_arena: Vec<u8>,
-    wb_insert_states: Vec<InsertState>,
-    wb_del_slots: Vec<u64>,
-    wb_del_dists: Vec<u16>,
-    wb_del_resolved: Vec<bool>,
     headers: HeaderStore,
 }
 
@@ -1044,12 +745,6 @@ impl RobinHoodEngine {
             uring_dists: Vec::new(),
             uring_resolved: Vec::new(),
             wb_pairs: Vec::new(),
-            wb_insert_arena: Vec::new(),
-            wb_write_arena: Vec::new(),
-            wb_insert_states: Vec::new(),
-            wb_del_slots: Vec::new(),
-            wb_del_dists: Vec::new(),
-            wb_del_resolved: Vec::new(),
             headers,
         };
         engine.recover()?;
@@ -1073,34 +768,11 @@ impl RobinHoodEngine {
             self.wb_pairs.push((op, coin));
         }
 
-        if !self.wb_pairs.is_empty() {
-            self.table
-                .insert_batch_uring(
-                    &self.wb_pairs,
-                    &mut self.ring,
-                    &mut self.wb_insert_arena,
-                    &mut self.wb_write_arena,
-                    &mut self.wb_insert_states,
-                )
-                ?;
-            self.wb_pairs.clear();
-            self.refresh_registered_fd()?;
-        }
-
-        let deletes = std::mem::take(&mut self.pending_disk_deletes);
         self.table
-            .remove_batch_uring(
-                &deletes,
-                &mut self.ring,
-                &mut self.read_arena,
-                &mut self.wb_del_slots,
-                &mut self.wb_del_dists,
-                &mut self.wb_del_resolved,
-            )?;
-        self.pending_disk_deletes = deletes;
+            .apply_flush(&mut self.ring, &self.pending_disk_deletes, &self.wb_pairs)?;
+        self.wb_pairs.clear();
         self.pending_disk_deletes.clear();
-
-        Ok(())
+        self.refresh_registered_fd()
     }
 }
 
@@ -1318,32 +990,6 @@ fn pwrite_all(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
     file.write_all_at(buf, offset)
 }
 
-/// Push `sqe` onto the ring. If the SQ is full, submit and drain all in-flight
-/// entries first, then retry. `submitted` tracks how many SQEs are pending
-/// for the caller's final `submit_and_wait`.
-fn flush_if_full(
-    ring: &mut ququmatz::IoUring,
-    sqe: ququmatz::Sqe,
-    submitted: &mut u32,
-) -> io::Result<()> {
-    let copy = sqe;
-    match ring.push(sqe) {
-        Ok(()) => {
-            *submitted += 1;
-            Ok(())
-        }
-        Err(ququmatz::Error::Submit(ququmatz::SubmitError::QueueFull)) => {
-            ring.submit_and_wait(*submitted).map_err(uring_err)?;
-            while ring.complete().is_some() {}
-            *submitted = 0;
-            ring.push(copy).map_err(uring_err)?;
-            *submitted += 1;
-            Ok(())
-        }
-        Err(e) => Err(uring_err(e)),
-    }
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1392,6 +1038,53 @@ mod tests {
             script_pubkey: ScriptPubKey::from_slice(spk),
             height: BlockHeight::new(100),
             coinbase: false,
+        }
+    }
+
+    /// The old batch-call signatures, routed through [`RobinHoodTable::apply_flush`].
+    trait FlushCalls {
+        fn insert_batch_uring(
+            &mut self,
+            pairs: &[(OutPoint, Coin)],
+            ring: &mut ququmatz::IoUring,
+            arena: &mut Vec<u8>,
+            write_arena: &mut Vec<u8>,
+            states: &mut Vec<u8>,
+        ) -> io::Result<()>;
+
+        fn remove_batch_uring(
+            &mut self,
+            ops: &[OutPoint],
+            ring: &mut ququmatz::IoUring,
+            arena: &mut Vec<u8>,
+            slots: &mut Vec<u64>,
+            dists: &mut Vec<u16>,
+            resolved: &mut Vec<bool>,
+        ) -> io::Result<()>;
+    }
+
+    impl FlushCalls for RobinHoodTable {
+        fn insert_batch_uring(
+            &mut self,
+            pairs: &[(OutPoint, Coin)],
+            ring: &mut ququmatz::IoUring,
+            _arena: &mut Vec<u8>,
+            _write_arena: &mut Vec<u8>,
+            _states: &mut Vec<u8>,
+        ) -> io::Result<()> {
+            self.apply_flush(ring, &[], pairs)
+        }
+
+        fn remove_batch_uring(
+            &mut self,
+            ops: &[OutPoint],
+            ring: &mut ququmatz::IoUring,
+            _arena: &mut Vec<u8>,
+            _slots: &mut Vec<u64>,
+            _dists: &mut Vec<u16>,
+            _resolved: &mut Vec<bool>,
+        ) -> io::Result<()> {
+            self.apply_flush(ring, ops, &[])
         }
     }
 
