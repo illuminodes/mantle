@@ -18,10 +18,16 @@ use mantle_consensus::chain_view::{Coin, TipInfo};
 use super::{Engine, EngineError};
 use crate::types::{CommitBlockReq, Durability, LookupResult};
 
+mod growth;
+mod placement_stream;
+mod slot_window;
+
+use growth::TableGrowth;
+
 const BUCKET_SIZE: usize = 88;
 const BUCKET_SIZE_U64: u64 = BUCKET_SIZE as u64;
 const MAGIC: [u8; 8] = *b"MANTLEU\0";
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 const INITIAL_SLOT_COUNT: u64 = 1024;
 const MAX_INLINE_SPK: usize = 34;
 const OVERFLOW_MARKER: u16 = 0xFFFF;
@@ -159,9 +165,11 @@ pub struct InsertState {
 
 // ── Hash function ────────────────────────────────────────────────────────────
 
+const VOUT_SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+
 fn hash_outpoint(op: &OutPoint) -> u64 {
-    // OutPoint.txid is SHA-256d output — first 8 bytes are uniformly distributed.
-    u64::from_le_bytes(op.txid.as_bytes()[..8].try_into().unwrap())
+    let txid_bits = u64::from_le_bytes(op.txid.as_bytes()[..8].try_into().unwrap());
+    txid_bits ^ u64::from(op.vout).wrapping_mul(VOUT_SPREAD)
 }
 
 // ── File header ──────────────────────────────────────────────────────────────
@@ -397,8 +405,13 @@ impl RobinHoodTable {
             self.resize()?;
         }
 
-        let ideal = self.ideal_slot(op);
-        let mut current = Bucket::from_outpoint_and_coin(op, coin, 1, &mut self.overflow)?;
+        let bucket = Bucket::from_outpoint_and_coin(op, coin, 1, &mut self.overflow)?;
+        self.place(bucket)
+    }
+
+    fn place(&mut self, mut current: Bucket) -> io::Result<()> {
+        current.probe_distance = 1;
+        let ideal = self.ideal_slot(&current.outpoint());
         let mut slot = ideal;
 
         loop {
@@ -477,28 +490,17 @@ impl RobinHoodTable {
     fn resize(&mut self) -> io::Result<()> {
         let new_count = self.slot_count * 2;
         let new_path = self.path.with_extension("new");
-        {
-            let mut new_table = Self::create(&new_path, new_count)?;
-            for slot in 0..self.slot_count {
-                let bucket = self.read_bucket(slot)?;
-                if !bucket.is_empty() {
-                    let op = bucket.outpoint();
-                    let coin = bucket.to_coin(&self.overflow)?;
-                    new_table.insert(&op, &coin)?;
-                }
-            }
-            new_table.flush_header()?;
-        }
+        let deferred = TableGrowth::new(self).write(&new_path)?;
         std::fs::rename(&new_path, &self.path)?;
-        let new_overflow_path = overflow_path(&new_path);
-        let old_overflow_path = overflow_path(&self.path);
-        std::fs::rename(&new_overflow_path, &old_overflow_path)?;
         self.file = OpenOptions::new().read(true).write(true).open(&self.path)?;
-        self.overflow = open_overflow_file(&old_overflow_path)?;
         self.slot_count = new_count;
         self.mask = new_count - 1;
+        self.live_count -= u64::try_from(deferred.len()).expect("deferred count fits u64");
         self.fixed_fd = None;
-        Ok(())
+        for bucket in deferred {
+            self.place(bucket)?;
+        }
+        self.flush_header()
     }
 
     #[must_use]
