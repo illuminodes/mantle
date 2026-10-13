@@ -8,7 +8,6 @@ use mantle_consensus::validation::{Prevout, ScriptChecks, TxScriptContext};
 
 use super::ScriptPool;
 use super::job::ScriptJob;
-use super::roster::PoolRoster;
 use super::verdict::{BlockVerdict, InputPosition, JobOutcome};
 
 /// The script checks of one block, spread over a [`ScriptPool`].
@@ -37,19 +36,15 @@ impl<'p, 'env> ScriptBatch<'p, 'env> {
         // SAFETY: `wait_all` runs before the scope that created this batch
         // returns, from `settle` or from `Drop` while unwinding, and `'env`
         // outlives that scope.
-        let mut job = unsafe { job.erase() };
+        let job = unsafe { job.erase() };
         self.outstanding += 1;
-        loop {
-            match self.pool.jobs.push(job) {
-                Ok(()) => return,
-                Err(rejected) => {
-                    job = rejected;
-                    self.pool.roster.wake_workers();
-                    if !self.help_once() {
-                        std::thread::yield_now();
-                    }
-                }
-            }
+        let Err(job) = self.pool.jobs.push(job) else {
+            return;
+        };
+        self.collect_ready();
+        self.help_once();
+        if self.pool.jobs.push_block(job).is_err() {
+            unreachable!("the pool owns the only job producer, so the ring stays open");
         }
     }
 
@@ -80,9 +75,15 @@ impl<'p, 'env> ScriptBatch<'p, 'env> {
 
     fn wait_all(&mut self) {
         while self.outstanding > 0 {
-            if !self.help_once() && self.outstanding > 0 {
-                PoolRoster::park();
+            if self.help_once() || self.outstanding == 0 {
+                continue;
             }
+            let outcome = self
+                .pool
+                .outcomes
+                .pop_block()
+                .expect("script workers outlive the pool, so the outcome ring stays open");
+            self.record(outcome);
         }
     }
 
@@ -120,7 +121,6 @@ impl<'env> ScriptChecks<'env> for ScriptBatch<'_, 'env> {
                 },
             ));
         }
-        self.pool.roster.wake_workers();
         Ok(())
     }
 

@@ -203,6 +203,17 @@ fn one_pool_serves_many_blocks() {
 }
 
 #[test]
+fn idle_workers_wake_for_each_of_many_tiny_blocks_and_release_on_drop() {
+    let mut chain = Chain::new();
+    let mut pool = ScriptPool::new(8).expect("spawn");
+    for _ in 0..500 {
+        let block = wide_block(&mut chain, 1, 2);
+        assert_eq!(chain.pooled(&mut pool, &block), chain.inline(&block));
+    }
+    drop(pool);
+}
+
+#[test]
 fn a_block_rejected_before_its_scripts_finish_leaves_the_pool_usable() {
     let mut chain = Chain::new();
     let mut block = wide_block(&mut chain, 20, 20);
