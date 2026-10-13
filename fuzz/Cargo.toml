@@ -1,0 +1,42 @@
+[package]
+name = "mantle-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[[bin]]
+name = "fuzz_varint"
+path = "fuzz_targets/fuzz_varint.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_primitives"
+path = "fuzz_targets/fuzz_primitives.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_network"
+path = "fuzz_targets/fuzz_network.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_script_differential"
+path = "fuzz_targets/fuzz_script_differential.rs"
+test = false
+doc = false
+
+[dependencies]
+mantle = { path = "../crates/mantle" }
+mantle-conformance = { path = "../conformance" }
+mantle-consensus = { path = "../crates/consensus" }
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+arbitrary = { version = "1", features = ["derive"] }
+
+# Prevent this from being included in the workspace.
+[workspace]

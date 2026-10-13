@@ -1,0 +1,12 @@
+[package]
+name = "mantle-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mantle = { path = "../mantle" }
+ququmatz.workspace = true

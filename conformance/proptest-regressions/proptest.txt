@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc dedbd3b1edf8735786253f4f13d2cef56585eb1c553bf1a4c24416987005e163 # shrinks to txids = [0000000000000000000000000000000000000000000000000000000000000000]
+cc 8c3ff80f84d0b37e7736bf0066f34bc1abd8cb40a0ebf01c3a33a4561b47ed6c # shrinks to b = Block { header: BlockHeader { version: 0, prev_block: 0000000000000000000000000000000000000000000000000000000000000000, merkle_root: 0000000000000000000000000000000000000000000000000000000000000000, time: 0, bits: CompactBits(0), nonce: 0 }, transactions: [Transaction { version: 0, inputs: [], outputs: [TxOut { value: Satoshi(0), script_pubkey: ScriptBuf([]) }], locktime: 0 }] }
+cc 6a409ccaee02b8fa54db00156a5f96d941324dc9770c0fedebcaf5bd122a650b # shrinks to h = 170060

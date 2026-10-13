@@ -1,0 +1,20 @@
+[package]
+name = "mantle-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+storage-dbg = []
+
+[dependencies]
+mantle = { path = "../mantle" }
+mantle-consensus = { path = "../consensus" }
+quetzalcoatl.workspace = true
+ququmatz.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

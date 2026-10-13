@@ -1,0 +1,124 @@
+[package]
+name = "mantle-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "codec"
+harness = false
+
+[[bench]]
+name = "hash"
+harness = false
+
+[[bench]]
+name = "mantle"
+harness = false
+
+[[bench]]
+name = "consensus"
+harness = false
+
+[[bench]]
+name = "script"
+harness = false
+
+[[bench]]
+name = "storage"
+harness = false
+
+[[bench]]
+name = "transport"
+harness = false
+
+[[bench]]
+name = "validator"
+harness = false
+
+[[bench]]
+name = "block_io"
+harness = false
+
+[[bench]]
+name = "replay_parity"
+harness = false
+
+[[bench]]
+name = "replay_parity_ordinals"
+harness = false
+
+[[bin]]
+name = "consensus-dhat"
+path = "src/consensus/dhat.rs"
+
+[[bin]]
+name = "consensus-pprof"
+path = "src/consensus/pprof.rs"
+
+[[bin]]
+name = "storage-dhat"
+path = "src/storage/dhat.rs"
+
+[[bin]]
+name = "storage-pprof"
+path = "src/storage/pprof.rs"
+
+[[bin]]
+name = "transport-dhat"
+path = "src/transport/dhat.rs"
+
+[[bin]]
+name = "transport-pprof"
+path = "src/transport/pprof.rs"
+
+[[bin]]
+name = "validator-dhat"
+path = "src/validator/dhat.rs"
+
+[[bin]]
+name = "validator-pprof"
+path = "src/validator/pprof.rs"
+
+[[bin]]
+name = "block-io-dhat"
+path = "src/block_io/dhat.rs"
+
+[[bin]]
+name = "block-io-pprof"
+path = "src/block_io/pprof.rs"
+
+[[bin]]
+name = "parity-dhat"
+path = "src/parity_dhat.rs"
+
+[[bin]]
+name = "replay-perf-window"
+path = "src/replay_perf_window.rs"
+
+[[bin]]
+name = "replay-dhat-window"
+path = "src/replay_dhat_window.rs"
+
+[dependencies]
+mantle = { path = "../crates/mantle" }
+mantle-consensus = { path = "../crates/consensus" }
+mantle-storage = { path = "../crates/storage" }
+mantle-transport = { path = "../crates/transport" }
+mantle-validator = { path = "../crates/validator" }
+mantle-block-io = { path = "../crates/block-io" }
+ququmatz.workspace = true
+dhat = "0.3"
+tempfile = "3"
+pprof = { version = "0.14", features = ["flamegraph"] }
+k256 = { workspace = true, features = ["ecdsa", "arithmetic"] }
+sha2 = { workspace = true }
+ripemd = { workspace = true }
+
+[dev-dependencies]
+divan = "0.1"
+bitcoinconsensus = { workspace = true }

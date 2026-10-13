@@ -1,0 +1,29 @@
+[package]
+name = "mantle-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# This crate is test-infrastructure only. It must never appear as a
+# [dependency] of mantle-node or mantle — only as a [dev-dependency]
+# of test/fuzz crates.
+[dependencies]
+bitcoinconsensus = { workspace = true }
+mantle = { path = "../crates/mantle" }
+mantle-consensus = { path = "../crates/consensus" }
+proptest = "1"
+k256 = { workspace = true, features = ["ecdsa", "schnorr", "arithmetic"] }
+sha2 = { workspace = true }
+ripemd = { workspace = true }
+
+[[test]]
+name = "bip_vectors"
+path = "tests/bip_vectors/mod.rs"
+
+[[test]]
+name = "proptest"
+path = "tests/proptest.rs"

@@ -1,0 +1,62 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/mantle",
+    "crates/consensus",
+    "crates/storage",
+    "crates/validator",
+    "crates/transport",
+    "crates/block-io",
+    "crates/fetcher",
+    "crates/utxo-hash",
+    "bench",
+    "conformance",
+    "replay",
+    "archive/storage-engines",
+    "archive/utxo-set",
+    "archive/bloom",
+    "archive/lru-cache",
+]
+default-members = [
+    "crates/mantle",
+    "crates/consensus",
+    "crates/storage",
+    "crates/validator",
+    "crates/transport",
+    "crates/block-io",
+    "crates/fetcher",
+    "crates/utxo-hash",
+    "bench",
+    "conformance",
+    "replay",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.lints.clippy]
+all = "warn"
+perf = "warn"
+pedantic = "warn"
+style = "warn"
+
+# cargo-fuzz requires debug info in release builds to get useful stack traces.
+[profile.release]
+debug = true
+
+[profile.replay]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
+[workspace.dependencies]
+sha2 = "0.11"
+sha1 = "0.11"
+ripemd = "0.2"
+k256 = { version = "0.14.0", default-features = false }
+bitcoinconsensus = "0.106.0"
+ququmatz = "0.16.2"
+quetzalcoatl = "0.15.2"
+
