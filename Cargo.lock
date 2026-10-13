@@ -873,6 +873,7 @@ dependencies = [
  "mantle-consensus",
  "mantle-storage",
  "mantle-utxo-hash",
+ "quetzalcoatl",
 ]
 
 [[package]]

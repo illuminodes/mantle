@@ -1,5 +1,4 @@
 use mantle::primitives::{BlockHeader, BlockHeight, Hash256};
-use mantle_consensus::script::ScriptExecutionCache;
 use mantle_validator::{HeaderSnapshot, PipelineOpts, ReplayBufs};
 use mantle_storage::types::{Durability, ReqToken};
 use std::hint::black_box;
@@ -107,12 +106,10 @@ fn commit(
     block: &mantle::primitives::Block,
     height: BlockHeight,
     snap: &HeaderSnapshot,
-    cache: &mut ScriptExecutionCache,
     token: u64,
 ) {
     bufs.validate_and_commit(block, height, storage, snap, PipelineOpts {
-        skip_script: true,
-        exec_cache: Some(cache),
+        scripts: mantle_validator::ScriptPolicy::Skip,
         durability: Durability::Memory,
         token: ReqToken(token),
         utxo_hash: None,
@@ -198,10 +195,9 @@ mod pipeline {
         let snap = make_snapshot(&[(hash, block.header)]);
         bencher.bench_local(|| {
             let (mut storage, _dir) = tmp_storage();
-            let mut cache = ScriptExecutionCache::new(1024);
             let mut bufs = ReplayBufs::new();
             commit(&mut bufs, &mut storage, black_box(&block),
-                   BlockHeight::new(1), &snap, &mut cache, 1);
+                   BlockHeight::new(1), &snap, 1);
             storage.shutdown().expect("shutdown");
         });
     }
@@ -269,17 +265,16 @@ mod pipeline {
 
         bencher.bench_local(|| {
             let (mut storage, _dir) = tmp_storage();
-            let mut cache = ScriptExecutionCache::new(1024);
             let mut bufs = ReplayBufs::new();
             commit(&mut bufs, &mut storage, &fund_block,
-                   BlockHeight::new(1), &snap, &mut cache, 1);
+                   BlockHeight::new(1), &snap, 1);
             for (i, b) in filler.iter().enumerate() {
                 commit(&mut bufs, &mut storage, b,
                        BlockHeight::new(2 + u32::try_from(i).unwrap()),
-                       &snap, &mut cache, 2 + i as u64);
+                       &snap, 2 + i as u64);
             }
             commit(&mut bufs, &mut storage, black_box(&spend_block),
-                   BlockHeight::new(102), &snap, &mut cache, 102);
+                   BlockHeight::new(102), &snap, 102);
             storage.shutdown().expect("shutdown");
         });
     }
@@ -301,12 +296,11 @@ mod pipeline {
 
         bencher.bench_local(|| {
             let (mut storage, _dir) = tmp_storage();
-            let mut cache = ScriptExecutionCache::new(1024);
             let mut bufs = ReplayBufs::new();
             for (i, block) in blocks.iter().enumerate() {
                 commit(&mut bufs, &mut storage, black_box(block),
                        BlockHeight::new(u32::try_from(i + 1).expect("fits")),
-                       &snap, &mut cache, i as u64);
+                       &snap, i as u64);
             }
             storage.shutdown().expect("shutdown");
         });
@@ -329,13 +323,11 @@ mod pipeline {
 
         bencher.bench_local(|| {
             let (mut storage, _dir) = tmp_storage();
-            let mut cache = ScriptExecutionCache::new(1024);
             let mut bufs = ReplayBufs::new();
             for (i, block) in blocks.iter().enumerate() {
                 bufs.validate_and_commit(block, BlockHeight::new(u32::try_from(i + 1).unwrap()),
                     &mut storage, &snap, PipelineOpts {
-                        skip_script: true,
-                        exec_cache: Some(&mut cache),
+                        scripts: mantle_validator::ScriptPolicy::Skip,
                         durability: Durability::Memory,
                         token: ReqToken(i as u64),
                         utxo_hash: None,
@@ -445,7 +437,6 @@ mod ordinals {
         height: BlockHeight,
         storage: &mut mantle_storage::StorageHandle<'static>,
         snap: &HeaderSnapshot,
-        cache: &mut ScriptExecutionCache,
         token: u64,
     ) {
         let mut spent_set: PrehashedSet<OutPoint> = PrehashedSet::default();
@@ -535,8 +526,7 @@ mod ordinals {
             &view,
             &mut scratch2,
             &mut ConnectScratch::new(),
-            true,
-            Some(cache),
+            &mut mantle_consensus::validation::SkippedScripts,
             None,
         )
         .unwrap_or_else(|e| panic!("connect_block {}: {e}", height.to_u32()));
@@ -579,13 +569,11 @@ mod ordinals {
 
         bencher.bench_local(|| {
             let (mut storage, _dir) = tmp_storage();
-            let mut cache = ScriptExecutionCache::new(64 * 1024);
             replay_block(
                 black_box(block),
                 height,
                 &mut storage,
                 &fix.snap,
-                &mut cache,
                 1,
             );
             storage.shutdown().expect("shutdown");

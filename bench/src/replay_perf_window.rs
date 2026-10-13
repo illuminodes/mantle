@@ -228,17 +228,28 @@ fn replay_block_timed(
     coins.extend(intra);
     let view = BenchView::new(&coins, snap, tip, dummy_on_miss);
     let mut scratch = Vec::new();
-    let cache_arg = if skip_script { None } else { Some(&mut *cache) };
-    let result = connect_block(
-        &block_ref,
-        height,
-        &view,
-        &mut scratch,
-        &mut ConnectScratch::new(),
-        skip_script,
-        cache_arg,
-        Some(&txids),
-    )
+    let connected = if skip_script {
+        connect_block(
+            &block_ref,
+            height,
+            &view,
+            &mut scratch,
+            &mut ConnectScratch::new(),
+            &mut mantle_consensus::validation::SkippedScripts,
+            Some(&txids),
+        )
+    } else {
+        connect_block(
+            &block_ref,
+            height,
+            &view,
+            &mut scratch,
+            &mut ConnectScratch::new(),
+            &mut mantle_consensus::validation::InlineScripts::new(Some(&mut *cache)),
+            Some(&txids),
+        )
+    };
+    let result = connected
     .unwrap_or_else(|e| panic!("connect_block at height {}: {e}", height.to_u32()));
     let connect = t0.elapsed();
 

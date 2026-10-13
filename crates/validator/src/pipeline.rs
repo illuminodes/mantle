@@ -2,20 +2,20 @@ use mantle::collections::{BuildPrehashedHasher, PrehashedMap, PrehashedSet};
 use mantle::primitives::{Block, BlockHeader, BlockHeight, BlockRef, Hash256, OutPoint, TxHash};
 use mantle_consensus::chain_view::{Coin, ConnectResult, ConnectScratch};
 use mantle_consensus::error::ValidationError;
-use mantle_consensus::script::ScriptExecutionCache;
 use mantle_consensus::tx_view::BlockView;
-use mantle_consensus::validation::{Bip30, connect_block};
+use mantle_consensus::validation::Bip30;
 use mantle_storage::ops::StorageOps;
 use mantle_storage::types::{CommitBlockReq, CommittedResp, Durability, ReqToken, StorageError};
 use mantle_utxo_hash::UtxoSetHash;
 
 use crate::prefetched_view::{HeaderSnapshot, PrefetchedView};
+use crate::script_policy::{ConnectCall, ScriptPolicy};
 use crate::utxo_hash_update::UtxoHashUpdate;
 
-/// Per-block pipeline options: script policy and storage commit parameters.
+/// Per-block pipeline options: script policy, storage commit parameters and
+/// UTXO hashing.
 pub struct PipelineOpts<'a> {
-    pub skip_script: bool,
-    pub exec_cache: Option<&'a mut ScriptExecutionCache>,
+    pub scripts: ScriptPolicy<'a>,
     pub durability: Durability,
     pub token: ReqToken,
     /// Updated with the block's UTXO delta once the block is committed.
@@ -215,8 +215,8 @@ impl ReplayBufs {
     /// Validate an owned `Block` and commit it to storage.
     ///
     /// Full pipeline: collect outpoints, batch-fetch from storage, run
-    /// `connect_block`, commit the UTXO delta. Reuses buffer capacity
-    /// across calls.
+    /// `connect_block` with `scripts` verifying inputs, commit the UTXO
+    /// delta. Reuses buffer capacity across calls.
     ///
     /// # Errors
     ///
@@ -227,7 +227,7 @@ impl ReplayBufs {
         height: BlockHeight,
         storage: &mut S,
         headers: &HeaderSnapshot,
-        opts: PipelineOpts<'_>,
+        mut opts: PipelineOpts<'_>,
     ) -> Result<CommittedResp, PipelineError>
     where
         S: for<'x> StorageOps<'x>,
@@ -240,16 +240,14 @@ impl ReplayBufs {
         let tip = storage.tip();
         let view = PrefetchedView::new(&self.coins, headers, tip);
 
-        let result = connect_block(
+        let result = opts.scripts.connect(ConnectCall {
             block,
             height,
-            &view,
-            &mut self.txid_scratch,
-            &mut self.connect_scratch,
-            opts.skip_script,
-            opts.exec_cache,
-            None,
-        )?;
+            view: &view,
+            scratch: &mut self.txid_scratch,
+            connect_scratch: &mut self.connect_scratch,
+            txids: None,
+        })?;
 
         let resp = storage.commit_block_borrowed(CommitBlockReq {
             token: opts.token,
@@ -292,8 +290,7 @@ impl ReplayBufs {
         height: BlockHeight,
         storage: &mut S,
         headers: &HeaderSnapshot,
-        skip_script: bool,
-        exec_cache: Option<&mut ScriptExecutionCache>,
+        mut scripts: ScriptPolicy<'_>,
     ) -> Result<ConnectResult<'blk>, PipelineError>
     where
         S: for<'x> StorageOps<'x>,
@@ -305,16 +302,14 @@ impl ReplayBufs {
         let tip = storage.tip();
         let view = PrefetchedView::new(&self.coins, headers, tip);
 
-        let result = connect_block(
-            block_ref,
+        let result = scripts.connect(ConnectCall {
+            block: block_ref,
             height,
-            &view,
-            &mut self.txid_scratch,
-            &mut self.connect_scratch,
-            skip_script,
-            exec_cache,
-            Some(&self.txids),
-        )?;
+            view: &view,
+            scratch: &mut self.txid_scratch,
+            connect_scratch: &mut self.connect_scratch,
+            txids: Some(&self.txids),
+        })?;
 
         Ok(result)
     }

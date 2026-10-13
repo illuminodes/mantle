@@ -13,7 +13,6 @@
 use std::path::PathBuf;
 
 use mantle::primitives::BlockHeight;
-use mantle_consensus::script::ScriptExecutionCache;
 use mantle_storage::types::Durability;
 
 #[global_allocator]
@@ -117,7 +116,6 @@ fn main() {
     } else {
         tmp_storage(&tag)
     };
-    let mut cache = ScriptExecutionCache::new(64 * 1024);
     let mut arena: Vec<u8> = Vec::new();
 
     // Warm up all scratch buffers (BenchReplayBufs, arena, engine internals) with
@@ -143,7 +141,6 @@ fn main() {
             BlockHeight::new(start),
             &mut storage,
             &snap,
-            &mut cache,
             1,
             dummy_on_miss,
             block_durability(start),
@@ -163,7 +160,6 @@ fn main() {
                 height,
                 &mut storage,
                 &snap,
-                &mut cache,
                 token,
                 dummy_on_miss,
                 block_durability(h),
@@ -178,7 +174,6 @@ fn main() {
             BlockHeight::new(start),
             &mut storage,
             &snap,
-            &mut cache,
             1,
             dummy_on_miss,
             &mut arena,
@@ -194,7 +189,6 @@ fn main() {
                 height,
                 &mut storage,
                 &snap,
-                &mut cache,
                 token,
                 dummy_on_miss,
                 &mut arena,

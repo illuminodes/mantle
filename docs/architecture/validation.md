@@ -305,9 +305,12 @@ The validator's runtime model:
 - A **script-verify worker pool** receives parallel script-verification jobs from the coordinator. Each job is `(scriptSig, scriptPubKey, witness, amount, flags, sighash)` → `accept/reject`. Workers are stateless; they just compute.
 - The coordinator gathers results, applies them to the in-progress block state, and emits commit messages to storage.
 
-Communication:
-- Coordinator → workers: `quetzalcoatl::spmc` ring (`ScriptJob`).
-- Workers → coordinator: `quetzalcoatl::mpsc` ring (`ScriptResult`).
+Communication (implemented in `crates/validator/src/script_pool/`):
+- Coordinator → workers: one shared `quetzalcoatl::mpmc` ring of per-input `ScriptJob`s. Not `spmc`: an SPMC consumer claims a batch of slots at once, so the first worker to wake takes a whole block's jobs.
+- Workers → coordinator: `quetzalcoatl::mpsc` ring of outcomes.
+- Idle workers and the waiting coordinator park with `park_timeout`. Submitting a job unparks the workers, and each outcome unparks the coordinator (`PoolRoster`).
+- While it waits, the coordinator runs queued jobs itself, so `n` workers keep `n + 1` cores busy.
+- `connect_block` hands each transaction to a `ScriptChecks` implementation once that transaction's other checks pass, and calls `finish` after the block-level checks. The pool reports the failure at the lowest `(tx_index, input_index)`, the same one a single-threaded run reports.
 - Coordinator → storage: SPSC pair already specified in `persistence.md`.
 
 This means the coordinator is the only thread interacting with storage. The workers do not have a `ChainView`; they get all the data they need handed to them in the job. This is deliberate — it keeps the storage seam clean and the workers trivially testable.

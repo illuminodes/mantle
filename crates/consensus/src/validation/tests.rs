@@ -654,8 +654,7 @@ fn connect_coinbase_only_block() {
         &view,
         &mut scratch,
         &mut ConnectScratch::new(),
-        false,
-        None,
+        &mut InlineScripts::new(None),
         None,
     )
     .expect("coinbase-only block must connect");
@@ -702,8 +701,7 @@ fn connect_block_with_spend() {
         &view,
         &mut scratch,
         &mut ConnectScratch::new(),
-        false,
-        None,
+        &mut InlineScripts::new(None),
         None,
     )
     .expect("block with valid spend must connect");
@@ -731,8 +729,7 @@ fn connect_missing_input_rejected() {
             &view,
             &mut scratch,
             &mut ConnectScratch::new(),
-            false,
-            None,
+            &mut InlineScripts::new(None),
             None
         ),
         Err(ValidationError::MissingInput {
@@ -773,8 +770,7 @@ fn connect_coinbase_maturity_rejected() {
             &view,
             &mut scratch,
             &mut ConnectScratch::new(),
-            false,
-            None,
+            &mut InlineScripts::new(None),
             None
         ),
         Err(ValidationError::CoinbaseMaturityViolation {
@@ -819,8 +815,7 @@ fn connect_script_verify_failure_propagates() {
         &view,
         &mut scratch,
         &mut ConnectScratch::new(),
-        false,
-        None,
+        &mut InlineScripts::new(None),
         None,
     );
     assert!(
@@ -868,8 +863,7 @@ fn connect_skip_script_bypasses_verification() {
         &view,
         &mut scratch,
         &mut ConnectScratch::new(),
-        true,
-        None,
+        &mut SkippedScripts,
         None,
     )
     .expect("skip_script=true must succeed even with OP_RETURN scriptPubKey");
@@ -907,8 +901,7 @@ fn connect_exec_cache_hits_on_second_call() {
         &view,
         &mut scratch,
         &mut ConnectScratch::new(),
-        false,
-        Some(&mut cache),
+        &mut InlineScripts::new(Some(&mut cache)),
         None,
     )
     .expect("first call must succeed");
@@ -921,8 +914,7 @@ fn connect_exec_cache_hits_on_second_call() {
         &view,
         &mut scratch,
         &mut ConnectScratch::new(),
-        false,
-        Some(&mut cache),
+        &mut InlineScripts::new(Some(&mut cache)),
         None,
     )
     .expect("second call must succeed");
@@ -963,8 +955,7 @@ fn connect_negative_fee_rejected() {
             &view,
             &mut scratch,
             &mut ConnectScratch::new(),
-            false,
-            None,
+            &mut InlineScripts::new(None),
             None
         ),
         Err(ValidationError::NegativeFee { tx_index: 1 })
@@ -998,8 +989,7 @@ fn connect_coinbase_reward_exceeds_subsidy_rejected() {
             &view,
             &mut scratch,
             &mut ConnectScratch::new(),
-            false,
-            None,
+            &mut InlineScripts::new(None),
             None
         ),
         Err(ValidationError::CoinbaseRewardExceedsSubsidy)
@@ -1066,8 +1056,7 @@ fn connect_sigops_limit_exceeded() {
         &view,
         &mut scratch,
         &mut ConnectScratch::new(),
-        false,
-        None,
+        &mut InlineScripts::new(None),
         None,
     )
     .expect_err("block with too many sigops must be rejected");
@@ -1111,8 +1100,7 @@ fn connect_bip30_violation_rejected() {
             &view,
             &mut scratch,
             &mut ConnectScratch::new(),
-            false,
-            None,
+            &mut InlineScripts::new(None),
             None
         ),
         Err(ValidationError::Bip30Violation { tx_index: 0 })
@@ -1185,8 +1173,7 @@ fn connect_bip30_rejects_overwriting_a_non_coinbase_coin_at_a_later_index() {
             &view,
             &mut scratch,
             &mut ConnectScratch::new(),
-            true,
-            None,
+            &mut SkippedScripts,
             None,
         ),
         Err(ValidationError::Bip30Violation { tx_index: 0 })
@@ -1229,8 +1216,7 @@ fn connect_exec_cache_script_failure_propagates() {
         &view,
         &mut scratch,
         &mut ConnectScratch::new(),
-        false,
-        Some(&mut cache),
+        &mut InlineScripts::new(Some(&mut cache)),
         None,
     );
     assert!(
@@ -1287,8 +1273,7 @@ fn connect_with_precomputed_txids() {
         &view,
         &mut scratch,
         &mut ConnectScratch::new(),
-        false,
-        None,
+        &mut InlineScripts::new(None),
         Some(&txids),
     )
     .expect("block with precomputed txids must connect");

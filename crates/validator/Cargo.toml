@@ -12,3 +12,4 @@ mantle = { path = "../mantle" }
 mantle-consensus = { path = "../consensus" }
 mantle-storage = { path = "../storage" }
 mantle-utxo-hash = { path = "../utxo-hash" }
+quetzalcoatl.workspace = true

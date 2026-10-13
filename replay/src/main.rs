@@ -11,7 +11,7 @@
 //!     validate_block_context(&block, &header_snapshot)?
 //!     validator::validate_and_commit(
 //!         &block, height, &mut storage, &header_snapshot,
-//!         skip_script, Some(&mut exec_cache),
+//!         ScriptPolicy::Parallel(&mut script_pool),
 //!         if height % 2016 == 0 { Synced } else { Memory },
 //!     )?
 //! ```
@@ -28,13 +28,13 @@ use std::process::ExitCode;
 use mantle::collections::{BuildPrehashedHasher, PrehashedMap};
 use mantle::network::Network;
 use mantle::primitives::{BlockHeader, BlockHeight, Hash256};
-use mantle_consensus::script::ScriptExecutionCache;
 use mantle_consensus::validation::{validate_block_context, validate_block_structure};
 use mantle_storage::StorageHandle;
 use mantle_storage::types::{Durability, ReqToken};
 use mantle::primitives::Block;
 use mantle_validator::{
     ForcedCommit, HeaderSnapshot, PipelineError, PipelineOpts, PrefetchedView, ReplayBufs,
+    ScriptPolicy, ScriptPool,
 };
 
 use crate::failures::{FailureLog, FailureStage};
@@ -48,7 +48,7 @@ struct ReplayCtx {
     storage: StorageHandle<'static>,
     skip_script: bool,
     allow_min_difficulty: bool,
-    cache: ScriptExecutionCache,
+    scripts: ScriptPool,
     bufs: ReplayBufs,
     token: u64,
     forced: ForcedCommit,
@@ -60,8 +60,6 @@ struct ReplayCtx {
 /// Block at which `Durability::Synced` flushes everything to disk. Matches
 /// difficulty-adjustment-period boundaries — a natural checkpoint cadence.
 const SYNC_EVERY: u32 = 2_016;
-/// Cap script-execution cache at this many entries.
-const SCRIPT_CACHE_ENTRIES: usize = 64 * 1024;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -71,6 +69,7 @@ struct Args {
     network: Network,
     extra_peers: PeerList,
     skip_script: bool,
+    script_threads: usize,
     download_only: bool,
     /// First height to validate. Defaults to `storage.tip().height + 1`.
     start_height: Option<BlockHeight>,
@@ -156,6 +155,9 @@ Options:
                           writes, or external sources like
                           https://testnet4.achownodes.xyz/seeds.txt.gz.
     --skip-script         Skip script verification (Stage 2; faster bring-up).
+    --script-threads N    Script-verification worker threads, besides the
+                          replay thread (default: CPUs - 1; 0 verifies on the
+                          replay thread only).
     --download-only       Fetch and cache blocks, without replaying or mutating
                           validated chain state. The only mode allowed on
                           networks other than mainnet, whose consensus
@@ -199,6 +201,7 @@ fn parse_args() -> Result<Args, String> {
     let mut network = Network::Mainnet;
     let mut extra_peers = PeerList::new();
     let mut skip_script = false;
+    let mut script_threads = ScriptPool::default_workers();
     let mut download_only = false;
     let mut start_height: Option<BlockHeight> = None;
     let mut stop_height: Option<BlockHeight> = None;
@@ -256,6 +259,13 @@ fn parse_args() -> Result<Args, String> {
             }
             "--skip-script" => {
                 skip_script = true;
+            }
+            "--script-threads" => {
+                i += 1;
+                let v = raw.get(i).ok_or("--script-threads requires N")?;
+                script_threads = v
+                    .parse()
+                    .map_err(|e| format!("invalid --script-threads {v}: {e}"))?;
             }
             "--download-only" => {
                 download_only = true;
@@ -391,6 +401,7 @@ fn parse_args() -> Result<Args, String> {
         network,
         extra_peers,
         skip_script,
+        script_threads,
         download_only,
         start_height,
         stop_height,
@@ -663,7 +674,8 @@ fn run(args: &Args) -> Result<u64, String> {
         storage,
         skip_script: args.skip_script,
         allow_min_difficulty,
-        cache: ScriptExecutionCache::new(SCRIPT_CACHE_ENTRIES),
+        scripts: ScriptPool::new(if args.skip_script { 0 } else { args.script_threads })
+            .map_err(|e| format!("spawn script workers: {e}"))?,
         bufs: ReplayBufs::new(),
         token: u64::from(tip.height.to_u32()).saturating_add(1),
         forced: ForcedCommit::new(),
@@ -673,10 +685,11 @@ fn run(args: &Args) -> Result<u64, String> {
     };
 
     eprintln!(
-        "  replaying {}..={} ({} script verification{})…",
+        "  replaying {}..={} ({} script verification, {} script workers{})…",
         start_height.to_u32(),
         actual_stop.to_u32(),
         if args.skip_script { "skipping" } else { "with" },
+        ctx.scripts.workers(),
         args.verify.mode_suffix(),
     );
 
@@ -780,8 +793,11 @@ impl ReplayCtx {
             &mut self.storage,
             snapshot,
             PipelineOpts {
-                skip_script: self.skip_script,
-                exec_cache: Some(&mut self.cache),
+                scripts: if self.skip_script {
+                    ScriptPolicy::Skip
+                } else {
+                    ScriptPolicy::Parallel(&mut self.scripts)
+                },
                 durability,
                 token,
                 utxo_hash: self.utxo_hash.as_mut().and_then(UtxoHashTracker::hash_mut),

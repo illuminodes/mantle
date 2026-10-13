@@ -146,8 +146,7 @@ impl RelativeLock {
             &self.view,
             &mut Vec::new(),
             &mut ConnectScratch::new(),
-            true,
-            None,
+            &mut super::SkippedScripts,
             None,
         )
         .map(|_| ())

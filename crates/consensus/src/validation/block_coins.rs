@@ -2,6 +2,7 @@ use mantle::collections::{PrehashedMap, PrehashedSet};
 use mantle::primitives::{BlockHeight, OutPoint, Satoshi};
 
 use crate::chain_view::{Coin, NewCoin};
+use super::tx_script_context::Prevout;
 
 /// The output an input spends, whether it came from the UTXO set or from an
 /// earlier transaction in the same block.
@@ -29,6 +30,13 @@ impl<'a> SpentCoin<'a> {
             script_pubkey: coin.script_pubkey,
             height: coin.height,
             coinbase: coin.coinbase,
+        }
+    }
+
+    pub(crate) fn prevout(&self) -> Prevout<'a> {
+        Prevout {
+            value: self.value,
+            script_pubkey: self.script_pubkey,
         }
     }
 }

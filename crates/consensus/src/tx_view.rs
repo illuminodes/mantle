@@ -27,7 +27,7 @@ use mantle::primitives::{
 /// The associated `Tx` type is the per-transaction view: `Transaction` for
 /// owned blocks, `TransactionRef<'a>` for borrowed.
 pub trait BlockView {
-    type Tx<'a>: TxView
+    type Tx<'a>: TxView + Sync
     where
         Self: 'a;
     type TxIter<'a>: Iterator<Item = &'a Self::Tx<'a>>

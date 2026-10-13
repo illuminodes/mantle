@@ -5,7 +5,6 @@ use mantle::primitives::{
     Nonce, OutPoint, Satoshi, Sequence, Transaction, TxHash, TxIn, TxOut, TxVersion, Witness,
 };
 use mantle_consensus::merkle::compute_merkle_root;
-use mantle_consensus::script::ScriptExecutionCache;
 use mantle_storage::StorageHandle;
 use mantle_storage::types::{Durability, ReqToken};
 use mantle_validator::{HeaderSnapshot, PipelineOpts, ReplayBufs};
@@ -159,7 +158,6 @@ pub fn commit(
     block: &Block,
     height: BlockHeight,
     snap: &HeaderSnapshot,
-    cache: &mut ScriptExecutionCache,
     token: u64,
 ) {
     bufs.validate_and_commit(
@@ -168,8 +166,7 @@ pub fn commit(
         storage,
         snap,
         PipelineOpts {
-            skip_script: true,
-            exec_cache: Some(cache),
+            scripts: mantle_validator::ScriptPolicy::Skip,
             durability: Durability::Memory,
             token: ReqToken(token),
             utxo_hash: None,
@@ -239,7 +236,6 @@ pub fn seed_storage(
     state: &SeedState,
     storage: &mut StorageHandle<'static>,
     bufs: &mut ReplayBufs,
-    cache: &mut ScriptExecutionCache,
 ) {
     commit(
         bufs,
@@ -247,7 +243,6 @@ pub fn seed_storage(
         &state.fund_block,
         BlockHeight::new(state.fund_height),
         &state.snap,
-        cache,
         1,
     );
     for (i, b) in state.filler.iter().enumerate() {
@@ -257,7 +252,6 @@ pub fn seed_storage(
             b,
             BlockHeight::new(2 + u32::try_from(i).expect("fits")),
             &state.snap,
-            cache,
             2 + u64::try_from(i).expect("fits"),
         );
     }

@@ -14,7 +14,6 @@ use mantle::primitives::{
 };
 use mantle_consensus::chain_view::{ChainView, Coin, ConnectScratch, TipInfo};
 use mantle_consensus::error::ChainViewError;
-use mantle_consensus::script::ScriptExecutionCache;
 use mantle_consensus::validation::{Bip30, connect_block};
 use mantle_storage::StorageHandle;
 use mantle_storage::types::{CommitBlockReq, Durability, LookupResult, ReqToken};
@@ -191,7 +190,6 @@ pub fn replay_block(
     height: BlockHeight,
     storage: &mut StorageHandle<'static>,
     snap: &HeaderSnapshot,
-    cache: &mut ScriptExecutionCache,
     token: u64,
     dummy_on_miss: bool,
 ) {
@@ -280,8 +278,7 @@ pub fn replay_block(
         &view,
         &mut scratch2,
         &mut ConnectScratch::new(),
-        true,
-        Some(cache),
+        &mut mantle_consensus::validation::SkippedScripts,
         None,
     )
     .unwrap_or_else(|e| panic!("connect_block at height {}: {e}", height.to_u32()));
@@ -309,13 +306,11 @@ pub fn replay_block(
 /// `wire` is the raw block bytes (BIP144 wire form). `arena` is a caller-owned
 /// scratch buffer that holds non-witness preimages for any segwit txs in the
 /// block; reuse it across calls so its capacity amortises.
-#[allow(clippy::too_many_arguments)]
 pub fn replay_block_ref(
     wire: &[u8],
     height: BlockHeight,
     storage: &mut StorageHandle<'static>,
     snap: &HeaderSnapshot,
-    cache: &mut ScriptExecutionCache,
     token: u64,
     dummy_on_miss: bool,
     arena: &mut Vec<u8>,
@@ -350,8 +345,7 @@ pub fn replay_block_ref(
         &view,
         &mut scratch,
         &mut ConnectScratch::new(),
-        true,
-        Some(cache),
+        &mut mantle_consensus::validation::SkippedScripts,
         Some(&txids),
     )
     .unwrap_or_else(|e| panic!("connect_block at height {}: {e}", height.to_u32()));
@@ -505,7 +499,6 @@ pub fn replay_block_ref_reusing(
     height: BlockHeight,
     storage: &mut StorageHandle<'static>,
     snap: &HeaderSnapshot,
-    cache: &mut ScriptExecutionCache,
     token: u64,
     dummy_on_miss: bool,
     durability: Durability,
@@ -613,8 +606,7 @@ pub fn replay_block_ref_reusing(
         &view,
         &mut bufs.hash_scratch,
         &mut bufs.connect_scratch,
-        true,
-        Some(cache),
+        &mut mantle_consensus::validation::SkippedScripts,
         Some(&bufs.txids),
     )
     .unwrap_or_else(|e| panic!("connect_block at height {}: {e}", height.to_u32()));

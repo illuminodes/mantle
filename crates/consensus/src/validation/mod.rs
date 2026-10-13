@@ -3,6 +3,7 @@ pub(crate) mod block_coins;
 mod clock;
 mod connect;
 mod pow;
+mod script_checks;
 mod sequence_locks;
 mod sigop_cost;
 mod structure;
@@ -16,6 +17,8 @@ pub use bip30::Bip30;
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use connect::{BlockHeightExt, connect_block};
 pub use sigop_cost::SigopCost;
+pub use script_checks::{InlineScripts, ScriptChecks, SkippedScripts};
+pub use tx_script_context::{Prevout, TxScriptContext};
 pub use pow::{HeaderValidationExt, RetargetExt};
 pub use structure::{
     BIP34_HEIGHT, MAX_BLOCK_TRANSACTIONS, MAX_BLOCK_WEIGHT, MAX_COINBASE_SCRIPTSIG_LEN, MAX_MONEY,

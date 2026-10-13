@@ -6,8 +6,9 @@ use super::bip30::Bip30;
 use super::block_coins::SpentCoin;
 use super::sequence_locks::SequenceLocks;
 use super::sigop_cost::SigopCost;
-use super::tx_script_context::TxScriptContext;
-use crate::script::{ScriptExecutionCache, ScriptFlags};
+use super::script_checks::ScriptChecks;
+use super::tx_script_context::Prevout;
+use crate::script::ScriptFlags;
 use crate::tx_view::{BlockView, InputView, OutputView, TxView};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -34,13 +35,12 @@ const COINBASE_MATURITY: u32 = 100;
 ///
 /// `scratch` is reused across txid computations to avoid repeated allocation.
 ///
-/// `skip_script` — when `true`, script verification is skipped entirely for
-/// all inputs. Set this for blocks at or below the `assumevalid` tip: all
-/// other consensus checks (UTXO, maturity, fee math, sigops) still run.
-///
-/// `exec_cache` — optional [`ScriptExecutionCache`]. When `Some`, each input
-/// probes the cache before running the interpreter; hits short-circuit the
-/// full verification. Pass `None` to disable caching (fuzzer, tests).
+/// `scripts` receives each transaction's script verification once that
+/// transaction's other checks pass, and is drained after every other block
+/// rule has passed. [`InlineScripts`](super::InlineScripts) verifies on the
+/// calling thread, [`SkippedScripts`](super::SkippedScripts) skips scripts
+/// for blocks under `assumevalid`, and a deferring implementation can verify
+/// on other threads.
 ///
 /// `precomputed_txids` — optional pre-hashed per-tx ids in block order. The
 /// pipeline computes txids before validation (for intra-block dep collection,
@@ -54,20 +54,21 @@ const COINBASE_MATURITY: u32 = 100;
 /// # Panics
 /// Panics if `precomputed_txids` is `Some(slice)` and `slice.len() != block.tx_count()`.
 #[allow(clippy::too_many_lines)] // single-pass per-input loop reads better as one function
-#[allow(clippy::too_many_arguments)] // precomputed_txids is opt-in; refactoring to a struct adds churn
-pub fn connect_block<'blk, B, V>(
+pub fn connect_block<'blk, 'v, 's, B, V, S>(
     block: &'blk B,
     height: BlockHeight,
-    view: &V,
+    view: &'v V,
     scratch: &mut Vec<u8>,
     connect_scratch: &mut ConnectScratch,
-    skip_script: bool,
-    mut exec_cache: Option<&mut ScriptExecutionCache>,
+    scripts: &mut S,
     precomputed_txids: Option<&[Hash256]>,
 ) -> Result<ConnectResult<'blk>, ValidationError>
 where
+    'blk: 's,
+    'v: 's,
     B: BlockView,
     V: ChainView,
+    S: ScriptChecks<'s>,
 {
     if let Some(txids) = precomputed_txids {
         assert_eq!(
@@ -96,14 +97,14 @@ where
     connect_scratch.spent.clear();
     let outpoints_scratch = &mut connect_scratch.outpoints;
 
-    let mut coins_scratch: Vec<Option<&crate::chain_view::Coin>> = {
+    let mut coins_scratch: Vec<Option<&'v crate::chain_view::Coin>> = {
         let v = std::mem::take(&mut connect_scratch.coins);
         // SAFETY: Option<&'static Coin> and Option<&'view Coin> have identical layout.
         // The vec is cleared inside get_coins_into before each use.
         unsafe {
             std::mem::transmute::<
                 Vec<Option<&'static crate::chain_view::Coin>>,
-                Vec<Option<&crate::chain_view::Coin>>,
+                Vec<Option<&'v crate::chain_view::Coin>>,
             >(v)
         }
     };
@@ -113,7 +114,8 @@ where
     let count_p2sh = script_flags.contains(ScriptFlags::P2SH);
     let count_witness = script_flags.contains(ScriptFlags::WITNESS);
     connect_scratch.in_block.clear();
-    let mut spent_coins: Vec<SpentCoin<'_>> = Vec::new();
+    let mut spent_coins: Vec<SpentCoin<'s>> = Vec::new();
+    let mut prevouts: Vec<Prevout<'s>> = Vec::new();
     let sequence_locks = SequenceLocks::new(view, block.header(), height);
 
     for (tx_index, tx) in block.txs().enumerate() {
@@ -190,22 +192,8 @@ where
 
         sequence_locks.check(tx, &spent_coins, tx_index)?;
 
-        let script_ctx = if skip_script {
-            None
-        } else {
-            Some(TxScriptContext::new(
-                tx,
-                &spent_coins,
-                script_flags,
-                exec_cache.is_some(),
-                scratch,
-            )?)
-        };
-
         let mut input_total = Satoshi::ZERO;
         for (input_index, (input, coin)) in tx.inputs().zip(spent_coins.iter()).enumerate() {
-
-            // Coinbase maturity: coinbase outputs must be 100 blocks deep.
             if coin.coinbase {
                 let depth = height.to_u32().saturating_sub(coin.height.to_u32());
                 if depth < COINBASE_MATURITY {
@@ -214,24 +202,6 @@ where
                         input_index,
                     });
                 }
-            }
-
-            // Script verification: fourth per-input check, after coin lookup,
-            // before fee math. Skipped entirely under assumevalid (`skip_script`).
-            // When a cache is provided, probes it before running the interpreter.
-            if let Some(ctx) = &script_ctx {
-                ctx.verify_input(
-                    tx,
-                    input_index,
-                    input.script_sig(),
-                    coin,
-                    exec_cache.as_deref_mut(),
-                )
-                .map_err(|kind| ValidationError::ScriptVerifyFailed {
-                    tx_index,
-                    input_index,
-                    kind,
-                })?;
             }
 
             input_total = input_total
@@ -254,6 +224,12 @@ where
         total_fees = total_fees
             .checked_add(fee)
             .ok_or(ValidationError::InputValueOverflow { tx_index })?;
+
+        if scripts.enabled() {
+            prevouts.clear();
+            prevouts.extend(spent_coins.iter().map(SpentCoin::prevout));
+            scripts.check_tx(tx_index, tx, &prevouts, script_flags, scratch)?;
+        }
 
         for (vout, output) in tx.outputs().enumerate() {
             #[allow(clippy::cast_possible_truncation)]
@@ -286,6 +262,8 @@ where
     if coinbase_output_total > max_coinbase {
         return Err(ValidationError::CoinbaseRewardExceedsSubsidy);
     }
+
+    scripts.finish()?;
 
     let spent = std::mem::take(&mut connect_scratch.spent);
 

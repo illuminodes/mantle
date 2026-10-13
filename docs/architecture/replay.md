@@ -23,7 +23,8 @@ runtime acceptable, per the M5 exit criterion in `script.md`.
 **Non-goals (explicit deferrals).**
 
 - N / N+1 pipelining and write-through delta layers.
-- Script-worker thread pool (parallel script verification).
+- Script-worker thread pool (parallel script verification). *Since implemented:
+  `ScriptPool`, see `validation.md` §Concurrency.*
 - B-tree / WAL / page-allocator on-disk engine — v1 uses a flat-file shim
   behind an `Engine` trait.
 - Async `ChainView`. Stays synchronous; async happens at the prefetch

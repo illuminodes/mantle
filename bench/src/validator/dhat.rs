@@ -15,7 +15,6 @@ use fixtures::{
     tmp_storage, ITERS_MEDIUM, ITERS_SMALL,
 };
 use mantle::primitives::{BlockHeight, Hash256};
-use mantle_consensus::script::ScriptExecutionCache;
 use mantle_validator::{HeaderSnapshot, ReplayBufs};
 
 #[global_allocator]
@@ -40,7 +39,6 @@ fn scenario_coinbase_only() {
 
     for _ in 0..ITERS_SMALL {
         let (mut storage, _dir) = tmp_storage();
-        let mut cache = ScriptExecutionCache::new(1024);
         let mut bufs = ReplayBufs::new();
         commit(
             &mut bufs,
@@ -48,7 +46,6 @@ fn scenario_coinbase_only() {
             &block,
             BlockHeight::new(1),
             &snap,
-            &mut cache,
             1,
         );
         storage.shutdown().expect("shutdown");
@@ -61,16 +58,14 @@ fn scenario_50_spends() {
 
     for _ in 0..ITERS_SMALL {
         let (mut storage, _dir) = tmp_storage();
-        let mut cache = ScriptExecutionCache::new(1024);
         let mut bufs = ReplayBufs::new();
-        seed_storage(&state, &mut storage, &mut bufs, &mut cache);
+        seed_storage(&state, &mut storage, &mut bufs);
         commit(
             &mut bufs,
             &mut storage,
             &state.spend_block,
             BlockHeight::new(state.spend_height),
             &state.snap,
-            &mut cache,
             u64::from(state.spend_height),
         );
         storage.shutdown().expect("shutdown");
@@ -94,7 +89,6 @@ fn scenario_100_chain() {
 
     for _ in 0..ITERS_SMALL {
         let (mut storage, _dir) = tmp_storage();
-        let mut cache = ScriptExecutionCache::new(1024);
         let mut bufs = ReplayBufs::new();
         for (i, block) in blocks.iter().enumerate() {
             commit(
@@ -103,8 +97,7 @@ fn scenario_100_chain() {
                 block,
                 BlockHeight::new(u32::try_from(i + 1).expect("fits")),
                 &snap,
-                &mut cache,
-                i as u64,
+                    i as u64,
             );
         }
         storage.shutdown().expect("shutdown");
@@ -147,7 +140,6 @@ fn scenario_bufs_reuse() {
     let snap = make_snapshot(&chain);
 
     let (mut storage, _dir) = tmp_storage();
-    let mut cache = ScriptExecutionCache::new(1024);
     let mut bufs = ReplayBufs::new();
     for (i, block) in blocks.iter().enumerate() {
         commit(
@@ -156,7 +148,6 @@ fn scenario_bufs_reuse() {
             block,
             BlockHeight::new(u32::try_from(i + 1).expect("fits")),
             &snap,
-            &mut cache,
             i as u64,
         );
     }

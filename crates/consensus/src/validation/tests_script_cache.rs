@@ -166,8 +166,7 @@ impl Chain {
             &self.view,
             &mut Vec::new(),
             &mut ConnectScratch::new(),
-            false,
-            cache,
+            &mut super::InlineScripts::new(cache),
             None,
         )
         .map(|r| r.fees)
@@ -230,8 +229,7 @@ impl SigopHeavy {
             &chain.view,
             &mut Vec::new(),
             &mut ConnectScratch::new(),
-            true,
-            None,
+            &mut super::SkippedScripts,
             None,
         )
         .map(|r| r.fees)

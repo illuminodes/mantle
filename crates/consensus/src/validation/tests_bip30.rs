@@ -75,8 +75,7 @@ impl Mainnet91842 {
             &view,
             &mut Vec::new(),
             &mut ConnectScratch::new(),
-            true,
-            None,
+            &mut super::SkippedScripts,
             None,
         )
         .map(|_| ())

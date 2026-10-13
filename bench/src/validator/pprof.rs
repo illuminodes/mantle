@@ -16,7 +16,6 @@ use fixtures::{
     tmp_storage,
 };
 use mantle::primitives::{BlockHeight, Hash256};
-use mantle_consensus::script::ScriptExecutionCache;
 use mantle_validator::ReplayBufs;
 use std::hint::black_box;
 
@@ -31,7 +30,6 @@ fn run_validate_and_commit_coinbase() {
 
     profile("validate_and_commit_coinbase", 5, || {
         let (mut storage, _dir) = tmp_storage();
-        let mut cache = ScriptExecutionCache::new(1024);
         let mut bufs = ReplayBufs::new();
         commit(
             &mut bufs,
@@ -39,7 +37,6 @@ fn run_validate_and_commit_coinbase() {
             black_box(&block),
             BlockHeight::new(1),
             &snap,
-            &mut cache,
             1,
         );
         storage.shutdown().expect("shutdown");
@@ -51,16 +48,14 @@ fn run_validate_and_commit_50_spends() {
 
     profile("validate_and_commit_50_spends", 5, || {
         let (mut storage, _dir) = tmp_storage();
-        let mut cache = ScriptExecutionCache::new(1024);
         let mut bufs = ReplayBufs::new();
-        seed_storage(&state, &mut storage, &mut bufs, &mut cache);
+        seed_storage(&state, &mut storage, &mut bufs);
         commit(
             &mut bufs,
             &mut storage,
             black_box(&state.spend_block),
             BlockHeight::new(state.spend_height),
             &state.snap,
-            &mut cache,
             u64::from(state.spend_height),
         );
         storage.shutdown().expect("shutdown");
@@ -83,7 +78,6 @@ fn run_validate_and_commit_100_chain() {
 
     profile("validate_and_commit_100_chain", 5, || {
         let (mut storage, _dir) = tmp_storage();
-        let mut cache = ScriptExecutionCache::new(1024);
         let mut bufs = ReplayBufs::new();
         for (i, block) in blocks.iter().enumerate() {
             commit(
@@ -92,8 +86,7 @@ fn run_validate_and_commit_100_chain() {
                 black_box(block),
                 BlockHeight::new(u32::try_from(i + 1).expect("fits")),
                 &snap,
-                &mut cache,
-                i as u64,
+                    i as u64,
             );
         }
         storage.shutdown().expect("shutdown");
