@@ -60,6 +60,7 @@ struct ReplayCtx {
 /// Block at which `Durability::Synced` flushes everything to disk. Matches
 /// difficulty-adjustment-period boundaries — a natural checkpoint cadence.
 const SYNC_EVERY: u32 = 2_016;
+const FETCH_ATTEMPTS: u32 = 5;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -733,9 +734,18 @@ impl ReplayCtx {
                 first.to_u32(),
                 last.to_u32()
             );
-            fetcher
-                .fetch_blocks(window)
-                .map_err(|e| format!("fetch blocks: {e:?}"))?;
+            let mut attempt = 1;
+            while let Err(e) = fetcher.fetch_blocks(window) {
+                if attempt >= FETCH_ATTEMPTS {
+                    return Err(format!("fetch blocks: {e:?} after {attempt} attempts"));
+                }
+                eprintln!(
+                    "  fetch retry {attempt}/{FETCH_ATTEMPTS} for {}..={}: {e:?}",
+                    first.to_u32(),
+                    last.to_u32()
+                );
+                attempt += 1;
+            }
             for (height, header) in window {
                 self.replay_block(*height, *header, fetcher, snapshot)?;
                 last_committed = *height;
