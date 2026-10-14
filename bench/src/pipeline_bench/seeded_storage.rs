@@ -22,16 +22,19 @@ impl SeededStorage {
     const FILLER_BATCH: usize = 1_000_000;
     const FILLER_SCRIPT: [u8; 22] = [0x00, 0x14, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab];
 
-    pub fn dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../data/pipeline-bench")
-            .join(format!("store-{}", std::process::id()))
+    pub fn default_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../data/pipeline-bench")
     }
 
     /// # Errors
     /// Returns a message when the store cannot be created or seeded.
-    pub fn open(spec: &ChainSpec, history: &[BlockHeader], filler: usize) -> Result<Self, String> {
-        let dir = Self::dir();
+    pub fn open(
+        root: &std::path::Path,
+        spec: &ChainSpec,
+        history: &[BlockHeader],
+        filler: usize,
+    ) -> Result<Self, String> {
+        let dir = root.join(format!("store-{}", std::process::id()));
         std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         let mut handle = StorageHandle::open_robin_hood(&dir).map_err(|e| format!("open: {e}"))?;
         let started = std::time::Instant::now();

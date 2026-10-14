@@ -79,6 +79,21 @@ impl CpuMeter {
 }
 
 impl CpuReport {
+    /// CPU time of the group named after the process, which holds the main
+    /// thread and any thread left unnamed.
+    pub fn main_thread(&self) -> Duration {
+        let name = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_default();
+        let prefix: String = name.chars().take(15).collect();
+        self.groups
+            .iter()
+            .filter(|g| !prefix.is_empty() && prefix.starts_with(g.name.as_str()))
+            .map(|g| g.busy)
+            .sum()
+    }
+
     pub fn print(&self) {
         let wall = self.wall.as_secs_f64();
         println!("cpu by thread group (wall {wall:.2}s):");
