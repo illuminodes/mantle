@@ -8,6 +8,9 @@ use mantle_storage::ops::StorageOps;
 use mantle_storage::types::{CommitBlockReq, CommittedResp, Durability, ReqToken, StorageError};
 use mantle_utxo_hash::UtxoSetHash;
 
+use mantle_consensus::validation::connect_block;
+
+use crate::deferred_scripts::{DeferredScripts, SettledScripts};
 use crate::prefetched_view::{HeaderSnapshot, PrefetchedView};
 use crate::script_policy::{ConnectCall, ScriptPolicy};
 use crate::utxo_hash_update::UtxoHashUpdate;
@@ -20,6 +23,31 @@ pub struct PipelineOpts<'a> {
     pub token: ReqToken,
     /// Updated with the block's UTXO delta once the block is committed.
     pub utxo_hash: Option<&'a mut UtxoSetHash>,
+}
+
+/// Storage and hashing options for [`ReplayBufs::validate_and_commit_deferred`].
+pub struct DeferredOpts<'a> {
+    pub durability: Durability,
+    pub token: ReqToken,
+    pub utxo_hash: Option<&'a mut UtxoSetHash>,
+}
+
+/// What happened to the current block in
+/// [`ReplayBufs::validate_and_commit_deferred`].
+pub enum DeferredBlock {
+    /// Committed; its scripts are still running and settle with the next
+    /// call or with [`DeferredScripts::settle`].
+    Committed(CommittedResp),
+    /// Not committed. The block is handed back so the caller can save it or
+    /// force-commit it.
+    Rejected { error: PipelineError, block: Block },
+}
+
+/// The result of one [`ReplayBufs::validate_and_commit_deferred`] call.
+pub struct DeferredStep {
+    /// The script verdict of the block committed by the previous call.
+    pub previous: Option<SettledScripts>,
+    pub current: DeferredBlock,
 }
 
 /// Block-identity fields needed when committing a previously validated result.
@@ -271,6 +299,116 @@ impl ReplayBufs {
             );
         }
 
+        Ok(resp)
+    }
+
+    /// Validate and commit `block` while its script checks keep running.
+    ///
+    /// Collects outpoints and fetches coins while the previous block's
+    /// checks are still running, then settles them, connects `block`,
+    /// submits its checks and commits its UTXO delta without waiting for
+    /// them. A script failure in `block` is reported by the next call, so
+    /// the block after a script-invalid block is already prepared, but never
+    /// committed, when the failure becomes known.
+    pub fn validate_and_commit_deferred<S>(
+        &mut self,
+        block: Block,
+        height: BlockHeight,
+        storage: &mut S,
+        headers: &HeaderSnapshot,
+        scripts: &mut DeferredScripts,
+        opts: DeferredOpts<'_>,
+    ) -> DeferredStep
+    where
+        S: for<'x> StorageOps<'x>,
+    {
+        self.clear();
+        self.collect_outpoints_block(&block, height);
+        let fetched = self.fetch_coins(storage);
+        let previous = scripts.settle();
+        if let Err(e) = fetched {
+            return DeferredStep {
+                previous,
+                current: DeferredBlock::Rejected {
+                    error: e.into(),
+                    block,
+                },
+            };
+        }
+
+        let hash = block.header.hash();
+        let committed =
+            self.connect_and_commit_deferred(&block, height, hash, storage, headers, scripts, opts);
+        let current = match committed {
+            Ok(resp) => {
+                scripts.hold(height, hash, block, &mut self.coins);
+                DeferredBlock::Committed(resp)
+            }
+            Err(error) => {
+                scripts.discard();
+                DeferredBlock::Rejected { error, block }
+            }
+        };
+        DeferredStep { previous, current }
+    }
+
+    /// On `Ok`, the submitted checks are still running and borrow `block`
+    /// and `self.coins`; the caller must hand both to
+    /// [`DeferredScripts::hold`]. On `Err`, the caller must call
+    /// [`DeferredScripts::discard`] before `block` is dropped.
+    #[allow(clippy::too_many_arguments)]
+    fn connect_and_commit_deferred<S>(
+        &mut self,
+        block: &Block,
+        height: BlockHeight,
+        hash: Hash256,
+        storage: &mut S,
+        headers: &HeaderSnapshot,
+        scripts: &mut DeferredScripts,
+        opts: DeferredOpts<'_>,
+    ) -> Result<CommittedResp, PipelineError>
+    where
+        S: for<'x> StorageOps<'x>,
+    {
+        let tip = storage.tip();
+        let view = PrefetchedView::new(&self.coins, headers, tip);
+        let txids = (self.txids.len() == block.transactions.len()).then_some(self.txids.as_slice());
+        // SAFETY: on success `validate_and_commit_deferred` passes `block`
+        // and `self.coins` to `hold` without touching them; on failure it
+        // calls `discard` before either is dropped or mutated.
+        let mut batch = unsafe { scripts.batch() };
+        let result = connect_block(
+            block,
+            height,
+            &view,
+            &mut self.txid_scratch,
+            &mut self.connect_scratch,
+            &mut batch,
+            txids,
+        )?;
+
+        let resp = storage.commit_block_borrowed(CommitBlockReq {
+            token: opts.token,
+            height,
+            hash,
+            prev_hash: block.header.prev_block(),
+            header: block.header,
+            created: &result.created,
+            spent: &result.spent,
+            block_bytes: None,
+            durability: opts.durability,
+        })?;
+
+        if let Some(utxo_hash) = opts.utxo_hash {
+            self.utxo_hash_update.apply(
+                utxo_hash,
+                (height, hash),
+                &result.created,
+                &result.spent,
+                &self.coins,
+            );
+        }
+        batch.release();
         Ok(resp)
     }
 

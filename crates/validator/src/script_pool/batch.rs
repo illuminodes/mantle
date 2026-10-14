@@ -8,94 +8,72 @@ use mantle_consensus::validation::{Prevout, ScriptChecks, TxScriptContext};
 
 use super::ScriptPool;
 use super::job::ScriptJob;
-use super::verdict::{BlockVerdict, InputPosition, JobOutcome};
+use super::verdict::InputPosition;
+
+/// When a batch waits for the checks it submitted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Settlement {
+    /// `finish` waits and reports the verdict.
+    OnFinish,
+    /// `finish` returns at once; the verdict stays in the pool until its
+    /// owner settles it.
+    Deferred,
+}
 
 /// The script checks of one block, spread over a [`ScriptPool`].
 ///
-/// Only [`ScriptPool::scope`] creates a batch, and it waits for every
-/// submitted check before returning, so block data borrowed for `'env`
-/// outlives every job that reads it.
+/// [`ScriptPool::scope`] creates a batch that waits for every submitted
+/// check before the scope returns. [`ScriptPool::deferred_batch`] creates
+/// one whose checks may keep running after [`release`](Self::release).
+///
+/// Either kind waits for its checks when dropped without being released,
+/// so an early return or a panic never leaves a job reading data that is
+/// about to be freed.
 pub struct ScriptBatch<'p, 'env> {
     pool: &'p mut ScriptPool,
-    outstanding: usize,
-    verdict: BlockVerdict,
+    settlement: Settlement,
+    wait_on_drop: bool,
     env: PhantomData<fn(&'env ()) -> &'env ()>,
 }
 
-impl<'p, 'env> ScriptBatch<'p, 'env> {
-    pub(super) fn new(pool: &'p mut ScriptPool) -> Self {
+impl<'p> ScriptBatch<'p, '_> {
+    pub(super) fn settled_on_finish(pool: &'p mut ScriptPool) -> Self {
         Self {
             pool,
-            outstanding: 0,
-            verdict: BlockVerdict::default(),
+            settlement: Settlement::OnFinish,
+            wait_on_drop: true,
             env: PhantomData,
         }
     }
 
-    fn submit(&mut self, job: ScriptJob<'env>) {
-        // SAFETY: `wait_all` runs before the scope that created this batch
-        // returns, from `settle` or from `Drop` while unwinding, and `'env`
-        // outlives that scope.
-        let job = unsafe { job.erase() };
-        self.outstanding += 1;
-        let Err(job) = self.pool.jobs.push(job) else {
-            return;
-        };
-        self.collect_ready();
-        self.help_once();
-        if self.pool.jobs.push_block(job).is_err() {
-            unreachable!("the pool owns the only job producer, so the ring stays open");
-        }
-    }
-
-    fn record(&mut self, outcome: JobOutcome) {
-        self.verdict.record(outcome);
-        self.outstanding -= 1;
-    }
-
-    fn collect_ready(&mut self) {
-        while let Some(outcome) = self.pool.outcomes.pop() {
-            self.record(outcome);
-        }
-    }
-
-    /// Collect finished outcomes, then run one queued job on this thread.
-    /// Returns `false` when no job was waiting.
-    fn help_once(&mut self) -> bool {
-        self.collect_ready();
-        match self.pool.helper.pop() {
-            Some(job) => {
-                let outcome = job.run();
-                self.record(outcome);
-                true
-            }
-            None => false,
-        }
-    }
-
-    fn wait_all(&mut self) {
-        while self.outstanding > 0 {
-            if self.help_once() || self.outstanding == 0 {
-                continue;
-            }
-            let outcome = self
-                .pool
-                .outcomes
-                .pop_block()
-                .expect("script workers outlive the pool, so the outcome ring stays open");
-            self.record(outcome);
+    pub(super) fn deferred(pool: &'p mut ScriptPool) -> Self {
+        Self {
+            pool,
+            settlement: Settlement::Deferred,
+            wait_on_drop: true,
+            env: PhantomData,
         }
     }
 
     pub(super) fn settle(&mut self) {
-        self.wait_all();
-        self.verdict.resume_panic();
+        self.pool.wait_all();
+        self.pool.verdict.resume_panic();
+    }
+
+    /// Let the submitted checks keep running after the batch is gone.
+    ///
+    /// The safety contract of [`ScriptPool::deferred_batch`] still applies:
+    /// the data borrowed for `'env` must outlive the checks.
+    pub(crate) fn release(mut self) {
+        self.wait_on_drop = false;
     }
 }
 
 impl Drop for ScriptBatch<'_, '_> {
     fn drop(&mut self) {
-        self.wait_all();
+        if self.wait_on_drop {
+            self.pool.wait_all();
+        }
     }
 }
 
@@ -108,10 +86,10 @@ impl<'env> ScriptChecks<'env> for ScriptBatch<'_, 'env> {
         flags: ScriptFlags,
         _scratch: &mut Vec<u8>,
     ) -> Result<(), ValidationError> {
-        self.collect_ready();
+        self.pool.collect_ready();
         let context = Arc::new(TxScriptContext::uncached(tx, prevouts, flags));
         for (input_index, prevout) in prevouts.iter().enumerate() {
-            self.submit(ScriptJob::new(
+            let job = ScriptJob::new(
                 tx,
                 Arc::clone(&context),
                 *prevout,
@@ -119,13 +97,22 @@ impl<'env> ScriptChecks<'env> for ScriptBatch<'_, 'env> {
                     tx_index,
                     input_index,
                 },
-            ));
+            );
+            // SAFETY: the batch waits in `settle` or in `Drop` before `'env`
+            // ends, unless it was released, and only a batch from the unsafe
+            // `deferred_batch` can be released; that caller waits instead.
+            self.pool.submit(unsafe { job.erase() });
         }
         Ok(())
     }
 
     fn finish(&mut self) -> Result<(), ValidationError> {
-        self.wait_all();
-        self.verdict.take()
+        match self.settlement {
+            Settlement::OnFinish => {
+                self.pool.wait_all();
+                self.pool.verdict.take()
+            }
+            Settlement::Deferred => Ok(()),
+        }
     }
 }

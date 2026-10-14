@@ -9,11 +9,12 @@
 //!     block = Block::decode(bytes)
 //!     validate_block_structure(&block)?
 //!     validate_block_context(&block, &header_snapshot)?
-//!     validator::validate_and_commit(
-//!         &block, height, &mut storage, &header_snapshot,
-//!         ScriptPolicy::Parallel(&mut script_pool),
+//!     bufs.validate_and_commit_deferred(
+//!         block, height, &mut storage, &header_snapshot, &mut deferred_scripts,
 //!         if height % 2016 == 0 { Synced } else { Memory },
-//!     )?
+//!     )
+//!     // reports the script verdict of height - 1; this block's scripts
+//!     // keep running while the next block is prepared
 //! ```
 //!
 //! CLI: `mantle-replay [--data-dir DIR] [--network NAME] [--peer HOST:PORT]…
@@ -35,8 +36,8 @@ use mantle_storage::StorageHandle;
 use mantle_storage::types::{Durability, ReqToken};
 use mantle::primitives::Block;
 use mantle_validator::{
-    ForcedCommit, HeaderSnapshot, PipelineError, PipelineOpts, PrefetchedView, ReplayBufs,
-    ScriptPolicy, ScriptPool,
+    DeferredBlock, DeferredOpts, DeferredScripts, ForcedCommit, HeaderSnapshot, PipelineError,
+    PipelineOpts, PrefetchedView, ReplayBufs, ScriptPolicy, ScriptPool, SettledScripts,
 };
 
 use crate::failures::{FailureLog, FailureStage};
@@ -51,7 +52,10 @@ struct ReplayCtx {
     storage: StorageHandle<'static>,
     skip_script: bool,
     allow_min_difficulty: bool,
-    scripts: ScriptPool,
+    scripts: DeferredScripts,
+    /// The committed block whose scripts are still running, kept so a late
+    /// script failure can still save its bytes.
+    in_flight: Option<FedBlock>,
     bufs: ReplayBufs,
     token: u64,
     forced: ForcedCommit,
@@ -692,8 +696,11 @@ fn run(args: &Args) -> Result<u64, String> {
         storage,
         skip_script: args.skip_script,
         allow_min_difficulty,
-        scripts: ScriptPool::new(if args.skip_script { 0 } else { args.script_threads })
-            .map_err(|e| format!("spawn script workers: {e}"))?,
+        scripts: DeferredScripts::new(
+            ScriptPool::new(if args.skip_script { 0 } else { args.script_threads })
+                .map_err(|e| format!("spawn script workers: {e}"))?,
+        ),
+        in_flight: None,
         bufs: ReplayBufs::new(),
         token: u64::from(tip.height.to_u32()).saturating_add(1),
         forced: ForcedCommit::new(),
@@ -760,9 +767,12 @@ impl ReplayCtx {
                         height.to_u32()
                     ));
                 }
-                self.replay_block(&block, snapshot)?;
+                self.replay_block(block, snapshot)?;
                 last_committed = height;
                 reporter.tick(height);
+            }
+            if window.last().is_some_and(|&(h, _)| h == header_pairs[header_pairs.len() - 1].0) {
+                self.settle_in_flight()?;
             }
             eprintln!(
                 "  window {}..={}: {}",
@@ -774,23 +784,30 @@ impl ReplayCtx {
         Ok(last_committed)
     }
 
-    fn replay_block(&mut self, fed: &FedBlock, snapshot: &HeaderSnapshot) -> Result<(), String> {
+    fn replay_block(&mut self, fed: FedBlock, snapshot: &HeaderSnapshot) -> Result<(), String> {
         let (height, hash) = (fed.height, fed.hash);
         let block = self.clock.time(Stage::Decode, || fed.decode())?;
 
         let mut saved = false;
         if let Err(e) = validate_block_structure(&block) {
-            self.save_failed_block(fed, &mut saved);
+            self.save_failed_block(&fed, &mut saved);
             self.fail(height, hash, FailureStage::Structure, &e)?;
         }
 
         let empty_coins = PrehashedMap::with_hasher(BuildPrehashedHasher);
         let context_view = PrefetchedView::new(&empty_coins, snapshot, self.storage.tip());
         if let Err(e) = validate_block_context(&block, &context_view, self.allow_min_difficulty) {
-            self.save_failed_block(fed, &mut saved);
+            self.save_failed_block(&fed, &mut saved);
             self.fail(height, hash, FailureStage::Context, &e)?;
         }
 
+        if self.skip_script {
+            return self.replay_block_scoped(&fed, &block, snapshot, saved);
+        }
+        self.replay_block_deferred(fed, block, snapshot, saved)
+    }
+
+    fn next_commit_params(&mut self, height: BlockHeight) -> (Durability, ReqToken) {
         let durability = if height.to_u32().is_multiple_of(SYNC_EVERY) {
             Durability::Synced
         } else {
@@ -798,19 +815,109 @@ impl ReplayCtx {
         };
         let token = ReqToken(self.token);
         self.token = self.token.saturating_add(1);
+        (durability, token)
+    }
+
+    /// Validate and commit `block` while its scripts run on the pool, and
+    /// record the script verdict of the block committed before it.
+    fn replay_block_deferred(
+        &mut self,
+        fed: FedBlock,
+        block: Block,
+        snapshot: &HeaderSnapshot,
+        mut saved: bool,
+    ) -> Result<(), String> {
+        let (height, hash) = (fed.height, fed.hash);
+        let (durability, token) = self.next_commit_params(height);
+        let validate_started = std::time::Instant::now();
+        let step = self.bufs.validate_and_commit_deferred(
+            block,
+            height,
+            &mut self.storage,
+            snapshot,
+            &mut self.scripts,
+            DeferredOpts {
+                durability,
+                token,
+                utxo_hash: self.utxo_hash.as_mut().and_then(UtxoHashTracker::hash_mut),
+            },
+        );
+        self.clock.add(Stage::Validate, validate_started);
+        let previous = self.in_flight.take();
+        self.record_settled(step.previous, previous)?;
+        match step.current {
+            DeferredBlock::Committed(_) => {
+                self.in_flight = Some(fed);
+                self.check_utxo_hash(height, hash)
+            }
+            DeferredBlock::Rejected {
+                error: PipelineError::Validation(e),
+                block,
+            } => {
+                self.save_failed_block(&fed, &mut saved);
+                self.fail(height, hash, FailureStage::Connect, &e)?;
+                if let Some(tracker) = &mut self.utxo_hash {
+                    tracker.stop(height);
+                }
+                self.force_commit(&block, height, durability, token)
+            }
+            DeferredBlock::Rejected {
+                error: e @ PipelineError::Storage(_),
+                ..
+            } => Err(format!("validate_and_commit at {}: {e}", height.to_u32())),
+        }
+    }
+
+    /// Wait for the scripts of the last committed block and record their
+    /// verdict.
+    fn settle_in_flight(&mut self) -> Result<(), String> {
+        let settled = self.scripts.settle();
+        let fed = self.in_flight.take();
+        self.record_settled(settled, fed)
+    }
+
+    fn record_settled(
+        &mut self,
+        settled: Option<SettledScripts>,
+        fed: Option<FedBlock>,
+    ) -> Result<(), String> {
+        let Some(SettledScripts {
+            height,
+            hash,
+            verdict: Err(e),
+        }) = settled
+        else {
+            return Ok(());
+        };
+        if let Some(fed) = fed.filter(|f| f.height == height) {
+            self.save_failed_block(&fed, &mut false);
+        }
+        if let Some(tracker) = &mut self.utxo_hash {
+            tracker.stop(height);
+        }
+        self.fail(height, hash, FailureStage::Connect, &e)
+    }
+
+    /// Validate and commit `block` with every check finished before the
+    /// commit; used when scripts are skipped.
+    fn replay_block_scoped(
+        &mut self,
+        fed: &FedBlock,
+        block: &Block,
+        snapshot: &HeaderSnapshot,
+        mut saved: bool,
+    ) -> Result<(), String> {
+        let (height, hash) = (fed.height, fed.hash);
+        let (durability, token) = self.next_commit_params(height);
 
         let validate_started = std::time::Instant::now();
         let connected = self.bufs.validate_and_commit(
-            &block,
+            block,
             height,
             &mut self.storage,
             snapshot,
             PipelineOpts {
-                scripts: if self.skip_script {
-                    ScriptPolicy::Skip
-                } else {
-                    ScriptPolicy::Parallel(&mut self.scripts)
-                },
+                scripts: ScriptPolicy::Skip,
                 durability,
                 token,
                 utxo_hash: self.utxo_hash.as_mut().and_then(UtxoHashTracker::hash_mut),
@@ -825,7 +932,7 @@ impl ReplayCtx {
                 if let Some(tracker) = &mut self.utxo_hash {
                     tracker.stop(height);
                 }
-                self.force_commit(&block, height, durability, token)
+                self.force_commit(block, height, durability, token)
             }
             Err(e @ PipelineError::Storage(_)) => {
                 Err(format!("validate_and_commit at {}: {e}", height.to_u32()))
