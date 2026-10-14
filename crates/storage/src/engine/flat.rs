@@ -165,11 +165,15 @@ impl Engine for FlatEngine {
     }
 
     fn flush(&mut self, d: Durability) -> Result<(), EngineError> {
-        if d == Durability::Synced {
-            self.utxo_file.flush()?;
-            self.utxo_file.get_ref().sync_all()?;
-            self.utxo_flushed_pos = self.utxo_write_pos;
-            self.headers.sync_checkpoint()?;
+        match d {
+            Durability::Memory => {}
+            Durability::Flushed => self.utxo_file.flush()?,
+            Durability::Synced => {
+                self.utxo_file.flush()?;
+                self.utxo_file.get_ref().sync_all()?;
+                self.utxo_flushed_pos = self.utxo_write_pos;
+                self.headers.sync_checkpoint()?;
+            }
         }
         Ok(())
     }

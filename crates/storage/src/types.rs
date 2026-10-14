@@ -21,6 +21,10 @@ pub enum Durability {
     /// if the engine itself persists (it does for `FlatEngine`, which flushes
     /// at `Synced` boundaries).
     Memory,
+    /// Write buffered state to the data files without `fsync`. Bounds memory
+    /// like `Synced` but survives only a process exit, not a crash or power
+    /// loss; for runs whose data is thrown away afterwards.
+    Flushed,
     /// `fsync` to disk before returning. Used every 2016 blocks (difficulty
     /// epoch boundary) by the replay loop.
     Synced,

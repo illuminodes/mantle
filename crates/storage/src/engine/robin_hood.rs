@@ -902,10 +902,14 @@ impl Engine for RobinHoodEngine {
     }
 
     fn flush(&mut self, d: Durability) -> Result<(), EngineError> {
-        if d == Durability::Synced {
-            self.flush_write_buffer()?;
-            self.table.sync()?;
-            self.headers.sync_checkpoint()?;
+        match d {
+            Durability::Memory => {}
+            Durability::Flushed => self.flush_write_buffer()?,
+            Durability::Synced => {
+                self.flush_write_buffer()?;
+                self.table.sync()?;
+                self.headers.sync_checkpoint()?;
+            }
         }
         Ok(())
     }
@@ -2025,6 +2029,43 @@ mod tests {
 
         assert!(eng.pending_disk_deletes.is_empty());
         assert!(eng.table.is_empty());
+    }
+
+    #[test]
+    fn a_flushed_commit_empties_the_write_buffer_without_a_checkpoint() {
+        let dir = TmpFile::new("flushed-no-checkpoint");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let mut eng = RobinHoodEngine::open(dir.path()).unwrap();
+        let op = make_op(9);
+        let created = [mantle_consensus::chain_view::NewCoin {
+            outpoint: op,
+            value: Satoshi::new(5),
+            script_pubkey: &[0x51],
+            coinbase: false,
+            height: BlockHeight::new(1),
+        }];
+        eng.write_block(&CommitBlockReq {
+            token: crate::types::ReqToken(1),
+            height: BlockHeight::new(1),
+            hash: Hash256::from_bytes([1; 32]),
+            prev_hash: Hash256::ZERO,
+            header: make_header(1),
+            created: &created,
+            spent: &[],
+            block_bytes: None,
+            durability: Durability::Flushed,
+        })
+        .unwrap();
+        eng.flush(Durability::Flushed).unwrap();
+
+        assert!(eng.write_buffer.is_empty());
+        assert_eq!(eng.table.len(), 1);
+        assert_eq!(eng.read_coin(&op).unwrap().map(|c| c.value), Some(Satoshi::new(5)));
+        let checkpoint = std::fs::read(dir.path().join("checkpoint.bin")).unwrap_or_default();
+        assert!(
+            checkpoint.iter().all(|&b| b == 0),
+            "a flushed commit must not advance the checkpoint"
+        );
     }
 
     #[test]
