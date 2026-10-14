@@ -13,6 +13,8 @@ pub struct BenchArgs {
     pub sync_without_fsync: bool,
     pub skip_scripts: bool,
     pub limit: InFlightLimit,
+    pub prep_threads: usize,
+    pub prep_depth: usize,
     pub store_root: PathBuf,
     pub generate_only: bool,
 }
@@ -21,7 +23,7 @@ impl BenchArgs {
     const HELP: &'static str = "usage: pipeline-bench [--blocks N] [--txs N] [--inputs N] [--outputs N] \
          [--segwit-percent P] [--recent-percent P] [--script-threads N] [--filler-coins N] \
          [--sync-every N] [--no-fsync] [--skip-scripts] [--in-flight-blocks N] [--in-flight-inputs N] \
-         [--store-dir DIR] [--generate-only]";
+         [--prep-threads N] [--prep-depth N] [--store-dir DIR] [--generate-only]";
 
     /// # Errors
     /// Returns a message for an unknown flag, a missing or bad value, or a
@@ -43,6 +45,8 @@ impl BenchArgs {
         let mut sync_without_fsync = false;
         let mut limit = InFlightLimit::default();
         let mut store_root = SeededStorage::default_root();
+        let mut prep_threads = 2;
+        let mut prep_depth = 64;
         let mut generate_only = false;
         while let Some(flag) = args.next() {
             if flag == "--generate-only" {
@@ -82,6 +86,8 @@ impl BenchArgs {
                 "--filler-coins" => filler_coins = number(&value)?,
                 "--in-flight-blocks" => limit.blocks = number(&value)?,
                 "--in-flight-inputs" => limit.inputs = number(&value)?,
+                "--prep-threads" => prep_threads = number(&value)?,
+                "--prep-depth" => prep_depth = number(&value)?,
                 "--sync-every" => {
                     sync_every = u32::try_from(number(&value)?).map_err(|e| e.to_string())?;
                 }
@@ -97,6 +103,8 @@ impl BenchArgs {
             sync_without_fsync,
             skip_scripts,
             limit,
+            prep_threads,
+            prep_depth,
             store_root,
             generate_only,
         })

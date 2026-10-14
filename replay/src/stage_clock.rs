@@ -23,7 +23,7 @@ impl Stage {
     const fn label(self) -> &'static str {
         match self {
             Self::Wait => "waited for blocks",
-            Self::Decode => "decode",
+            Self::Decode => "waited for prep",
             Self::Validate => "validate",
             Self::Commit => "scripts+commit",
         }
@@ -75,7 +75,7 @@ mod tests {
         assert_eq!(clock.spent[Stage::Wait.index()], Duration::ZERO);
 
         let line = clock.take_line();
-        assert!(line.starts_with("waited for blocks 0.0s, decode 0.0"), "{line}");
+        assert!(line.starts_with("waited for blocks 0.0s, waited for prep 0.0"), "{line}");
         assert!(clock.spent.iter().all(Duration::is_zero));
     }
 }

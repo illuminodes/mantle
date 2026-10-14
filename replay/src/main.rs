@@ -22,14 +22,17 @@ mod stage_clock;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use mantle::network::Network;
 use mantle::primitives::{BlockHeader, BlockHeight, Hash256};
 use mantle_storage::StorageHandle;
 use mantle_storage::types::Durability;
 use mantle_utxo_hash::UtxoSetHash;
+use mantle_consensus::validation::SystemClock;
 use mantle_validator::{
-    ConnectPipeline, HeaderSnapshot, InFlightLimit, OnScriptFailure, ScriptPool,
+    BlockPreparer, CommitPlan, ConnectPipeline, HeaderSnapshot, InFlightLimit, OnScriptFailure,
+    PrepPool, ScriptPool,
 };
 
 use crate::block_feed::{BlockFeed, FeedItem, FeedPlan};
@@ -49,6 +52,7 @@ struct Args {
     extra_peers: PeerList,
     skip_script: bool,
     script_threads: usize,
+    prep_threads: usize,
     download_only: bool,
     /// First height to validate. Defaults to `storage.tip().height + 1`.
     start_height: Option<BlockHeight>,
@@ -113,6 +117,15 @@ impl VerifyOpts {
 
 const DEFAULT_EPHEMERAL_WINDOW: usize = 1_000;
 
+/// Block at which commits are made durable: difficulty-adjustment
+/// boundaries, a natural checkpoint cadence.
+const SYNC_EVERY: u32 = 2_016;
+
+/// Blocks decoded and checked ahead of the one being connected.
+const PREP_DEPTH: usize = 128;
+
+const DEFAULT_PREP_THREADS: usize = 2;
+
 const HELP: &str = "\
 mantle-replay — historical replay against a Bitcoin Core-compatible network
 
@@ -137,6 +150,8 @@ Options:
     --script-threads N    Script-verification worker threads, besides the
                           replay thread (default: CPUs - 1; 0 verifies on the
                           replay thread only).
+    --prep-threads N      Threads that decode and check blocks ahead of the
+                          one being connected (default: 2).
     --download-only       Fetch and cache blocks, without replaying or mutating
                           validated chain state. The only mode allowed on
                           networks other than mainnet, whose consensus
@@ -181,6 +196,7 @@ fn parse_args() -> Result<Args, String> {
     let mut extra_peers = PeerList::new();
     let mut skip_script = false;
     let mut script_threads = ScriptPool::default_workers();
+    let mut prep_threads = DEFAULT_PREP_THREADS;
     let mut download_only = false;
     let mut start_height: Option<BlockHeight> = None;
     let mut stop_height: Option<BlockHeight> = None;
@@ -245,6 +261,16 @@ fn parse_args() -> Result<Args, String> {
                 script_threads = v
                     .parse()
                     .map_err(|e| format!("invalid --script-threads {v}: {e}"))?;
+            }
+            "--prep-threads" => {
+                i += 1;
+                let v = raw.get(i).ok_or("--prep-threads requires N")?;
+                prep_threads = v
+                    .parse()
+                    .map_err(|e| format!("invalid --prep-threads {v}: {e}"))?;
+                if prep_threads == 0 {
+                    return Err("--prep-threads must be at least 1".to_string());
+                }
             }
             "--download-only" => {
                 download_only = true;
@@ -381,6 +407,7 @@ fn parse_args() -> Result<Args, String> {
         extra_peers,
         skip_script,
         script_threads,
+        prep_threads,
         download_only,
         start_height,
         stop_height,
@@ -662,6 +689,23 @@ fn run(args: &Args) -> Result<u64, String> {
     let headers: Vec<BlockHeader> = header_pairs.iter().map(|(_, h)| *h).collect();
     let snapshot = build_snapshot(start_height, &headers, args.network, &mut storage)?;
 
+    let snapshot = Arc::new(snapshot);
+    let commits = CommitPlan {
+        every: SYNC_EVERY,
+        boundary: if args.verify.ephemeral {
+            Durability::Flushed
+        } else {
+            Durability::Synced
+        },
+    };
+    let preparer = BlockPreparer::new(
+        Arc::clone(&snapshot),
+        SystemClock,
+        matches!(args.network, Network::Testnet3 | Network::Testnet4),
+        commits,
+    );
+    let prep = PrepPool::new(preparer, args.prep_threads, PREP_DEPTH, start_height)
+        .map_err(|e| format!("spawn prep threads: {e}"))?;
     let pool = ScriptPool::new(if args.skip_script { 0 } else { args.script_threads })
         .map_err(|e| format!("spawn script workers: {e}"))?;
     let mut pipeline = ConnectPipeline::new(pool, storage.tip(), InFlightLimit::default())
@@ -677,14 +721,10 @@ fn run(args: &Args) -> Result<u64, String> {
     if utxo_hash.is_some() {
         pipeline = pipeline.with_utxo_hash(UtxoSetHash::new());
     }
-    let mut ctx = ReplayLoop::new(storage, pipeline);
-    ctx.allow_min_difficulty = matches!(args.network, Network::Testnet3 | Network::Testnet4);
+    let mut ctx = ReplayLoop::new(storage, pipeline, prep);
     ctx.failures = args.verify.failure_log()?;
     ctx.failure_blocks = args.verify.failure_blocks()?;
     ctx.utxo_hash = utxo_hash;
-    if args.verify.ephemeral {
-        ctx.boundary_durability = Durability::Flushed;
-    }
 
     eprintln!(
         "  replaying {}..={} ({} script verification, {} script workers{})…",

@@ -1,63 +1,56 @@
-use mantle::collections::{BuildPrehashedHasher, PrehashedMap};
+use std::time::Instant;
+
+use mantle::codec::Encode;
 use mantle::primitives::{Block, BlockHeader, BlockHeight, Hash256};
-use mantle_consensus::validation::{validate_block_context, validate_block_structure};
+use mantle_consensus::error::ValidationError;
 use mantle_storage::StorageHandle;
-use mantle_storage::types::{Durability, ReqToken};
 use mantle_validator::{
-    BlockJob, ConnectPipeline, Connected, HeaderSnapshot, PrefetchedView, Retired, Verdict, Wait,
+    BlockJob, ConnectPipeline, Connected, HeaderSnapshot, PrepCheck, PrepPool, Prepared, RawBlock,
+    Retired, Verdict, Wait,
 };
 
-use crate::block_feed::{BlockFeed, FedBlock, FeedItem};
+use crate::block_feed::{BlockFeed, FeedItem};
 use crate::failures::{FailureLog, FailureStage};
 use crate::report::Reporter;
 use crate::stage_clock::{Stage, StageClock};
 use mantle_replay::block_files::BlockFiles;
 use mantle_replay::utxo_hash_check::{UtxoHashTracker, UtxoHashVerdict};
 
-/// Drives blocks from the feed through the connect pipeline.
+/// Drives blocks from the feed through preparation and the connect pipeline.
 ///
-/// Each block is decoded and checked on its own, connected ahead of its
-/// scripts, and committed once its scripts pass. Blocks reach storage, the
-/// failure log and the UTXO hash tracker in height order.
+/// Prep threads decode and check blocks ahead of the one being connected;
+/// this thread connects them in height order and commits each once its
+/// scripts pass. Blocks reach storage, the failure log and the UTXO hash
+/// tracker in height order.
 pub struct ReplayLoop {
     pub storage: StorageHandle<'static>,
     pub pipeline: ConnectPipeline,
-    pub allow_min_difficulty: bool,
+    pub prep: PrepPool,
     pub failures: Option<FailureLog>,
     pub failure_blocks: Option<BlockFiles>,
     pub utxo_hash: Option<UtxoHashTracker>,
     pub clock: StageClock,
-    /// Durability of the commit at each `SYNC_EVERY` boundary. Ephemeral
-    /// runs only need the write buffer drained there, not an `fsync`.
-    pub boundary_durability: Durability,
-    next_token: u64,
     last_committed: BlockHeight,
 }
 
-/// Blocks are written with `Durability::Synced` at difficulty-adjustment
-/// boundaries; every other commit stays in memory until then.
-const SYNC_EVERY: u32 = 2_016;
-
 impl ReplayLoop {
     #[must_use]
-    pub fn new(storage: StorageHandle<'static>, pipeline: ConnectPipeline) -> Self {
+    pub fn new(storage: StorageHandle<'static>, pipeline: ConnectPipeline, prep: PrepPool) -> Self {
         let tip = storage.tip().height;
         Self {
             storage,
             pipeline,
-            allow_min_difficulty: false,
+            prep,
             failures: None,
             failure_blocks: None,
             utxo_hash: None,
             clock: StageClock::default(),
-            boundary_durability: Durability::Synced,
-            next_token: u64::from(tip.to_u32()).saturating_add(1),
             last_committed: tip,
         }
     }
 
-    /// Replay every block in `header_pairs`, window by window, and return
-    /// the height storage ends at.
+    /// Replay every block in `header_pairs`, logging stage times every
+    /// `window` blocks, and return the height storage ends at.
     ///
     /// # Errors
     /// A message on a feed or storage failure, or on the first consensus
@@ -70,10 +63,15 @@ impl ReplayLoop {
         snapshot: &HeaderSnapshot,
         reporter: &mut Reporter,
     ) -> Result<BlockHeight, String> {
+        let mut to_submit = header_pairs.iter();
         for chunk in header_pairs.chunks(window) {
-            for &(height, _) in chunk {
-                let block = self.next_block(feed, height)?;
-                self.replay_block(&block, snapshot)?;
+            for _ in chunk {
+                self.fill_prep(feed, &mut to_submit)?;
+                let prepared = self
+                    .clock
+                    .time(Stage::Decode, || self.prep.take_next())
+                    .ok_or("prep pool ran dry before the last header")??;
+                self.connect(prepared, snapshot)?;
                 self.retire(Wait::IfOverLimit, reporter)?;
                 if self.pipeline.is_stopped() {
                     return Ok(self.last_committed);
@@ -93,47 +91,56 @@ impl ReplayLoop {
         Ok(self.last_committed)
     }
 
-    fn next_block(&mut self, feed: &mut BlockFeed, height: BlockHeight) -> Result<FedBlock, String> {
-        let block = match self.clock.time(Stage::Wait, || feed.next()) {
-            Some(FeedItem::Block(block)) => block,
-            Some(FeedItem::Failed(e)) => return Err(e),
-            Some(FeedItem::Headers(_)) | None => {
-                return Err(format!("block feed ended before height {}", height.to_u32()));
+    /// Keep the prep threads fed with downloaded blocks.
+    fn fill_prep<'h>(
+        &mut self,
+        feed: &mut BlockFeed,
+        headers: &mut impl Iterator<Item = &'h (BlockHeight, BlockHeader)>,
+    ) -> Result<(), String> {
+        while self.prep.has_room() {
+            let Some(&(height, _)) = headers.next() else {
+                return Ok(());
+            };
+            let block = match self.clock.time(Stage::Wait, || feed.next()) {
+                Some(FeedItem::Block(block)) => block,
+                Some(FeedItem::Failed(e)) => return Err(e),
+                Some(FeedItem::Headers(_)) | None => {
+                    return Err(format!("block feed ended before height {}", height.to_u32()));
+                }
+            };
+            if block.height != height {
+                return Err(format!(
+                    "block feed sent height {}, expected {}",
+                    block.height.to_u32(),
+                    height.to_u32()
+                ));
             }
-        };
-        if block.height != height {
-            return Err(format!(
-                "block feed sent height {}, expected {}",
-                block.height.to_u32(),
-                height.to_u32()
-            ));
+            self.prep.submit(RawBlock {
+                height: block.height,
+                hash: block.hash,
+                bytes: block.bytes,
+            });
         }
-        Ok(block)
+        Ok(())
     }
 
-    fn replay_block(&mut self, fed: &FedBlock, snapshot: &HeaderSnapshot) -> Result<(), String> {
-        let (height, hash) = (fed.height, fed.hash);
-        let block = self.clock.time(Stage::Decode, || fed.decode())?;
-        let mut failed = false;
-        if let Err(e) = validate_block_structure(&block) {
-            failed = true;
-            self.save_failed_block(height, hash, &fed.bytes);
-            self.fail(height, hash, FailureStage::Structure, &e)?;
-        }
-        let empty = PrehashedMap::with_hasher(BuildPrehashedHasher);
-        let view = PrefetchedView::new(&empty, snapshot, self.pipeline.tip().clone());
-        if let Err(e) = validate_block_context(&block, &view, self.allow_min_difficulty) {
-            if !failed {
-                self.save_failed_block(height, hash, &fed.bytes);
+    fn connect(&mut self, prepared: Prepared, snapshot: &HeaderSnapshot) -> Result<(), String> {
+        let job = match prepared {
+            Prepared::Ready(job) => job,
+            Prepared::Invalid { job, failures } => {
+                self.save_block(job.height, job.hash, &job.block);
+                for (check, error) in &failures {
+                    let stage = match check {
+                        PrepCheck::Structure => FailureStage::Structure,
+                        PrepCheck::Context => FailureStage::Context,
+                    };
+                    self.fail(job.height, job.hash, stage, error)?;
+                }
+                return self.force(job);
             }
-            failed = true;
-            self.fail(height, hash, FailureStage::Context, &e)?;
-        }
-        let job = BlockJob::new(block, height, self.durability(height), self.next_token());
-        if failed {
-            return self.force(job);
-        }
-        let started = std::time::Instant::now();
+        };
+        let (height, hash) = (job.height, job.hash);
+        let started = Instant::now();
         let connected = self
             .pipeline
             .connect(job, &mut self.storage, snapshot)
@@ -142,7 +149,7 @@ impl ReplayLoop {
         match connected {
             Connected::Queued => Ok(()),
             Connected::Rejected { error, job } => {
-                self.save_failed_block(height, hash, &fed.bytes);
+                self.save_block(height, hash, &job.block);
                 self.fail(height, hash, FailureStage::Connect, &error)?;
                 self.force(*job)
             }
@@ -151,18 +158,15 @@ impl ReplayLoop {
 
     fn force(&mut self, job: BlockJob) -> Result<(), String> {
         let height = job.height;
-        self.pipeline.stop_utxo_hash();
-        if let Some(tracker) = &mut self.utxo_hash {
-            tracker.stop(height);
-        }
+        self.stop_utxo_hash(height);
         self.pipeline
             .force(Box::new(job))
-            .map_err(|e| format!("forced commit at {}: {e}", height.to_u32()))
+            .map_err(|e: ValidationError| format!("forced commit at {}: {e}", height.to_u32()))
     }
 
     fn retire(&mut self, wait: Wait, reporter: &mut Reporter) -> Result<(), String> {
         loop {
-            let started = std::time::Instant::now();
+            let started = Instant::now();
             let retired = self
                 .pipeline
                 .retire_next(&mut self.storage, wait)
@@ -187,10 +191,7 @@ impl ReplayLoop {
             if let Some(block) = &failed_block {
                 self.save_block(height, hash, block);
             }
-            if let Some(tracker) = &mut self.utxo_hash {
-                tracker.stop(height);
-            }
-            self.pipeline.stop_utxo_hash();
+            self.stop_utxo_hash(height);
             self.fail(height, hash, FailureStage::Connect, error)?;
         }
         if !committed {
@@ -201,38 +202,28 @@ impl ReplayLoop {
         self.check_utxo_hash(height, hash)
     }
 
-    fn durability(&self, height: BlockHeight) -> Durability {
-        if height.to_u32().is_multiple_of(SYNC_EVERY) {
-            self.boundary_durability
-        } else {
-            Durability::Memory
+    fn stop_utxo_hash(&mut self, height: BlockHeight) {
+        self.pipeline.stop_utxo_hash();
+        if let Some(tracker) = &mut self.utxo_hash {
+            tracker.stop(height);
         }
     }
 
-    fn next_token(&mut self) -> ReqToken {
-        let token = ReqToken(self.next_token);
-        self.next_token = self.next_token.saturating_add(1);
-        token
-    }
-
-    fn save_failed_block(&self, height: BlockHeight, hash: Hash256, bytes: &[u8]) {
+    fn save_block(&self, height: BlockHeight, hash: Hash256, block: &Block) {
         let Some(blocks) = &self.failure_blocks else {
             return;
         };
-        match blocks.save(Some(height), hash, bytes) {
+        let mut bytes = Vec::new();
+        if let Err(e) = block.encode(&mut bytes) {
+            eprintln!("  warning: could not encode failing block {}: {e}", height.to_u32());
+            return;
+        }
+        match blocks.save(Some(height), hash, &bytes) {
             Ok(path) => eprintln!("  saved failing block to {}", path.display()),
             Err(e) => eprintln!(
                 "  warning: could not save failing block {}: {e}",
                 height.to_u32()
             ),
-        }
-    }
-
-    fn save_block(&self, height: BlockHeight, hash: Hash256, block: &Block) {
-        use mantle::codec::Encode;
-        let mut bytes = Vec::new();
-        if block.encode(&mut bytes).is_ok() {
-            self.save_failed_block(height, hash, &bytes);
         }
     }
 

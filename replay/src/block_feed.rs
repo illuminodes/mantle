@@ -1,12 +1,10 @@
-use std::io::Cursor;
 use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use mantle::codec::Decode;
 use mantle::network::Network;
-use mantle::primitives::{Block, BlockHeader, BlockHeight, Hash256};
+use mantle::primitives::{BlockHeader, BlockHeight, Hash256};
 use mantle_fetcher::Fetcher;
 use quetzalcoatl::capacity::Capacity;
 use quetzalcoatl::spsc;
@@ -40,24 +38,6 @@ pub struct FedBlock {
     pub height: BlockHeight,
     pub hash: Hash256,
     pub bytes: Vec<u8>,
-}
-
-impl FedBlock {
-    /// # Errors
-    /// Returns a message if the bytes do not decode or hash to `self.hash`.
-    pub fn decode(&self) -> Result<Block, String> {
-        let block = Block::decode(&mut Cursor::new(&self.bytes))
-            .map_err(|e| format!("decode block {}: {e}", self.height.to_u32()))?;
-        if block.header.hash() != self.hash {
-            return Err(format!(
-                "block {} hashes to {}, expected {}",
-                self.height.to_u32(),
-                block.header.hash(),
-                self.hash
-            ));
-        }
-        Ok(block)
-    }
 }
 
 pub enum FeedItem {

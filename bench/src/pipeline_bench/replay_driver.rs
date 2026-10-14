@@ -1,16 +1,12 @@
-use std::io::Cursor;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mantle::codec::Decode;
-use mantle::collections::{BuildPrehashedHasher, PrehashedMap};
-use mantle::primitives::{Block, BlockHeight};
-use mantle_consensus::validation::{
-    FixedClock, validate_block_context_with_clock, validate_block_structure,
-};
-use mantle_storage::types::{Durability, ReqToken};
+use mantle::primitives::{BlockHeader, BlockHeight};
+use mantle_consensus::validation::FixedClock;
+use mantle_storage::types::Durability;
 use mantle_validator::{
-    BlockJob, ConnectPipeline, Connected, HeaderSnapshot, PrefetchedView, Retired, ScriptPool,
-    Verdict, Wait,
+    BlockPreparer, CommitPlan, ConnectPipeline, Connected, PrepPool, Prepared, RawBlock, Retired,
+    ScriptPool, Verdict, Wait,
 };
 
 use crate::bench_args::BenchArgs;
@@ -21,21 +17,18 @@ use crate::synthetic_chain::SyntheticChain;
 
 #[derive(Default)]
 struct StageTimes {
-    decode: Duration,
-    checks: Duration,
+    prepared: Duration,
     connect: Duration,
     retire: Duration,
 }
 
-/// Replays a synthetic chain through the calls `mantle-replay` makes per
-/// block and reports throughput and CPU use per thread group.
+/// Replays a synthetic chain through the same pipeline `mantle-replay`
+/// uses and reports throughput and CPU use per thread group.
 pub struct ReplayDriver {
-    snapshot: HeaderSnapshot,
     storage: SeededStorage,
     pipeline: ConnectPipeline,
-    clock: FixedClock,
-    sync_every: u32,
-    boundary: Durability,
+    prep: PrepPool,
+    snapshot: Arc<mantle_validator::HeaderSnapshot>,
     times: StageTimes,
 }
 
@@ -47,34 +40,49 @@ impl ReplayDriver {
         if args.generate_only {
             return Ok(());
         }
-        let snapshot = SeededStorage::snapshot(&chain);
+        let snapshot = Arc::new(SeededStorage::snapshot(&chain));
         let storage =
             SeededStorage::open(&args.store_root, &args.spec, &chain.history, args.filler_coins)?;
         let pool = ScriptPool::new(args.script_threads).map_err(|e| e.to_string())?;
-        let mut pipeline =
-            ConnectPipeline::new(pool, storage.handle.tip(), args.limit);
+        let mut pipeline = ConnectPipeline::new(pool, storage.handle.tip(), args.limit);
         if args.skip_scripts {
             pipeline = pipeline.skip_scripts();
         }
-        let mut driver = Self {
-            snapshot,
-            storage,
-            pipeline,
-            clock: FixedClock(u64::from(ChainSpec::time_at(args.spec.last_height()))),
-            sync_every: args.sync_every,
+        let commits = CommitPlan {
+            every: args.sync_every,
             boundary: if args.sync_without_fsync {
                 Durability::Flushed
             } else {
                 Durability::Synced
             },
+        };
+        let preparer = BlockPreparer::new(
+            Arc::clone(&snapshot),
+            FixedClock(u64::from(ChainSpec::time_at(args.spec.last_height()))),
+            false,
+            commits,
+        );
+        let prep = PrepPool::new(
+            preparer,
+            args.prep_threads,
+            args.prep_depth,
+            BlockHeight::new(ChainSpec::FIRST_HEIGHT),
+        )
+        .map_err(|e| e.to_string())?;
+        let mut driver = Self {
+            storage,
+            pipeline,
+            prep,
+            snapshot,
             times: StageTimes::default(),
         };
         let inputs = args.spec.inputs_per_block() * chain.blocks.len();
         println!(
-            "replaying {} blocks, {} inputs, {} script workers, up to {} blocks in flight",
+            "replaying {} blocks, {} inputs, {} script workers, {} prep threads, up to {} blocks in flight",
             chain.blocks.len(),
             inputs,
             driver.pipeline.workers(),
+            args.prep_threads,
             args.limit.blocks
         );
         let meter = CpuMeter::start();
@@ -82,6 +90,7 @@ impl ReplayDriver {
         let result = driver.replay(&chain);
         let wall = started.elapsed();
         let report = meter.finish();
+        drop(driver.prep);
         driver.storage.close();
         result?;
         let secs = wall.as_secs_f64();
@@ -92,9 +101,8 @@ impl ReplayDriver {
         );
         let t = &driver.times;
         println!(
-            "main thread: decode {:.2}s, structure+context {:.2}s, connect {:.2}s, retire+commit {:.2}s",
-            t.decode.as_secs_f64(),
-            t.checks.as_secs_f64(),
+            "main thread: waiting for prepared blocks {:.2}s, connect {:.2}s, retire+commit {:.2}s",
+            t.prepared.as_secs_f64(),
             t.connect.as_secs_f64(),
             t.retire.as_secs_f64()
         );
@@ -108,7 +116,7 @@ impl ReplayDriver {
         );
         let own = report.main_thread().saturating_sub(busy.owner);
         println!(
-            "main thread own work: {:.2}s cpu = {:.2} us/input (the ceiling once scripts keep up)",
+            "main thread own work: {:.2}s cpu = {:.2} us/input",
             own.as_secs_f64(),
             own.as_secs_f64() * 1e6 / inputs as f64
         );
@@ -117,39 +125,47 @@ impl ReplayDriver {
     }
 
     fn replay(&mut self, chain: &SyntheticChain) -> Result<(), String> {
-        for (offset, bytes) in chain.blocks.iter().enumerate() {
-            let height = BlockHeight::new(
-                ChainSpec::FIRST_HEIGHT + u32::try_from(offset).map_err(|e| e.to_string())?,
-            );
+        let mut feed = chain.blocks.iter().enumerate();
+        loop {
+            while self.prep.has_room() {
+                let Some((offset, bytes)) = feed.next() else { break };
+                let height = ChainSpec::FIRST_HEIGHT + u32::try_from(offset).map_err(|e| e.to_string())?;
+                let header = BlockHeader::from_bytes(
+                    bytes[..BlockHeader::ENCODED_LEN]
+                        .try_into()
+                        .map_err(|_| "short block".to_string())?,
+                );
+                self.prep.submit(RawBlock {
+                    height: BlockHeight::new(height),
+                    hash: header.hash(),
+                    bytes: bytes.clone(),
+                });
+            }
             let started = Instant::now();
-            let block = Block::decode(&mut Cursor::new(bytes)).map_err(|e| e.to_string())?;
-            self.times.decode += started.elapsed();
-            self.block(block, height)?;
+            let Some(prepared) = self.prep.take_next() else { break };
+            self.times.prepared += started.elapsed();
+            let job = match prepared? {
+                Prepared::Ready(job) => job,
+                Prepared::Invalid { job, failures } => {
+                    return Err(format!(
+                        "block {} failed {failures:?}",
+                        job.height.to_u32()
+                    ));
+                }
+            };
+            let at = job.height.to_u32();
+            let started = Instant::now();
+            let connected = self
+                .pipeline
+                .connect(job, &mut self.storage.handle, &self.snapshot)
+                .map_err(|e| format!("storage at {at}: {e}"))?;
+            self.times.connect += started.elapsed();
+            if let Connected::Rejected { error, .. } = connected {
+                return Err(format!("connect at {at}: {error}"));
+            }
             self.retire(Wait::IfOverLimit)?;
         }
         self.retire(Wait::Always)
-    }
-
-    fn block(&mut self, block: Block, height: BlockHeight) -> Result<(), String> {
-        let at = height.to_u32();
-        let started = Instant::now();
-        validate_block_structure(&block).map_err(|e| format!("structure at {at}: {e}"))?;
-        let empty = PrehashedMap::with_hasher(BuildPrehashedHasher);
-        let view = PrefetchedView::new(&empty, &self.snapshot, self.pipeline.tip().clone());
-        validate_block_context_with_clock(&block, &view, &self.clock, false)
-            .map_err(|e| format!("context at {at}: {e}"))?;
-        let job = BlockJob::new(block, height, self.durability(at), ReqToken(u64::from(at)));
-        self.times.checks += started.elapsed();
-        let started = Instant::now();
-        let connected = self
-            .pipeline
-            .connect(job, &mut self.storage.handle, &self.snapshot)
-            .map_err(|e| format!("storage at {at}: {e}"))?;
-        self.times.connect += started.elapsed();
-        match connected {
-            Connected::Queued => Ok(()),
-            Connected::Rejected { error, .. } => Err(format!("connect at {at}: {error}")),
-        }
     }
 
     fn retire(&mut self, wait: Wait) -> Result<(), String> {
@@ -172,14 +188,6 @@ impl ReplayDriver {
                 "block {} retired as {other:?}",
                 retired.height.to_u32()
             )),
-        }
-    }
-
-    fn durability(&self, height: u32) -> Durability {
-        if self.sync_every > 0 && height.is_multiple_of(self.sync_every) {
-            self.boundary
-        } else {
-            Durability::Memory
         }
     }
 }
