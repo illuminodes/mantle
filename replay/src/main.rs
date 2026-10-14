@@ -4,17 +4,11 @@
 //!
 //! ```text
 //! for height in start..=target:
-//!     hash  = headers[height]
-//!     bytes = fetcher.read_block_bytes(height)
-//!     block = Block::decode(bytes)
+//!     block = Block::decode(fetcher.read_block_bytes(height))
 //!     validate_block_structure(&block)?
 //!     validate_block_context(&block, &header_snapshot)?
-//!     bufs.validate_and_commit_deferred(
-//!         block, height, &mut storage, &header_snapshot, &mut deferred_scripts,
-//!         if height % 2016 == 0 { Synced } else { Memory },
-//!     )
-//!     // reports the script verdict of height - 1; this block's scripts
-//!     // keep running while the next block is prepared
+//!     pipeline.connect(block)      // queues its scripts, delta goes to the overlay
+//!     pipeline.retire_next(..)     // commits the oldest block whose scripts passed
 //! ```
 //!
 //! CLI: `mantle-replay [--data-dir DIR] [--network NAME] [--peer HOST:PORT]…
@@ -22,52 +16,29 @@
 
 mod block_feed;
 mod failures;
+mod replay_loop;
 mod report;
 mod stage_clock;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use mantle::collections::{BuildPrehashedHasher, PrehashedMap};
 use mantle::network::Network;
 use mantle::primitives::{BlockHeader, BlockHeight, Hash256};
-use mantle_consensus::validation::{validate_block_context, validate_block_structure};
 use mantle_storage::StorageHandle;
-use mantle_storage::types::{Durability, ReqToken};
-use mantle::primitives::Block;
+use mantle_storage::types::Durability;
+use mantle_utxo_hash::UtxoSetHash;
 use mantle_validator::{
-    DeferredBlock, DeferredOpts, DeferredScripts, ForcedCommit, HeaderSnapshot, PipelineError,
-    PipelineOpts, PrefetchedView, ReplayBufs, ScriptPolicy, ScriptPool, SettledScripts,
+    ConnectPipeline, HeaderSnapshot, InFlightLimit, OnScriptFailure, ScriptPool,
 };
 
-use crate::failures::{FailureLog, FailureStage};
-use crate::block_feed::{BlockFeed, FedBlock, FeedItem, FeedPlan};
+use crate::block_feed::{BlockFeed, FeedItem, FeedPlan};
+use crate::failures::FailureLog;
+use crate::replay_loop::ReplayLoop;
 use crate::report::Reporter;
-use crate::stage_clock::{Stage, StageClock};
 use mantle_replay::block_files::BlockFiles;
 use mantle_replay::peer_list::PeerList;
-use mantle_replay::utxo_hash_check::{UtxoHashReference, UtxoHashTracker, UtxoHashVerdict};
-
-struct ReplayCtx {
-    storage: StorageHandle<'static>,
-    skip_script: bool,
-    allow_min_difficulty: bool,
-    scripts: DeferredScripts,
-    /// The committed block whose scripts are still running, kept so a late
-    /// script failure can still save its bytes.
-    in_flight: Option<FedBlock>,
-    bufs: ReplayBufs,
-    token: u64,
-    forced: ForcedCommit,
-    failures: Option<FailureLog>,
-    failure_blocks: Option<BlockFiles>,
-    utxo_hash: Option<UtxoHashTracker>,
-    clock: StageClock,
-}
-
-/// Block at which `Durability::Synced` flushes everything to disk. Matches
-/// difficulty-adjustment-period boundaries — a natural checkpoint cadence.
-const SYNC_EVERY: u32 = 2_016;
+use mantle_replay::utxo_hash_check::{UtxoHashReference, UtxoHashTracker};
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -691,38 +662,43 @@ fn run(args: &Args) -> Result<u64, String> {
     let headers: Vec<BlockHeader> = header_pairs.iter().map(|(_, h)| *h).collect();
     let snapshot = build_snapshot(start_height, &headers, args.network, &mut storage)?;
 
-    let allow_min_difficulty = matches!(args.network, Network::Testnet3 | Network::Testnet4);
-    let mut ctx = ReplayCtx {
-        storage,
-        skip_script: args.skip_script,
-        allow_min_difficulty,
-        scripts: DeferredScripts::new(
-            ScriptPool::new(if args.skip_script { 0 } else { args.script_threads })
-                .map_err(|e| format!("spawn script workers: {e}"))?,
-        ),
-        in_flight: None,
-        bufs: ReplayBufs::new(),
-        token: u64::from(tip.height.to_u32()).saturating_add(1),
-        forced: ForcedCommit::new(),
-        failures: args.verify.failure_log()?,
-        failure_blocks: args.verify.failure_blocks()?,
-        utxo_hash: args.verify.utxo_hash_tracker()?,
-        clock: StageClock::default(),
-    };
+    let pool = ScriptPool::new(if args.skip_script { 0 } else { args.script_threads })
+        .map_err(|e| format!("spawn script workers: {e}"))?;
+    let mut pipeline = ConnectPipeline::new(pool, storage.tip(), InFlightLimit::default())
+        .on_script_failure(if args.verify.keep_going {
+            OnScriptFailure::CommitAnyway
+        } else {
+            OnScriptFailure::Stop
+        });
+    if args.skip_script {
+        pipeline = pipeline.skip_scripts();
+    }
+    let utxo_hash = args.verify.utxo_hash_tracker()?;
+    if utxo_hash.is_some() {
+        pipeline = pipeline.with_utxo_hash(UtxoSetHash::new());
+    }
+    let mut ctx = ReplayLoop::new(storage, pipeline);
+    ctx.allow_min_difficulty = matches!(args.network, Network::Testnet3 | Network::Testnet4);
+    ctx.failures = args.verify.failure_log()?;
+    ctx.failure_blocks = args.verify.failure_blocks()?;
+    ctx.utxo_hash = utxo_hash;
+    if args.verify.ephemeral {
+        ctx.boundary_durability = Durability::Flushed;
+    }
 
     eprintln!(
         "  replaying {}..={} ({} script verification, {} script workers{})…",
         start_height.to_u32(),
         actual_stop.to_u32(),
         if args.skip_script { "skipping" } else { "with" },
-        ctx.scripts.workers(),
+        ctx.pipeline.workers(),
         args.verify.mode_suffix(),
     );
 
     let mut reporter = Reporter::new(start_height, actual_stop, args.verify.progress_every);
-    let last_committed = ctx.replay_range(
+    let last_committed = ctx.run(
         &header_pairs,
-        &args.verify,
+        args.verify.window,
         &mut feed,
         &snapshot,
         &mut reporter,
@@ -736,283 +712,4 @@ fn run(args: &Args) -> Result<u64, String> {
         .shutdown()
         .map_err(|e| format!("shutdown storage: {e}"))?;
     Ok(failures)
-}
-
-impl ReplayCtx {
-    fn replay_range(
-        &mut self,
-        header_pairs: &[(BlockHeight, BlockHeader)],
-        verify: &VerifyOpts,
-        feed: &mut BlockFeed,
-        snapshot: &HeaderSnapshot,
-        reporter: &mut Reporter,
-    ) -> Result<BlockHeight, String> {
-        let mut last_committed = self.storage.tip().height;
-        for window in header_pairs.chunks(verify.window) {
-            for &(height, _) in window {
-                let block = match self.clock.time(Stage::Wait, || feed.next()) {
-                    Some(FeedItem::Block(block)) => block,
-                    Some(FeedItem::Failed(e)) => return Err(e),
-                    Some(FeedItem::Headers(_)) | None => {
-                        return Err(format!(
-                            "block feed ended before height {}",
-                            height.to_u32()
-                        ));
-                    }
-                };
-                if block.height != height {
-                    return Err(format!(
-                        "block feed sent height {}, expected {}",
-                        block.height.to_u32(),
-                        height.to_u32()
-                    ));
-                }
-                self.replay_block(block, snapshot)?;
-                last_committed = height;
-                reporter.tick(height);
-            }
-            if window.last().is_some_and(|&(h, _)| h == header_pairs[header_pairs.len() - 1].0) {
-                self.settle_in_flight()?;
-            }
-            eprintln!(
-                "  window {}..={}: {}",
-                window[0].0.to_u32(),
-                window[window.len() - 1].0.to_u32(),
-                self.clock.take_line()
-            );
-        }
-        Ok(last_committed)
-    }
-
-    fn replay_block(&mut self, fed: FedBlock, snapshot: &HeaderSnapshot) -> Result<(), String> {
-        let (height, hash) = (fed.height, fed.hash);
-        let block = self.clock.time(Stage::Decode, || fed.decode())?;
-
-        let mut saved = false;
-        if let Err(e) = validate_block_structure(&block) {
-            self.save_failed_block(&fed, &mut saved);
-            self.fail(height, hash, FailureStage::Structure, &e)?;
-        }
-
-        let empty_coins = PrehashedMap::with_hasher(BuildPrehashedHasher);
-        let context_view = PrefetchedView::new(&empty_coins, snapshot, self.storage.tip());
-        if let Err(e) = validate_block_context(&block, &context_view, self.allow_min_difficulty) {
-            self.save_failed_block(&fed, &mut saved);
-            self.fail(height, hash, FailureStage::Context, &e)?;
-        }
-
-        if self.skip_script {
-            return self.replay_block_scoped(&fed, &block, snapshot, saved);
-        }
-        self.replay_block_deferred(fed, block, snapshot, saved)
-    }
-
-    fn next_commit_params(&mut self, height: BlockHeight) -> (Durability, ReqToken) {
-        let durability = if height.to_u32().is_multiple_of(SYNC_EVERY) {
-            Durability::Synced
-        } else {
-            Durability::Memory
-        };
-        let token = ReqToken(self.token);
-        self.token = self.token.saturating_add(1);
-        (durability, token)
-    }
-
-    /// Validate and commit `block` while its scripts run on the pool, and
-    /// record the script verdict of the block committed before it.
-    fn replay_block_deferred(
-        &mut self,
-        fed: FedBlock,
-        block: Block,
-        snapshot: &HeaderSnapshot,
-        mut saved: bool,
-    ) -> Result<(), String> {
-        let (height, hash) = (fed.height, fed.hash);
-        let (durability, token) = self.next_commit_params(height);
-        let validate_started = std::time::Instant::now();
-        let step = self.bufs.validate_and_commit_deferred(
-            block,
-            height,
-            &mut self.storage,
-            snapshot,
-            &mut self.scripts,
-            DeferredOpts {
-                durability,
-                token,
-                utxo_hash: self.utxo_hash.as_mut().and_then(UtxoHashTracker::hash_mut),
-            },
-        );
-        self.clock.add(Stage::Validate, validate_started);
-        let previous = self.in_flight.take();
-        self.record_settled(step.previous, previous)?;
-        match step.current {
-            DeferredBlock::Committed(_) => {
-                self.in_flight = Some(fed);
-                self.check_utxo_hash(height, hash)
-            }
-            DeferredBlock::Rejected {
-                error: PipelineError::Validation(e),
-                block,
-            } => {
-                self.save_failed_block(&fed, &mut saved);
-                self.fail(height, hash, FailureStage::Connect, &e)?;
-                if let Some(tracker) = &mut self.utxo_hash {
-                    tracker.stop(height);
-                }
-                self.force_commit(&block, height, durability, token)
-            }
-            DeferredBlock::Rejected {
-                error: e @ PipelineError::Storage(_),
-                ..
-            } => Err(format!("validate_and_commit at {}: {e}", height.to_u32())),
-        }
-    }
-
-    /// Wait for the scripts of the last committed block and record their
-    /// verdict.
-    fn settle_in_flight(&mut self) -> Result<(), String> {
-        let settled = self.scripts.settle();
-        let fed = self.in_flight.take();
-        self.record_settled(settled, fed)
-    }
-
-    fn record_settled(
-        &mut self,
-        settled: Option<SettledScripts>,
-        fed: Option<FedBlock>,
-    ) -> Result<(), String> {
-        let Some(SettledScripts {
-            height,
-            hash,
-            verdict: Err(e),
-        }) = settled
-        else {
-            return Ok(());
-        };
-        if let Some(fed) = fed.filter(|f| f.height == height) {
-            self.save_failed_block(&fed, &mut false);
-        }
-        if let Some(tracker) = &mut self.utxo_hash {
-            tracker.stop(height);
-        }
-        self.fail(height, hash, FailureStage::Connect, &e)
-    }
-
-    /// Validate and commit `block` with every check finished before the
-    /// commit; used when scripts are skipped.
-    fn replay_block_scoped(
-        &mut self,
-        fed: &FedBlock,
-        block: &Block,
-        snapshot: &HeaderSnapshot,
-        mut saved: bool,
-    ) -> Result<(), String> {
-        let (height, hash) = (fed.height, fed.hash);
-        let (durability, token) = self.next_commit_params(height);
-
-        let validate_started = std::time::Instant::now();
-        let connected = self.bufs.validate_and_commit(
-            block,
-            height,
-            &mut self.storage,
-            snapshot,
-            PipelineOpts {
-                scripts: ScriptPolicy::Skip,
-                durability,
-                token,
-                utxo_hash: self.utxo_hash.as_mut().and_then(UtxoHashTracker::hash_mut),
-            },
-        );
-        self.clock.add(Stage::Validate, validate_started);
-        match connected {
-            Ok(_) => self.check_utxo_hash(height, hash),
-            Err(PipelineError::Validation(e)) => {
-                self.save_failed_block(fed, &mut saved);
-                self.fail(height, hash, FailureStage::Connect, &e)?;
-                if let Some(tracker) = &mut self.utxo_hash {
-                    tracker.stop(height);
-                }
-                self.force_commit(block, height, durability, token)
-            }
-            Err(e @ PipelineError::Storage(_)) => {
-                Err(format!("validate_and_commit at {}: {e}", height.to_u32()))
-            }
-        }
-    }
-
-    fn save_failed_block(&self, fed: &FedBlock, saved: &mut bool) {
-        let Some(blocks) = &self.failure_blocks else {
-            return;
-        };
-        if std::mem::replace(saved, true) {
-            return;
-        }
-        let height = fed.height;
-        let written = blocks.save(Some(height), fed.hash, &fed.bytes);
-        match written {
-            Ok(path) => eprintln!("  saved failing block to {}", path.display()),
-            Err(e) => eprintln!(
-                "  warning: could not save failing block {}: {e}",
-                height.to_u32()
-            ),
-        }
-    }
-
-    fn fail(
-        &mut self,
-        height: BlockHeight,
-        hash: Hash256,
-        stage: FailureStage,
-        error: &dyn std::fmt::Display,
-    ) -> Result<(), String> {
-        match &mut self.failures {
-            Some(log) => {
-                log.record(height, hash, stage, error);
-                Ok(())
-            }
-            None => Err(format!("{stage} check at {}: {error}", height.to_u32())),
-        }
-    }
-
-    fn force_commit(
-        &mut self,
-        block: &Block,
-        height: BlockHeight,
-        durability: Durability,
-        token: ReqToken,
-    ) -> Result<(), String> {
-        self.forced
-            .commit(block, height, &mut self.storage, durability, token)
-            .map(|_| ())
-            .map_err(|e| format!("forced commit at {}: {e}", height.to_u32()))
-    }
-
-    fn check_utxo_hash(&mut self, height: BlockHeight, hash: Hash256) -> Result<(), String> {
-        let Some(tracker) = &mut self.utxo_hash else {
-            return Ok(());
-        };
-        match tracker.after_block(height) {
-            UtxoHashVerdict::NotChecked => Ok(()),
-            UtxoHashVerdict::Match(muhash) => {
-                eprintln!("  utxo hash matches at height {}: {muhash}", height.to_u32());
-                Ok(())
-            }
-            UtxoHashVerdict::Mismatch { expected, actual } => self.fail(
-                height,
-                hash,
-                FailureStage::UtxoHash,
-                &format!("UTXO set MuHash {actual}, Bitcoin Core reports {expected}"),
-            ),
-        }
-    }
-
-    fn summarize_failures(&self) -> u64 {
-        if let Some(tracker) = &self.utxo_hash {
-            tracker.print_summary();
-        }
-        self.failures.as_ref().map_or(0, |log| {
-            log.print_summary();
-            log.total()
-        })
-    }
 }

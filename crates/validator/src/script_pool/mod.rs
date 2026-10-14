@@ -1,11 +1,16 @@
 mod batch;
+mod busy_clock;
 mod crew;
 mod job;
+mod ledger;
 mod verdict;
 mod worker;
 
 #[cfg(test)]
 mod tests;
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use mantle_consensus::error::ValidationError;
 use quetzalcoatl::capacity::Capacity;
@@ -13,18 +18,22 @@ use quetzalcoatl::{mpmc, mpsc};
 
 pub use batch::ScriptBatch;
 
+use busy_clock::BusyClock;
 use crew::WorkerCrew;
 use job::ScriptJob;
+use ledger::BlockLedger;
 use verdict::{BlockVerdict, JobOutcome};
 use worker::ScriptWorker;
 
 /// Worker threads that verify input scripts in parallel.
 ///
 /// The threads live as long as the pool and block on one shared job ring.
-/// The thread that calls [`scope`](Self::scope) submits a block's checks and
-/// runs queued checks itself while it waits, so a pool of `n` workers keeps
-/// `n + 1` cores busy and a pool of zero workers verifies everything on the
-/// calling thread. Every wait is a blocking ring operation; nothing polls.
+/// Each block's checks are tracked under their own id, so checks of several
+/// blocks can be queued at once and each block's verdict collected on its
+/// own. The thread that owns the pool runs queued checks itself whenever it
+/// waits, so a pool of `n` workers keeps `n + 1` cores busy and a pool of
+/// zero workers verifies everything on the owning thread. Every wait is a
+/// blocking ring operation; nothing polls.
 ///
 /// Field order matters: `jobs` drops first, which closes the job ring and
 /// releases the workers before `crew` joins them.
@@ -32,18 +41,19 @@ pub struct ScriptPool {
     jobs: mpmc::Producer<ScriptJob<'static>>,
     helper: mpmc::Consumer<ScriptJob<'static>>,
     outcomes: mpsc::Consumer<JobOutcome>,
-    outstanding: usize,
-    verdict: BlockVerdict,
+    ledger: BlockLedger,
+    workers_busy: Arc<BusyClock>,
+    owner_busy: Duration,
     crew: WorkerCrew,
 }
 
 impl ScriptPool {
-    const JOB_CAPACITY: usize = 1024;
+    const JOB_CAPACITY: usize = 16_384;
 
     /// The outcome ring must hold every outcome that can arrive between two
-    /// drains by the coordinator: a full job ring plus one in-flight job per
+    /// drains by the owner: a full job ring plus one in-flight job per
     /// worker. Otherwise a worker blocked on a full outcome ring and the
-    /// coordinator blocked on a full job ring would wait on each other.
+    /// owner blocked on a full job ring would wait on each other.
     const fn outcome_capacity(workers: usize) -> usize {
         2 * (Self::JOB_CAPACITY + workers + 1)
     }
@@ -57,11 +67,13 @@ impl ScriptPool {
             mpmc::RingBuffer::new(Capacity::at_least(Self::JOB_CAPACITY)).split();
         let (outcome_sender, outcomes) =
             mpsc::RingBuffer::new(Capacity::at_least(Self::outcome_capacity(workers))).split();
+        let workers_busy = Arc::new(BusyClock::default());
         let mut crew = WorkerCrew::default();
         for index in 0..workers {
             let worker = ScriptWorker {
                 jobs: helper.clone(),
                 outcomes: outcome_sender.clone(),
+                busy: Arc::clone(&workers_busy),
             };
             crew.add(worker.spawn(index)?);
         }
@@ -69,13 +81,14 @@ impl ScriptPool {
             jobs,
             helper,
             outcomes,
-            outstanding: 0,
-            verdict: BlockVerdict::default(),
+            ledger: BlockLedger::default(),
+            workers_busy,
+            owner_busy: Duration::ZERO,
             crew,
         })
     }
 
-    /// One worker per available CPU, minus the one the calling thread uses.
+    /// One worker per available CPU, minus the one the owning thread uses.
     #[must_use]
     pub fn default_workers() -> usize {
         std::thread::available_parallelism().map_or(0, |n| n.get().saturating_sub(1))
@@ -84,6 +97,16 @@ impl ScriptPool {
     #[must_use]
     pub fn workers(&self) -> usize {
         self.crew.len()
+    }
+
+    /// Time spent running checks so far: by all worker threads together,
+    /// and by the owning thread while it waited.
+    #[must_use]
+    pub fn busy(&self) -> PoolBusy {
+        PoolBusy {
+            workers: self.workers_busy.total(),
+            owner: self.owner_busy,
+        }
     }
 
     /// Run `f` with a batch that verifies submitted scripts on the pool.
@@ -97,18 +120,23 @@ impl ScriptPool {
         result
     }
 
-    /// A batch whose checks keep running after it is dropped and after its
-    /// `finish` returns.
+    /// A batch whose checks keep running after [`ScriptBatch::release`],
+    /// which hands back the id to settle them under.
     ///
     /// # Safety
-    /// The caller must call [`wait_all`](Self::wait_all), or drop the pool,
-    /// before any data borrowed for `'env` is freed or mutated.
+    /// The data borrowed for `'env` must stay alive and unchanged until
+    /// [`settle_block`](Self::settle_block) returns for the released id, or
+    /// the pool is dropped.
     pub(crate) unsafe fn deferred_batch<'env>(&mut self) -> ScriptBatch<'_, 'env> {
         ScriptBatch::deferred(self)
     }
 
+    fn open_block(&mut self) -> u64 {
+        self.ledger.open()
+    }
+
     fn submit(&mut self, job: ScriptJob<'static>) {
-        self.outstanding += 1;
+        self.ledger.add_job(job.block());
         let Err(job) = self.jobs.push(job) else {
             return;
         };
@@ -118,15 +146,17 @@ impl ScriptPool {
         }
     }
 
-    fn record(&mut self, outcome: JobOutcome) {
-        self.verdict.record(outcome);
-        self.outstanding -= 1;
+    /// Record every outcome the workers have already reported.
+    pub(crate) fn collect_ready(&mut self) {
+        while let Some(outcome) = self.outcomes.pop() {
+            self.ledger.record(outcome);
+        }
     }
 
-    fn collect_ready(&mut self) {
-        while let Some(outcome) = self.outcomes.pop() {
-            self.record(outcome);
-        }
+    /// `true` once every check of `block` has finished. Does not wait.
+    pub(crate) fn is_done(&mut self, block: u64) -> bool {
+        self.collect_ready();
+        self.ledger.is_done(block)
     }
 
     /// Collect finished outcomes, then run one queued job on this thread.
@@ -135,44 +165,71 @@ impl ScriptPool {
         self.collect_ready();
         match self.helper.pop() {
             Some(job) => {
+                let started = Instant::now();
                 let outcome = job.run();
-                self.record(outcome);
+                self.owner_busy += started.elapsed();
+                self.ledger.record(outcome);
                 true
             }
             None => false,
         }
     }
 
-    /// Block until every submitted check has finished, running queued checks
-    /// on this thread meanwhile.
-    pub(crate) fn wait_all(&mut self) {
-        while self.outstanding > 0 {
-            if self.help_once() || self.outstanding == 0 {
+    fn wait_until(&mut self, mut done: impl FnMut(&BlockLedger) -> bool) {
+        while !done(&self.ledger) {
+            if self.help_once() || done(&self.ledger) {
                 continue;
             }
             let outcome = self
                 .outcomes
                 .pop_block()
                 .expect("script workers outlive the pool, so the outcome ring stays open");
-            self.record(outcome);
+            self.ledger.record(outcome);
         }
     }
 
-    /// Wait for every submitted check, then return and clear their combined
-    /// verdict. Re-raises a worker panic.
+    fn wait_block(&mut self, block: u64) {
+        self.wait_until(|ledger| ledger.is_done(block));
+    }
+
+    /// Block until every check of `block` has finished, running queued
+    /// checks on this thread meanwhile, then return and forget its verdict.
+    /// Re-raises a worker panic.
     ///
     /// # Errors
     /// Returns the failure at the lowest `(tx_index, input_index)`.
-    pub(crate) fn settle_verdict(&mut self) -> Result<(), ValidationError> {
-        self.wait_all();
-        self.verdict.take()
+    pub(crate) fn settle_block(&mut self, block: u64) -> Result<(), ValidationError> {
+        self.wait_block(block);
+        self.ledger.close(block).take()
     }
 
-    /// Wait for every submitted check and forget their verdict.
-    pub(crate) fn discard(&mut self) {
-        self.wait_all();
-        self.verdict.resume_panic();
-        self.verdict = BlockVerdict::default();
+    /// Wait for every check of `block` and forget the block, handing back
+    /// its verdict without raising anything.
+    fn discard_block(&mut self, block: u64) -> BlockVerdict {
+        self.wait_block(block);
+        self.ledger.close(block)
+    }
+
+    fn wait_all(&mut self) {
+        self.wait_until(|ledger| ledger.outstanding() == 0);
+    }
+}
+
+/// Time spent running script checks, split by who ran them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PoolBusy {
+    pub workers: Duration,
+    pub owner: Duration,
+}
+
+impl std::ops::Sub for PoolBusy {
+    type Output = Self;
+
+    fn sub(self, earlier: Self) -> Self {
+        Self {
+            workers: self.workers.saturating_sub(earlier.workers),
+            owner: self.owner.saturating_sub(earlier.owner),
+        }
     }
 }
 

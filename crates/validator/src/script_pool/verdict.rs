@@ -31,11 +31,17 @@ impl ScriptFailure {
     }
 }
 
-/// What one input check produced.
-pub(super) enum JobOutcome {
+/// What one job's checks produced.
+pub(super) enum JobResult {
     Passed,
     Failed(ScriptFailure),
     Panicked(Box<dyn Any + Send>),
+}
+
+/// A finished job, tagged with the block its inputs belong to.
+pub(super) struct JobOutcome {
+    pub(super) block: u64,
+    pub(super) result: JobResult,
 }
 
 /// The combined outcome of every input check in one block.
@@ -49,10 +55,10 @@ pub(super) struct BlockVerdict {
 }
 
 impl BlockVerdict {
-    pub(super) fn record(&mut self, outcome: JobOutcome) {
-        match outcome {
-            JobOutcome::Passed => {}
-            JobOutcome::Failed(failure) => {
+    pub(super) fn record(&mut self, result: JobResult) {
+        match result {
+            JobResult::Passed => {}
+            JobResult::Failed(failure) => {
                 if self
                     .failure
                     .as_ref()
@@ -61,7 +67,7 @@ impl BlockVerdict {
                     self.failure = Some(failure);
                 }
             }
-            JobOutcome::Panicked(payload) => {
+            JobResult::Panicked(payload) => {
                 self.panic.get_or_insert(payload);
             }
         }
@@ -85,8 +91,8 @@ impl BlockVerdict {
 mod tests {
     use super::*;
 
-    fn failure(tx_index: usize, input_index: usize) -> JobOutcome {
-        JobOutcome::Failed(ScriptFailure::new(
+    fn failure(tx_index: usize, input_index: usize) -> JobResult {
+        JobResult::Failed(ScriptFailure::new(
             InputPosition {
                 tx_index,
                 input_index,
@@ -99,7 +105,7 @@ mod tests {
     fn the_lowest_failing_input_wins_whatever_order_failures_arrive_in() {
         let mut verdict = BlockVerdict::default();
         verdict.record(failure(5, 0));
-        verdict.record(JobOutcome::Passed);
+        verdict.record(JobResult::Passed);
         verdict.record(failure(2, 3));
         verdict.record(failure(2, 7));
         assert_eq!(
@@ -123,7 +129,7 @@ mod tests {
     #[test]
     fn a_worker_panic_is_raised_again_by_take() {
         let mut verdict = BlockVerdict::default();
-        verdict.record(JobOutcome::Panicked(Box::new("interpreter bug")));
+        verdict.record(JobResult::Panicked(Box::new("interpreter bug")));
         let raised = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| verdict.take()));
         assert!(raised.is_err());
     }

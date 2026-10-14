@@ -12,8 +12,7 @@ use mantle_storage::types::{
     CommitBlockReq, CommittedResp, Durability, LookupResult, ReqToken, StorageError,
 };
 
-use super::DeferredScripts;
-use crate::pipeline::{DeferredBlock, DeferredOpts, DeferredStep, PipelineError, ReplayBufs};
+use super::{BlockJob, ConnectPipeline, Connected, InFlightLimit, OnScriptFailure, Verdict, Wait};
 use crate::prefetched_view::HeaderSnapshot;
 use crate::script_pool::ScriptPool;
 
@@ -122,14 +121,13 @@ impl<'req> StorageOps<'req> for MemoryUtxos {
 struct Replay {
     utxos: MemoryUtxos,
     headers: HeaderSnapshot,
-    bufs: ReplayBufs,
-    scripts: DeferredScripts,
+    pipeline: ConnectPipeline,
     next_tag: u32,
     next_height: u32,
 }
 
 impl Replay {
-    fn new(workers: usize) -> Self {
+    fn new(workers: usize, limit: InFlightLimit, on_failure: OnScriptFailure) -> Self {
         let mut entries = Vec::new();
         let mut prev = Hash256::ZERO;
         for i in 0..FIRST_HEIGHT + 64 {
@@ -144,14 +142,24 @@ impl Replay {
             prev = header.hash();
             entries.push((prev, header));
         }
+        let utxos = MemoryUtxos::new();
+        let pipeline = ConnectPipeline::new(
+            ScriptPool::new(workers).expect("spawn"),
+            utxos.tip(),
+            limit,
+        )
+        .on_script_failure(on_failure);
         Self {
-            utxos: MemoryUtxos::new(),
+            utxos,
             headers: HeaderSnapshot::new(BlockHeight::ZERO, entries).expect("small snapshot"),
-            bufs: ReplayBufs::new(),
-            scripts: DeferredScripts::new(ScriptPool::new(workers).expect("spawn")),
+            pipeline,
             next_tag: 0,
             next_height: FIRST_HEIGHT,
         }
+    }
+
+    fn deep() -> Self {
+        Self::new(4, InFlightLimit::default(), OnScriptFailure::Stop)
     }
 
     fn block(&mut self, spenders: &[&[u8]], extra_coinbase_value: u64) -> Block {
@@ -209,22 +217,22 @@ impl Replay {
         }
     }
 
-    fn step(&mut self, block: Block) -> DeferredStep {
+    fn connect(&mut self, block: Block) -> Connected {
         let height = BlockHeight::new(self.next_height);
         self.next_height += 1;
-        let token = ReqToken(u64::from(height.to_u32()));
-        self.bufs.validate_and_commit_deferred(
+        let job = BlockJob::new(
             block,
             height,
-            &mut self.utxos,
-            &self.headers,
-            &mut self.scripts,
-            DeferredOpts {
-                durability: Durability::Memory,
-                token,
-                utxo_hash: None,
-            },
-        )
+            Durability::Memory,
+            ReqToken(u64::from(height.to_u32())),
+        );
+        self.pipeline
+            .connect(job, &mut self.utxos, &self.headers)
+            .expect("memory storage")
+    }
+
+    fn drain(&mut self) -> Vec<super::Retired> {
+        self.pipeline.drain(&mut self.utxos).expect("memory storage")
     }
 }
 
@@ -237,33 +245,41 @@ fn borrowed(spenders: &[Vec<u8>]) -> Vec<&[u8]> {
 }
 
 #[test]
-fn each_block_s_script_verdict_arrives_with_the_next_call() {
-    let mut replay = Replay::new(4);
-    let mut previous_heights = Vec::new();
+fn blocks_reach_storage_in_height_order_after_their_scripts_pass() {
+    let mut replay = Replay::deep();
     for _ in 0..30 {
         let spenders = wide(10, 10);
         let block = replay.block(&borrowed(&spenders), 0);
-        let step = replay.step(block);
-        assert!(matches!(step.current, DeferredBlock::Committed(_)));
-        if let Some(settled) = step.previous {
-            assert_eq!(settled.verdict, Ok(()));
-            previous_heights.push(settled.height.to_u32());
-        }
+        assert!(matches!(replay.connect(block), Connected::Queued));
     }
-    let last = replay.scripts.settle().expect("the last block is still held");
-    assert_eq!(last.verdict, Ok(()));
-    previous_heights.push(last.height.to_u32());
+    let retired = replay.drain();
+    let heights: Vec<u32> = retired.iter().map(|r| r.height.to_u32()).collect();
     let expected: Vec<u32> = (FIRST_HEIGHT..FIRST_HEIGHT + 30).collect();
-    assert_eq!(previous_heights, expected);
-    assert!(replay.scripts.settle().is_none());
+    assert_eq!(heights, expected);
+    assert!(retired.iter().all(|r| r.verdict == Verdict::Valid && r.committed));
+    let committed: Vec<u32> = replay.utxos.commits.iter().map(|h| h.to_u32()).collect();
+    assert_eq!(committed, expected);
 }
 
 #[test]
-fn a_script_failure_is_reported_for_its_own_block_at_the_lowest_input() {
-    let mut replay = Replay::new(4);
+fn nothing_reaches_storage_until_it_is_retired() {
+    let mut replay = Replay::deep();
+    for _ in 0..5 {
+        let spenders = wide(4, 4);
+        let block = replay.block(&borrowed(&spenders), 0);
+        assert!(matches!(replay.connect(block), Connected::Queued));
+    }
+    assert!(replay.utxos.commits.is_empty());
+    assert_eq!(replay.pipeline.in_flight(), 5);
+    assert_eq!(replay.pipeline.tip().height.to_u32(), FIRST_HEIGHT + 4);
+}
+
+#[test]
+fn a_script_failure_stops_storage_at_the_block_before_it() {
+    let mut replay = Replay::deep();
     let fine = wide(5, 5);
     let first = replay.block(&borrowed(&fine), 0);
-    assert!(matches!(replay.step(first).current, DeferredBlock::Committed(_)));
+    assert!(matches!(replay.connect(first), Connected::Queued));
 
     let late = [OP_TRUE, OP_TRUE, OP_FALSE];
     let early = [OP_TRUE, OP_FALSE, OP_FALSE];
@@ -273,93 +289,169 @@ fn a_script_failure_is_reported_for_its_own_block_at_the_lowest_input() {
     spenders[9] = &early;
     let bad = replay.block(&spenders, 0);
     let bad_hash = bad.header.hash();
-    let step = replay.step(bad);
-    assert_eq!(step.previous.expect("first block").verdict, Ok(()));
-    assert!(matches!(step.current, DeferredBlock::Committed(_)));
+    assert!(matches!(replay.connect(bad), Connected::Queued));
 
     let after = replay.block(&borrowed(&fine), 0);
-    let step = replay.step(after);
-    let settled = step.previous.expect("the bad block settles here");
-    assert_eq!(settled.height, BlockHeight::new(FIRST_HEIGHT + 1));
-    assert_eq!(settled.hash, bad_hash);
+    assert!(matches!(replay.connect(after), Connected::Queued));
+
+    let retired = replay.drain();
+    assert_eq!(retired.len(), 3);
+    assert_eq!(retired[0].verdict, Verdict::Valid);
+    assert!(retired[0].committed);
+    assert_eq!(retired[1].hash, bad_hash);
     assert_eq!(
-        settled.verdict,
-        Err(ValidationError::ScriptVerifyFailed {
+        retired[1].verdict,
+        Verdict::ScriptFailed(ValidationError::ScriptVerifyFailed {
             tx_index: 10,
             input_index: 1,
             kind: ScriptError::EvalFalse,
         })
     );
+    assert!(!retired[1].committed);
+    assert!(!retired[2].committed, "a block on top of an invalid one is never stored");
+    assert!(replay.pipeline.is_stopped());
+    assert_eq!(replay.utxos.commits, vec![BlockHeight::new(FIRST_HEIGHT)]);
 }
 
 #[test]
-fn a_block_rejected_before_its_scripts_finish_is_not_committed_or_held() {
-    let mut replay = Replay::new(4);
+fn a_keep_going_pipeline_commits_the_failed_block_and_continues() {
+    let mut replay = Replay::new(4, InFlightLimit::default(), OnScriptFailure::CommitAnyway);
+    let bad_scripts = [OP_FALSE];
+    let bad = replay.block(&[&bad_scripts], 0);
+    assert!(matches!(replay.connect(bad), Connected::Queued));
+    let fine = wide(2, 2);
+    let next = replay.block(&borrowed(&fine), 0);
+    assert!(matches!(replay.connect(next), Connected::Queued));
+    let retired = replay.drain();
+    assert!(matches!(retired[0].verdict, Verdict::ScriptFailed(_)));
+    assert!(retired[0].committed);
+    assert_eq!(retired[1].verdict, Verdict::Valid);
+    assert_eq!(replay.utxos.commits.len(), 2);
+}
+
+#[test]
+fn a_block_rejected_by_another_rule_is_not_queued() {
+    let mut replay = Replay::deep();
     let fine = wide(5, 5);
     let first = replay.block(&borrowed(&fine), 0);
-    assert!(matches!(replay.step(first).current, DeferredBlock::Committed(_)));
+    assert!(matches!(replay.connect(first), Connected::Queued));
 
     let greedy_spenders = wide(20, 20);
     let greedy = replay.block(&borrowed(&greedy_spenders), 100 * 100_000_000);
-    let step = replay.step(greedy);
-    assert_eq!(step.previous.expect("first block").verdict, Ok(()));
-    match step.current {
-        DeferredBlock::Rejected { error, block } => {
-            assert!(
-                matches!(
-                    error,
-                    PipelineError::Validation(ValidationError::CoinbaseRewardExceedsSubsidy)
-                ),
-                "{error}"
-            );
-            assert_eq!(block.transactions.len(), 21);
+    match replay.connect(greedy) {
+        Connected::Rejected { error, job } => {
+            assert_eq!(error, ValidationError::CoinbaseRewardExceedsSubsidy);
+            assert_eq!(job.block.transactions.len(), 21);
         }
-        DeferredBlock::Committed(_) => panic!("an overpaying coinbase must be rejected"),
+        Connected::Queued => panic!("an overpaying coinbase must be rejected"),
     }
-    assert_eq!(replay.utxos.commits, vec![BlockHeight::new(FIRST_HEIGHT)]);
-    assert!(replay.scripts.settle().is_none());
+    assert_eq!(replay.pipeline.in_flight(), 1);
+    assert_eq!(replay.pipeline.tip().height.to_u32(), FIRST_HEIGHT);
 
     let next = replay.block(&borrowed(&fine), 0);
-    let step = replay.step(next);
-    assert!(step.previous.is_none());
-    assert!(matches!(step.current, DeferredBlock::Committed(_)));
+    assert!(matches!(replay.connect(next), Connected::Queued));
+    assert_eq!(replay.drain().len(), 2);
 }
 
 #[test]
-fn a_block_spending_the_previous_block_s_output_sees_it_committed() {
-    let mut replay = Replay::new(4);
+fn a_forced_block_is_stored_unvalidated_and_later_blocks_build_on_it() {
+    let mut replay = Replay::deep();
+    let fine = wide(2, 2);
+    let greedy = replay.block(&borrowed(&fine), 100 * 100_000_000);
+    let created = OutPoint {
+        txid: greedy.transactions[1].txid().expect("txid"),
+        vout: 0,
+    };
+    let Connected::Rejected { job, .. } = replay.connect(greedy) else {
+        panic!("an overpaying coinbase must be rejected");
+    };
+    replay.pipeline.force(job).expect("delta");
+
+    let mut spender = replay.block(&[], 0);
+    spender.transactions.push(Replay::tx(vec![created], &[], 500));
+    assert!(matches!(replay.connect(spender), Connected::Queued));
+    let retired = replay.drain();
+    assert_eq!(retired[0].verdict, Verdict::Forced);
+    assert!(retired[0].committed);
+    assert_eq!(retired[1].verdict, Verdict::Valid);
+}
+
+#[test]
+fn a_block_spending_a_pending_block_s_output_sees_it_before_storage_does() {
+    let mut replay = Replay::deep();
     let fine = wide(3, 3);
     let first = replay.block(&borrowed(&fine), 0);
     let created = OutPoint {
         txid: first.transactions[1].txid().expect("txid"),
         vout: 0,
     };
-    assert!(matches!(replay.step(first).current, DeferredBlock::Committed(_)));
+    assert!(matches!(replay.connect(first), Connected::Queued));
 
     let mut second = replay.block(&[], 0);
-    second
-        .transactions
-        .push(Replay::tx(vec![created], &[], 500));
-    let step = replay.step(second);
-    assert_eq!(step.previous.expect("first block").verdict, Ok(()));
-    assert!(matches!(step.current, DeferredBlock::Committed(_)));
-    assert_eq!(replay.scripts.settle().expect("second").verdict, Ok(()));
+    second.transactions.push(Replay::tx(vec![created], &[], 500));
+    assert!(matches!(replay.connect(second), Connected::Queued));
+    assert!(replay.utxos.commits.is_empty());
+
+    let mut double = replay.block(&[], 0);
+    double.transactions.push(Replay::tx(vec![created], &[], 400));
+    match replay.connect(double) {
+        Connected::Rejected { error, .. } => {
+            assert_eq!(
+                error,
+                ValidationError::MissingInput {
+                    tx_index: 1,
+                    input_index: 0
+                }
+            );
+        }
+        Connected::Queued => panic!("a coin spent by a pending block cannot be spent again"),
+    }
+    let retired = replay.drain();
+    assert!(retired.iter().all(|r| r.verdict == Verdict::Valid));
+    assert!(!replay.utxos.coins.contains_key(&created));
 }
 
 #[test]
-fn deferred_and_scoped_runs_agree_without_workers() {
-    let mut replay = Replay::new(0);
+fn a_tight_limit_retires_blocks_as_it_goes() {
+    let limit = InFlightLimit {
+        blocks: 2,
+        inputs: usize::MAX,
+    };
+    let mut replay = Replay::new(2, limit, OnScriptFailure::Stop);
+    for _ in 0..10 {
+        let spenders = wide(3, 3);
+        let block = replay.block(&borrowed(&spenders), 0);
+        assert!(matches!(replay.connect(block), Connected::Queued));
+        while replay
+            .pipeline
+            .retire_next(&mut replay.utxos, Wait::IfOverLimit)
+            .expect("memory storage")
+            .is_some()
+        {}
+        assert!(replay.pipeline.in_flight() <= 2);
+    }
+    assert!(replay.utxos.commits.len() >= 8);
+    replay.drain();
+    assert_eq!(replay.utxos.commits.len(), 10);
+}
+
+#[test]
+fn a_pool_without_workers_gives_the_same_verdicts() {
+    let mut replay = Replay::new(0, InFlightLimit::default(), OnScriptFailure::Stop);
     let spenders = wide(8, 8);
     let block = replay.block(&borrowed(&spenders), 0);
-    assert!(matches!(replay.step(block).current, DeferredBlock::Committed(_)));
-    assert_eq!(replay.scripts.settle().expect("held").verdict, Ok(()));
+    assert!(matches!(replay.connect(block), Connected::Queued));
+    let retired = replay.drain();
+    assert_eq!(retired[0].verdict, Verdict::Valid);
 }
 
 #[test]
-fn dropping_with_a_block_in_flight_waits_for_its_checks() {
-    let mut replay = Replay::new(8);
-    let spenders = wide(40, 40);
-    let block = replay.block(&borrowed(&spenders), 0);
-    assert!(matches!(replay.step(block).current, DeferredBlock::Committed(_)));
+fn dropping_with_blocks_in_flight_waits_for_their_checks() {
+    let mut replay = Replay::new(8, InFlightLimit::default(), OnScriptFailure::Stop);
+    for _ in 0..6 {
+        let spenders = wide(40, 40);
+        let block = replay.block(&borrowed(&spenders), 0);
+        assert!(matches!(replay.connect(block), Connected::Queued));
+    }
     drop(replay);
 }

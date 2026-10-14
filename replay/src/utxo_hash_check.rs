@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use mantle::primitives::{BlockHeight, Hash256};
-use mantle_utxo_hash::UtxoSetHash;
 
 /// Expected UTXO set `MuHash` values by height, as reported by
 /// `bitcoin-cli gettxoutsetinfo muhash <height>` on a node with
@@ -75,9 +74,12 @@ pub enum UtxoHashVerdict {
     Mismatch { expected: Hash256, actual: Hash256 },
 }
 
-/// The running UTXO set hash of a replay, checked against a reference.
+/// Checks the UTXO set hash of a replay against a reference.
+///
+/// The hash itself is kept by the pipeline and updated as blocks reach
+/// storage; the tracker only decides at which heights to finalize it, and
+/// compares and prints the result.
 pub struct UtxoHashTracker {
-    hash: UtxoSetHash,
     reference: UtxoHashReference,
     print_every: Option<u32>,
     mismatches: u64,
@@ -89,21 +91,11 @@ impl UtxoHashTracker {
     #[must_use]
     pub fn new(reference: UtxoHashReference, print_every: Option<u32>) -> Self {
         Self {
-            hash: UtxoSetHash::new(),
             reference,
             print_every,
             mismatches: 0,
             checked: 0,
             stopped_at: None,
-        }
-    }
-
-    /// The hash to pass to the pipeline, or `None` once tracking has stopped.
-    pub fn hash_mut(&mut self) -> Option<&mut UtxoSetHash> {
-        if self.stopped_at.is_some() {
-            None
-        } else {
-            Some(&mut self.hash)
         }
     }
 
@@ -115,19 +107,29 @@ impl UtxoHashTracker {
         }
     }
 
-    /// Call after `height` was committed with the hash updated.
-    pub fn after_block(&mut self, height: BlockHeight) -> UtxoHashVerdict {
-        if self.stopped_at.is_some() {
+    /// `true` when the hash after `height` should be finalized.
+    #[must_use]
+    pub fn wants(&self, height: BlockHeight) -> bool {
+        self.stopped_at.is_none()
+            && (self
+                .print_every
+                .is_some_and(|n| height.to_u32().is_multiple_of(n))
+                || self.reference.expected_at(height).is_some())
+    }
+
+    /// Call after `height` was committed, with the finalized hash when
+    /// [`wants`](Self::wants) asked for it.
+    pub fn after_block(&mut self, height: BlockHeight, actual: Option<Hash256>) -> UtxoHashVerdict {
+        if !self.wants(height) {
             return UtxoHashVerdict::NotChecked;
         }
+        let Some(actual) = actual else {
+            return UtxoHashVerdict::NotChecked;
+        };
         let printing = self
             .print_every
             .is_some_and(|n| height.to_u32().is_multiple_of(n));
         let expected = self.reference.expected_at(height);
-        if !printing && expected.is_none() {
-            return UtxoHashVerdict::NotChecked;
-        }
-        let actual = self.hash.finalize();
         if printing {
             eprintln!("UTXO HASH height={} muhash={actual}", height.to_u32());
         }
@@ -203,16 +205,18 @@ mod tests {
         let reference =
             UtxoHashReference::parse(&format!("1 {EMPTY_SET}\n2 {other}")).expect("parses");
         let mut tracker = UtxoHashTracker::new(reference, None);
+        let empty = Some(UtxoSetHash::new().finalize());
         assert!(matches!(
-            tracker.after_block(BlockHeight::new(1)),
+            tracker.after_block(BlockHeight::new(1), empty),
             UtxoHashVerdict::Match(_)
         ));
         assert!(matches!(
-            tracker.after_block(BlockHeight::new(2)),
+            tracker.after_block(BlockHeight::new(2), empty),
             UtxoHashVerdict::Mismatch { .. }
         ));
+        assert!(!tracker.wants(BlockHeight::new(3)));
         assert_eq!(
-            tracker.after_block(BlockHeight::new(3)),
+            tracker.after_block(BlockHeight::new(3), empty),
             UtxoHashVerdict::NotChecked
         );
         assert_eq!(tracker.mismatches(), 1);
@@ -223,9 +227,9 @@ mod tests {
         let reference = UtxoHashReference::parse(&format!("5 {EMPTY_SET}")).expect("parses");
         let mut tracker = UtxoHashTracker::new(reference, None);
         tracker.stop(BlockHeight::new(4));
-        assert!(tracker.hash_mut().is_none());
+        assert!(!tracker.wants(BlockHeight::new(5)));
         assert_eq!(
-            tracker.after_block(BlockHeight::new(5)),
+            tracker.after_block(BlockHeight::new(5), Some(UtxoSetHash::new().finalize())),
             UtxoHashVerdict::NotChecked
         );
     }

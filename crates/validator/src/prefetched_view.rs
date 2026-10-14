@@ -3,6 +3,10 @@ use mantle::primitives::{BlockHeader, BlockHeight, BlockTime, Hash256, OutPoint}
 use mantle_consensus::chain_view::{ChainView, Coin, TipInfo};
 use mantle_consensus::error::ChainViewError;
 
+/// Coins a block reads, keyed by outpoint. `None` marks an outpoint that
+/// is not in the UTXO set as of the block's parent.
+pub type CoinMap = PrehashedMap<OutPoint, Option<Coin>>;
+
 /// A snapshot of headers used to serve `get_header*` and `median_time_past`
 /// queries during block validation without hitting storage per-call.
 pub struct HeaderSnapshot {

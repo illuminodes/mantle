@@ -5,16 +5,18 @@ pub enum Stage {
     Wait,
     Decode,
     Validate,
+    Commit,
 }
 
 impl Stage {
-    const ALL: [Self; 3] = [Self::Wait, Self::Decode, Self::Validate];
+    const ALL: [Self; 4] = [Self::Wait, Self::Decode, Self::Validate, Self::Commit];
 
     const fn index(self) -> usize {
         match self {
             Self::Wait => 0,
             Self::Decode => 1,
             Self::Validate => 2,
+            Self::Commit => 3,
         }
     }
 
@@ -23,13 +25,14 @@ impl Stage {
             Self::Wait => "waited for blocks",
             Self::Decode => "decode",
             Self::Validate => "validate",
+            Self::Commit => "scripts+commit",
         }
     }
 }
 
 #[derive(Default)]
 pub struct StageClock {
-    spent: [Duration; 3],
+    spent: [Duration; 4],
 }
 
 impl StageClock {
@@ -50,7 +53,7 @@ impl StageClock {
             .map(|s| format!("{} {:.1}s", s.label(), self.spent[s.index()].as_secs_f64()))
             .collect::<Vec<_>>()
             .join(", ");
-        self.spent = [Duration::ZERO; 3];
+        self.spent = [Duration::ZERO; 4];
         line
     }
 }

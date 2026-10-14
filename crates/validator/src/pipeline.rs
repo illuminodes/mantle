@@ -1,6 +1,6 @@
 use mantle::collections::{BuildPrehashedHasher, PrehashedMap, PrehashedSet};
-use mantle::primitives::{Block, BlockHeader, BlockHeight, BlockRef, Hash256, OutPoint, TxHash};
-use mantle_consensus::chain_view::{Coin, ConnectResult, ConnectScratch};
+use mantle::primitives::{Block, BlockHeight, Hash256, OutPoint, TxHash};
+use mantle_consensus::chain_view::{Coin, ConnectScratch};
 use mantle_consensus::error::ValidationError;
 use mantle_consensus::tx_view::BlockView;
 use mantle_consensus::validation::Bip30;
@@ -8,9 +8,6 @@ use mantle_storage::ops::StorageOps;
 use mantle_storage::types::{CommitBlockReq, CommittedResp, Durability, ReqToken, StorageError};
 use mantle_utxo_hash::UtxoSetHash;
 
-use mantle_consensus::validation::connect_block;
-
-use crate::deferred_scripts::{DeferredScripts, SettledScripts};
 use crate::prefetched_view::{HeaderSnapshot, PrefetchedView};
 use crate::script_policy::{ConnectCall, ScriptPolicy};
 use crate::utxo_hash_update::UtxoHashUpdate;
@@ -23,40 +20,6 @@ pub struct PipelineOpts<'a> {
     pub token: ReqToken,
     /// Updated with the block's UTXO delta once the block is committed.
     pub utxo_hash: Option<&'a mut UtxoSetHash>,
-}
-
-/// Storage and hashing options for [`ReplayBufs::validate_and_commit_deferred`].
-pub struct DeferredOpts<'a> {
-    pub durability: Durability,
-    pub token: ReqToken,
-    pub utxo_hash: Option<&'a mut UtxoSetHash>,
-}
-
-/// What happened to the current block in
-/// [`ReplayBufs::validate_and_commit_deferred`].
-pub enum DeferredBlock {
-    /// Committed; its scripts are still running and settle with the next
-    /// call or with [`DeferredScripts::settle`].
-    Committed(CommittedResp),
-    /// Not committed. The block is handed back so the caller can save it or
-    /// force-commit it.
-    Rejected { error: PipelineError, block: Block },
-}
-
-/// The result of one [`ReplayBufs::validate_and_commit_deferred`] call.
-pub struct DeferredStep {
-    /// The script verdict of the block committed by the previous call.
-    pub previous: Option<SettledScripts>,
-    pub current: DeferredBlock,
-}
-
-/// Block-identity fields needed when committing a previously validated result.
-#[derive(Clone, Copy)]
-pub struct BlockId {
-    pub height: BlockHeight,
-    pub hash: Hash256,
-    pub prev_hash: Hash256,
-    pub header: BlockHeader,
 }
 
 /// Reusable per-block working buffers for the validation pipeline.
@@ -167,56 +130,6 @@ impl ReplayBufs {
         self.spend_ops.extend_from_slice(&self.bip30_ops);
     }
 
-    /// Collect intra-block outputs and external outpoints from a zero-copy
-    /// `BlockRef`.
-    fn collect_outpoints_ref(&mut self, block_ref: &BlockRef<'_, '_>, height: BlockHeight) {
-        for tx in block_ref.transactions().skip(1) {
-            for inp in tx.inputs() {
-                let Ok(i) = inp else { continue };
-                self.spent_set.insert(i.previous_output);
-            }
-        }
-
-        for (tx_index, tx) in block_ref.transactions().enumerate() {
-            let txid = tx
-                .txid_into(&mut self.hash_scratch)
-                .expect("txid hash never fails");
-            self.txids.push(txid);
-            for (vout, output) in tx.outputs().enumerate() {
-                let Ok(out) = output else { continue };
-                let Ok(vout_u32) = u32::try_from(vout) else {
-                    continue;
-                };
-                let op = OutPoint {
-                    txid,
-                    vout: vout_u32,
-                };
-                if self.spent_set.contains(&op) {
-                    self.intra.insert(
-                        op,
-                        Some(Coin {
-                            value: out.value,
-                            script_pubkey: out.script_pubkey.into(),
-                            height: BlockHeight::ZERO,
-                            coinbase: tx_index == 0,
-                        }),
-                    );
-                }
-            }
-        }
-
-        for tx in block_ref.transactions().skip(1) {
-            for inp in tx.inputs() {
-                let Ok(i) = inp else { continue };
-                if !self.intra.contains_key(&i.previous_output) {
-                    self.spend_ops.push(i.previous_output);
-                }
-            }
-        }
-
-        self.collect_bip30_probes(block_ref, height);
-    }
-
     /// Fetch coins from storage into `self.coins`. Outpoints created inside
     /// the block are registered as absent: `connect_block` resolves them
     /// itself, in block order. After this call the coin map is ready for
@@ -300,189 +213,6 @@ impl ReplayBufs {
         }
 
         Ok(resp)
-    }
-
-    /// Validate and commit `block` while its script checks keep running.
-    ///
-    /// Collects outpoints and fetches coins while the previous block's
-    /// checks are still running, then settles them, connects `block`,
-    /// submits its checks and commits its UTXO delta without waiting for
-    /// them. A script failure in `block` is reported by the next call, so
-    /// the block after a script-invalid block is already prepared, but never
-    /// committed, when the failure becomes known.
-    pub fn validate_and_commit_deferred<S>(
-        &mut self,
-        block: Block,
-        height: BlockHeight,
-        storage: &mut S,
-        headers: &HeaderSnapshot,
-        scripts: &mut DeferredScripts,
-        opts: DeferredOpts<'_>,
-    ) -> DeferredStep
-    where
-        S: for<'x> StorageOps<'x>,
-    {
-        self.clear();
-        self.collect_outpoints_block(&block, height);
-        let fetched = self.fetch_coins(storage);
-        let previous = scripts.settle();
-        if let Err(e) = fetched {
-            return DeferredStep {
-                previous,
-                current: DeferredBlock::Rejected {
-                    error: e.into(),
-                    block,
-                },
-            };
-        }
-
-        let hash = block.header.hash();
-        let committed =
-            self.connect_and_commit_deferred(&block, height, hash, storage, headers, scripts, opts);
-        let current = match committed {
-            Ok(resp) => {
-                scripts.hold(height, hash, block, &mut self.coins);
-                DeferredBlock::Committed(resp)
-            }
-            Err(error) => {
-                scripts.discard();
-                DeferredBlock::Rejected { error, block }
-            }
-        };
-        DeferredStep { previous, current }
-    }
-
-    /// On `Ok`, the submitted checks are still running and borrow `block`
-    /// and `self.coins`; the caller must hand both to
-    /// [`DeferredScripts::hold`]. On `Err`, the caller must call
-    /// [`DeferredScripts::discard`] before `block` is dropped.
-    #[allow(clippy::too_many_arguments)]
-    fn connect_and_commit_deferred<S>(
-        &mut self,
-        block: &Block,
-        height: BlockHeight,
-        hash: Hash256,
-        storage: &mut S,
-        headers: &HeaderSnapshot,
-        scripts: &mut DeferredScripts,
-        opts: DeferredOpts<'_>,
-    ) -> Result<CommittedResp, PipelineError>
-    where
-        S: for<'x> StorageOps<'x>,
-    {
-        let tip = storage.tip();
-        let view = PrefetchedView::new(&self.coins, headers, tip);
-        let txids = (self.txids.len() == block.transactions.len()).then_some(self.txids.as_slice());
-        // SAFETY: on success `validate_and_commit_deferred` passes `block`
-        // and `self.coins` to `hold` without touching them; on failure it
-        // calls `discard` before either is dropped or mutated.
-        let mut batch = unsafe { scripts.batch() };
-        let result = connect_block(
-            block,
-            height,
-            &view,
-            &mut self.txid_scratch,
-            &mut self.connect_scratch,
-            &mut batch,
-            txids,
-        )?;
-
-        let resp = storage.commit_block_borrowed(CommitBlockReq {
-            token: opts.token,
-            height,
-            hash,
-            prev_hash: block.header.prev_block(),
-            header: block.header,
-            created: &result.created,
-            spent: &result.spent,
-            block_bytes: None,
-            durability: opts.durability,
-        })?;
-
-        if let Some(utxo_hash) = opts.utxo_hash {
-            self.utxo_hash_update.apply(
-                utxo_hash,
-                (height, hash),
-                &result.created,
-                &result.spent,
-                &self.coins,
-            );
-        }
-        batch.release();
-        Ok(resp)
-    }
-
-    /// Prefetch coins, validate, and connect a `BlockRef` against the UTXO set.
-    ///
-    /// Returns a `ConnectResult` whose `NewCoin` entries borrow `script_pubkey`
-    /// directly from the block's wire bytes (zero copy). The caller must pass
-    /// the result to [`commit_connect_result`](Self::commit_connect_result)
-    /// while the wire buffer is still alive.
-    ///
-    /// # Errors
-    ///
-    /// Returns `PipelineError` on any validation, lookup, or I/O failure.
-    pub fn prefetch_and_connect<'blk, S>(
-        &mut self,
-        block_ref: &'blk BlockRef<'blk, 'blk>,
-        height: BlockHeight,
-        storage: &mut S,
-        headers: &HeaderSnapshot,
-        mut scripts: ScriptPolicy<'_>,
-    ) -> Result<ConnectResult<'blk>, PipelineError>
-    where
-        S: for<'x> StorageOps<'x>,
-    {
-        self.clear();
-        self.collect_outpoints_ref(block_ref, height);
-
-        self.fetch_coins(storage)?;
-        let tip = storage.tip();
-        let view = PrefetchedView::new(&self.coins, headers, tip);
-
-        let result = scripts.connect(ConnectCall {
-            block: block_ref,
-            height,
-            view: &view,
-            scratch: &mut self.txid_scratch,
-            connect_scratch: &mut self.connect_scratch,
-            txids: Some(&self.txids),
-        })?;
-
-        Ok(result)
-    }
-
-    /// Commit a previously validated block's UTXO delta to storage.
-    ///
-    /// Takes the `ConnectResult` from [`prefetch_and_connect`](Self::prefetch_and_connect)
-    /// and pushes it through the storage ring. Must be called while the wire
-    /// buffer that the `ConnectResult` borrows from is still alive.
-    ///
-    /// # Errors
-    ///
-    /// Returns `StorageError` on ring or I/O failure.
-    pub fn commit_connect_result<'blk, S>(
-        &self,
-        result: &'blk ConnectResult<'blk>,
-        block: BlockId,
-        durability: Durability,
-        token: ReqToken,
-        storage: &mut S,
-    ) -> Result<CommittedResp, StorageError>
-    where
-        S: StorageOps<'blk>,
-    {
-        storage.commit_block_borrowed(CommitBlockReq {
-            token,
-            height: block.height,
-            hash: block.hash,
-            prev_hash: block.prev_hash,
-            header: block.header,
-            created: &result.created,
-            spent: &result.spent,
-            block_bytes: None,
-            durability,
-        })
     }
 }
 
@@ -779,39 +509,6 @@ mod tests {
 
         // Should have recorded 2 txids (coinbase + spending tx).
         assert_eq!(bufs.txids.len(), 2, "expected 2 txids");
-    }
-
-    #[test]
-    fn collect_outpoints_ref_finds_external_spend() {
-        use mantle::codec::Encode;
-
-        let prev_txid = Hash256::from_bytes([0xab; 32]);
-        let block = make_block_with_spend(prev_txid);
-
-        let mut encoded = Vec::new();
-        block.encode(&mut encoded).expect("encode block");
-
-        let mut arena_buf = Vec::new();
-        let mut txs_buf = Vec::new();
-        let block_ref =
-            BlockRef::decode_with_arena(&encoded, &mut arena_buf, &mut txs_buf)
-                .expect("decode BlockRef");
-
-        let mut bufs = ReplayBufs::new();
-        bufs.collect_outpoints_ref(&block_ref, TEST_HEIGHT);
-
-        let expected_external = OutPoint {
-            txid: prev_txid,
-            vout: 0,
-        };
-        assert!(
-            bufs.spend_ops.contains(&expected_external),
-            "spend_ops should contain the external outpoint via collect_outpoints_ref"
-        );
-        assert!(
-            bufs.intra.is_empty(),
-            "intra should be empty when spending from outside the block"
-        );
     }
 
     #[test]
