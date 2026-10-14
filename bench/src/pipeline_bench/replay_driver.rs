@@ -101,9 +101,10 @@ impl ReplayDriver {
         );
         let t = &driver.times;
         println!(
-            "main thread: waiting for prepared blocks {:.2}s, connect {:.2}s, retire+commit {:.2}s",
+            "main thread: waiting for prepared blocks {:.2}s, connect {:.2}s (storage lookups {:.2}s), retire+commit {:.2}s",
             t.prepared.as_secs_f64(),
             t.connect.as_secs_f64(),
+            driver.pipeline.lookup_time().as_secs_f64(),
             t.retire.as_secs_f64()
         );
         let busy = driver.pipeline.script_busy();
@@ -155,9 +156,10 @@ impl ReplayDriver {
             };
             let at = job.height.to_u32();
             let started = Instant::now();
+            let next = self.prep.peek_ready();
             let connected = self
                 .pipeline
-                .connect(job, &mut self.storage.handle, &self.snapshot)
+                .connect(job, next, &mut self.storage.handle, &self.snapshot)
                 .map_err(|e| format!("storage at {at}: {e}"))?;
             self.times.connect += started.elapsed();
             if let Connected::Rejected { error, .. } = connected {

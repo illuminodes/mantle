@@ -2,6 +2,7 @@ mod block_job;
 mod in_flight_limit;
 mod outcome;
 mod pending_block;
+mod prefetch;
 
 #[cfg(test)]
 mod tests;
@@ -22,6 +23,7 @@ pub use in_flight_limit::InFlightLimit;
 pub use outcome::{Connected, Retired, Verdict, Wait};
 
 use pending_block::{DetachedDelta, PendingBlock, ScriptState};
+use prefetch::Prefetch;
 
 use crate::prefetched_view::{CoinMap, HeaderSnapshot, PrefetchedView};
 use crate::script_pool::{PoolBusy, ScriptPool};
@@ -60,12 +62,14 @@ pub struct ConnectPipeline {
     verify_scripts: bool,
     stopped: bool,
     tip: TipInfo,
-    lookups: Vec<OutPoint>,
-    lookup_results: Vec<LookupResult>,
+    prefetch: Option<Prefetch>,
+    #[allow(clippy::box_collection)]
+    spare_lookups: Vec<(Vec<OutPoint>, Box<Vec<LookupResult>>)>,
     scratch: Vec<u8>,
     connect_scratch: ConnectScratch,
     utxo_hash: Option<(UtxoSetHash, UtxoHashUpdate)>,
     spare_maps: Vec<CoinMap>,
+    lookup_time: std::time::Duration,
 }
 
 impl ConnectPipeline {
@@ -81,13 +85,20 @@ impl ConnectPipeline {
             verify_scripts: true,
             stopped: false,
             tip,
-            lookups: Vec::new(),
-            lookup_results: Vec::new(),
+            prefetch: None,
+            spare_lookups: Vec::new(),
             scratch: Vec::new(),
             connect_scratch: ConnectScratch::new(),
             utxo_hash: None,
             spare_maps: Vec::new(),
+            lookup_time: std::time::Duration::ZERO,
         }
+    }
+
+    /// Time spent waiting for storage lookups so far.
+    #[must_use]
+    pub fn lookup_time(&self) -> std::time::Duration {
+        self.lookup_time
     }
 
     #[must_use]
@@ -150,12 +161,17 @@ impl ConnectPipeline {
     /// Connect `job` against storage and the pending blocks, queue its
     /// script checks and record its UTXO delta.
     ///
+    /// When `next` is given, its storage lookups are sent before `job` is
+    /// connected, so storage answers them while this thread works; the
+    /// answer is used when `next` is connected.
+    ///
     /// # Errors
     /// Returns `StorageError` when a lookup fails; validation failures come
     /// back as [`Connected::Rejected`].
     pub fn connect<S>(
         &mut self,
         job: BlockJob,
+        next: Option<&BlockJob>,
         storage: &mut S,
         headers: &HeaderSnapshot,
     ) -> Result<Connected, StorageError>
@@ -164,6 +180,9 @@ impl ConnectPipeline {
     {
         let job = Box::new(job);
         let coins = self.coins_for(&job, storage)?;
+        if let Some(next) = next {
+            self.send_prefetch(next, storage)?;
+        }
         let connected = self.connect_with(&job, &coins, headers);
         let (delta, scripts) = match connected {
             Ok(connected) => connected,
@@ -283,6 +302,10 @@ impl ConnectPipeline {
         let Some(pending) = self.pending.pop_front() else {
             return Ok(None);
         };
+        self.receive_prefetch(storage)?;
+        if let Some(prefetch) = &mut self.prefetch {
+            prefetch.refresh(&self.overlay);
+        }
         self.pending_inputs -= pending.inputs;
         let verdict = match pending.scripts {
             ScriptState::Running(id) => match self.pool.settle_block(id) {
@@ -326,7 +349,56 @@ impl ConnectPipeline {
         while let Some(block) = self.retire_next(storage, Wait::Always)? {
             retired.push(block);
         }
+        self.receive_prefetch(storage)?;
+        self.drop_prefetch();
         Ok(retired)
+    }
+
+    /// Wait for an outstanding prefetch, so storage can take other requests.
+    fn receive_prefetch<S>(&mut self, storage: &mut S) -> Result<(), StorageError>
+    where
+        S: for<'x> StorageOps<'x>,
+    {
+        let Some(prefetch) = &mut self.prefetch else {
+            return Ok(());
+        };
+        if prefetch.is_awaiting_storage() {
+            let started = std::time::Instant::now();
+            storage.recv_lookup()?;
+            self.lookup_time += started.elapsed();
+            prefetch.received();
+        }
+        Ok(())
+    }
+
+    fn drop_prefetch(&mut self) {
+        if let Some(prefetch) = self.prefetch.take() {
+            let (coins, lookups, results) = prefetch.into_parts();
+            self.recycle(coins);
+            self.spare_lookups.push((lookups, results));
+        }
+    }
+
+    /// Send `next`'s storage lookups without waiting for the answer.
+    fn send_prefetch<S>(&mut self, next: &BlockJob, storage: &mut S) -> Result<(), StorageError>
+    where
+        S: for<'x> StorageOps<'x>,
+    {
+        self.receive_prefetch(storage)?;
+        self.drop_prefetch();
+        let (mut lookups, mut results) = self.spare_lookups.pop().unwrap_or_default();
+        lookups.clear();
+        results.clear();
+        lookups.extend(next.inputs.lookups().copied());
+        let coins = self.spare_map();
+        let mut prefetch = Prefetch::new(next.height, next.hash, lookups, results, coins);
+        if prefetch.has_lookups() {
+            let (ops, out) = prefetch.request();
+            storage.send_lookup(ops, out)?;
+            prefetch.mark_sent();
+        }
+        self.prefetch = Some(prefetch);
+        Ok(())
     }
 
     fn commit<S>(&mut self, pending: &PendingBlock, storage: &mut S) -> Result<(), StorageError>
@@ -358,32 +430,58 @@ impl ConnectPipeline {
     }
 
     /// The coins `job` spends or probes, from the pending blocks where they
-    /// changed and from storage otherwise. Outpoints created inside the
-    /// block are registered as absent; `connect_block` resolves them itself.
+    /// changed and from storage otherwise, taken from a prefetch when one
+    /// was sent for `job`. Outpoints created inside the block are registered
+    /// as absent; `connect_block` resolves them itself.
     fn coins_for<S>(&mut self, job: &BlockJob, storage: &mut S) -> Result<CoinMap, StorageError>
     where
         S: for<'x> StorageOps<'x>,
     {
+        self.receive_prefetch(storage)?;
+        let mut coins = match self.prefetch.take() {
+            Some(mut prefetch) if prefetch.is_for(job.height, job.hash) => {
+                prefetch.refresh(&self.overlay);
+                let (coins, lookups, results) = prefetch.into_parts();
+                self.spare_lookups.push((lookups, results));
+                coins
+            }
+            other => {
+                self.prefetch = other;
+                self.drop_prefetch();
+                self.look_up(job, storage)?
+            }
+        };
+        for op in &job.inputs.internal {
+            coins.insert(*op, None);
+        }
+        Ok(coins)
+    }
+
+    fn look_up<S>(&mut self, job: &BlockJob, storage: &mut S) -> Result<CoinMap, StorageError>
+    where
+        S: for<'x> StorageOps<'x>,
+    {
         let mut coins = self.spare_map();
-        self.lookups.clear();
+        let (mut lookups, mut results) = self.spare_lookups.pop().unwrap_or_default();
+        lookups.clear();
         for op in job.inputs.lookups() {
             match self.overlay.get(op) {
                 Some(coin) => {
                     coins.insert(*op, coin.cloned());
                 }
-                None => self.lookups.push(*op),
+                None => lookups.push(*op),
             }
         }
-        if !self.lookups.is_empty() {
-            storage.send_lookup(&self.lookups, &mut self.lookup_results)?;
+        if !lookups.is_empty() {
+            let started = std::time::Instant::now();
+            storage.send_lookup(&lookups, &mut results)?;
             storage.recv_lookup()?;
-            for found in self.lookup_results.drain(..) {
+            self.lookup_time += started.elapsed();
+            for found in results.drain(..) {
                 coins.insert(found.outpoint, found.coin);
             }
         }
-        for op in &job.inputs.internal {
-            coins.insert(*op, None);
-        }
+        self.spare_lookups.push((lookups, results));
         Ok(coins)
     }
 

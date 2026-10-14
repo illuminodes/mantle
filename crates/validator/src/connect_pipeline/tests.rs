@@ -227,7 +227,30 @@ impl Replay {
             ReqToken(u64::from(height.to_u32())),
         );
         self.pipeline
-            .connect(job, &mut self.utxos, &self.headers)
+            .connect(job, None, &mut self.utxos, &self.headers)
+            .expect("memory storage")
+    }
+
+    fn job(&mut self, block: Block) -> BlockJob {
+        let height = BlockHeight::new(self.next_height);
+        self.next_height += 1;
+        BlockJob::new(
+            block,
+            height,
+            Durability::Memory,
+            ReqToken(u64::from(height.to_u32())),
+        )
+    }
+
+    fn connect_with_next(&mut self, job: BlockJob, next: &BlockJob) -> Connected {
+        self.pipeline
+            .connect(job, Some(next), &mut self.utxos, &self.headers)
+            .expect("memory storage")
+    }
+
+    fn connect_job(&mut self, job: BlockJob) -> Connected {
+        self.pipeline
+            .connect(job, None, &mut self.utxos, &self.headers)
             .expect("memory storage")
     }
 
@@ -409,6 +432,108 @@ fn a_block_spending_a_pending_block_s_output_sees_it_before_storage_does() {
     let retired = replay.drain();
     assert!(retired.iter().all(|r| r.verdict == Verdict::Valid));
     assert!(!replay.utxos.coins.contains_key(&created));
+}
+
+#[test]
+fn a_prefetched_block_sees_coins_the_block_before_it_created_and_spent() {
+    let mut replay = Replay::deep();
+    let spent_later = replay.utxos.fund(9_000, OP_TRUE);
+    let fine = wide(2, 2);
+    let mut first = replay.block(&borrowed(&fine), 0);
+    first
+        .transactions
+        .push(Replay::tx(vec![spent_later], &[], 900));
+    let created = OutPoint {
+        txid: first.transactions[1].txid().expect("txid"),
+        vout: 0,
+    };
+    let first = replay.job(first);
+
+    let mut second = replay.block(&[], 0);
+    second.transactions.push(Replay::tx(vec![created], &[], 500));
+    let second = replay.job(second);
+
+    assert!(matches!(
+        replay.connect_with_next(first, &second),
+        Connected::Queued
+    ));
+    assert!(matches!(replay.connect_job(second), Connected::Queued));
+
+    let mut double = replay.block(&[], 0);
+    double.transactions.push(Replay::tx(vec![spent_later], &[], 400));
+    let double = replay.job(double);
+    match replay.connect_job(double) {
+        Connected::Rejected { error, .. } => assert_eq!(
+            error,
+            ValidationError::MissingInput {
+                tx_index: 1,
+                input_index: 0
+            }
+        ),
+        Connected::Queued => panic!("a coin a pending block spent cannot be spent again"),
+    }
+    let retired = replay.drain();
+    assert_eq!(retired.len(), 2);
+    assert!(retired.iter().all(|r| r.verdict == Verdict::Valid && r.committed));
+}
+
+#[test]
+fn a_prefetch_answered_before_commits_still_sees_the_committed_blocks() {
+    let limit = InFlightLimit {
+        blocks: 1,
+        inputs: usize::MAX,
+    };
+    let mut replay = Replay::new(2, limit, OnScriptFailure::Stop);
+    let fine = wide(2, 2);
+    let first = replay.block(&borrowed(&fine), 0);
+    let created = OutPoint {
+        txid: first.transactions[1].txid().expect("txid"),
+        vout: 0,
+    };
+    let first = replay.job(first);
+    let filler = replay.block(&borrowed(&fine), 0);
+    let filler = replay.job(filler);
+    let mut spender = replay.block(&[], 0);
+    spender.transactions.push(Replay::tx(vec![created], &[], 500));
+    let spender = replay.job(spender);
+
+    assert!(matches!(replay.connect_job(first), Connected::Queued));
+    assert!(matches!(
+        replay.connect_with_next(filler, &spender),
+        Connected::Queued
+    ));
+    while replay
+        .pipeline
+        .retire_next(&mut replay.utxos, Wait::IfOverLimit)
+        .expect("memory storage")
+        .is_some()
+    {}
+    assert!(!replay.utxos.commits.is_empty(), "the limit forced a commit");
+    assert!(matches!(replay.connect_job(spender), Connected::Queued));
+    let retired = replay.drain();
+    assert!(retired.iter().all(|r| r.verdict == Verdict::Valid));
+    assert!(!replay.utxos.coins.contains_key(&created));
+}
+
+#[test]
+fn a_prefetch_for_another_block_is_ignored() {
+    let mut replay = Replay::deep();
+    let fine = wide(2, 2);
+    let first = replay.block(&borrowed(&fine), 0);
+    let first = replay.job(first);
+    let unrelated = replay.block(&borrowed(&fine), 0);
+    let unrelated = replay.job(unrelated);
+    replay.next_height -= 1;
+    let mut actual = replay.block(&borrowed(&fine), 0);
+    actual.header.set_nonce(Nonce::new(u32::MAX));
+    let actual = replay.job(actual);
+    assert!(matches!(
+        replay.connect_with_next(first, &unrelated),
+        Connected::Queued
+    ));
+    assert!(matches!(replay.connect_job(actual), Connected::Queued));
+    let retired = replay.drain();
+    assert!(retired.iter().all(|r| r.verdict == Verdict::Valid && r.committed));
 }
 
 #[test]

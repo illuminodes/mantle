@@ -141,9 +141,10 @@ impl ReplayLoop {
         };
         let (height, hash) = (job.height, job.hash);
         let started = Instant::now();
+        let next = self.prep.peek_ready();
         let connected = self
             .pipeline
-            .connect(job, &mut self.storage, snapshot)
+            .connect(job, next, &mut self.storage, snapshot)
             .map_err(|e| format!("lookup at {}: {e}", height.to_u32()))?;
         self.clock.add(Stage::Validate, started);
         match connected {

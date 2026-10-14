@@ -19,6 +19,12 @@ impl<T> InOrder<T> {
         self.waiting.insert(height, item);
     }
 
+    /// The item for the next height, if it has arrived, without taking it.
+    #[must_use]
+    pub fn peek(&self) -> Option<&T> {
+        self.waiting.get(&self.next)
+    }
+
     /// The item for the next height, once it has arrived.
     pub fn pop(&mut self) -> Option<T> {
         let item = self.waiting.remove(&self.next)?;

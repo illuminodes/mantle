@@ -8,6 +8,7 @@ use quetzalcoatl::{mpmc, mpsc};
 
 use super::in_order::InOrder;
 use super::{BlockPreparer, Prepared};
+use crate::connect_pipeline::BlockJob;
 
 /// Block bytes waiting to be prepared.
 pub struct RawBlock {
@@ -114,20 +115,42 @@ impl PrepPool {
     /// # Panics
     /// Panics if every prep thread has exited, which only happens on a panic.
     pub fn take_next(&mut self) -> Option<Result<Prepared, String>> {
-        if self.queued == 0 {
+        if !self.wait_for_next() {
             return None;
         }
-        loop {
-            if let Some(ready) = self.order.pop() {
-                self.queued -= 1;
-                return Some(ready);
-            }
+        self.queued -= 1;
+        self.order.pop()
+    }
+
+    /// The block that [`take_next`](Self::take_next) will return, if it is
+    /// already prepared and ready to connect. Does not wait.
+    pub fn peek_ready(&mut self) -> Option<&BlockJob> {
+        self.collect_ready();
+        match self.order.peek() {
+            Some(Ok(Prepared::Ready(job))) => Some(job),
+            _ => None,
+        }
+    }
+
+    fn collect_ready(&mut self) {
+        while let Some(outcome) = self.outcomes.pop() {
+            self.order.push(outcome.height.to_u32(), outcome.result);
+        }
+    }
+
+    /// Block until the next height is prepared. `false` when nothing is queued.
+    fn wait_for_next(&mut self) -> bool {
+        if self.queued == 0 {
+            return false;
+        }
+        while self.order.peek().is_none() {
             let outcome = self
                 .outcomes
                 .pop_block()
                 .expect("prep threads outlive the pool");
             self.order.push(outcome.height.to_u32(), outcome.result);
         }
+        true
     }
 }
 
