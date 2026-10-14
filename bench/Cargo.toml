@@ -104,6 +104,10 @@ path = "src/replay_perf_window.rs"
 name = "replay-dhat-window"
 path = "src/replay_dhat_window.rs"
 
+[[bin]]
+name = "pipeline-bench"
+path = "src/pipeline_bench/main.rs"
+
 [dependencies]
 mantle = { path = "../crates/mantle" }
 mantle-consensus = { path = "../crates/consensus" }
