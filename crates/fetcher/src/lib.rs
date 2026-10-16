@@ -9,11 +9,13 @@
 //! serves block bytes back by height.
 
 mod ewma_latency;
+mod header_admission;
 mod hedge_policy;
 mod in_flight;
 mod peer_book;
 mod peer_liveness;
 mod peer_score;
+mod routable;
 mod tip_quorum;
 
 use std::collections::{HashMap, VecDeque};
@@ -39,7 +41,10 @@ use quetzalcoatl::spsc::RingBuffer as SpscRing;
 use ququmatz::IoUring;
 use ququmatz::types::{AddressFamily, SockAddrIn, SocketFlags, SocketType, Timespec};
 
+pub use crate::header_admission::{AdmitAll, HeaderAdmission};
+
 use crate::ewma_latency::EwmaLatency;
+use crate::header_admission::HeaderPage;
 use crate::hedge_policy::{HedgeAction, HedgePolicy};
 use crate::in_flight::InFlight;
 use crate::peer_book::PeerBook;
@@ -340,11 +345,27 @@ where
         end: BlockHeight,
         locator: Hash256,
     ) -> Result<Vec<(BlockHeight, BlockHeader)>, FetchError> {
+        self.sync_headers_admitted(start, end, locator, &mut AdmitAll)
+    }
+
+    /// [`Self::sync_headers`], with every page, cached or fetched, passed
+    /// through `admission` before it is kept. A cached run that is refused is
+    /// discarded and fetched again; a peer whose page is refused is banned.
+    ///
+    /// # Errors
+    /// As [`Self::sync_headers`].
+    pub fn sync_headers_admitted(
+        &mut self,
+        start: BlockHeight,
+        end: BlockHeight,
+        locator: Hash256,
+        admission: &mut impl HeaderAdmission,
+    ) -> Result<Vec<(BlockHeight, BlockHeader)>, FetchError> {
         if self.peer_book.is_empty() {
             return Err(FetchError::NoPeers);
         }
 
-        let mut collected = self.file_io.load_cached_headers(start)?;
+        let mut collected = self.admitted_cache(start, locator, admission)?;
         if let Some(&(cached_end, _)) = collected.last() {
             eprintln!(
                 "  headers: loaded {} cached ({}..={})",
@@ -363,7 +384,16 @@ where
         };
 
         loop {
-            let page = self.run_getheaders_session(current_locator)?;
+            let remaining = usize::try_from(
+                end.to_u32().saturating_sub(next_height).saturating_add(1),
+            )
+            .unwrap_or(usize::MAX);
+            let page = self.run_getheaders_session(
+                current_locator,
+                BlockHeight::new(next_height),
+                remaining,
+                admission,
+            )?;
             if page.is_empty() {
                 eprintln!(
                     "  headers: peers agree there are no headers past height {} — at tip",
@@ -477,8 +507,35 @@ where
 
     // ── headers session ────────────────────────────────────────────────
 
+    fn admitted_cache(
+        &mut self,
+        start: BlockHeight,
+        locator: Hash256,
+        admission: &mut impl HeaderAdmission,
+    ) -> Result<Vec<(BlockHeight, BlockHeader)>, FetchError> {
+        let cached = self.file_io.load_cached_headers(start)?;
+        if cached.is_empty() {
+            return Ok(cached);
+        }
+        let headers: Vec<BlockHeader> = cached.iter().map(|(_, header)| *header).collect();
+        match HeaderPage::new(locator, &headers).admit(start, admission) {
+            Ok(()) => Ok(cached),
+            Err(reason) => {
+                eprintln!("  headers: discarding {} cached headers: {reason}", cached.len());
+                self.file_io.write_headers(start, Vec::new())?;
+                Ok(Vec::new())
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
-    fn run_getheaders_session(&mut self, locator: Hash256) -> Result<Vec<BlockHeader>, FetchError> {
+    fn run_getheaders_session(
+        &mut self,
+        locator: Hash256,
+        first: BlockHeight,
+        limit: usize,
+        admission: &mut impl HeaderAdmission,
+    ) -> Result<Vec<BlockHeader>, FetchError> {
         self.ensure_peers()?;
         if self.peers.is_empty() {
             return Err(FetchError::PoolExhausted);
@@ -595,12 +652,22 @@ where
                         }
                     },
                 )?;
-                if let Some(headers) = peer_headers {
+                if let Some(mut headers) = peer_headers {
                     peer.app.headers_request = None;
+                    headers.truncate(limit);
                     if headers.is_empty() {
                         peer.app.headers_empty_for = Some(locator);
                     } else if got_headers.is_none() {
-                        got_headers = Some(headers);
+                        match HeaderPage::new(locator, &headers).admit(first, admission) {
+                            Ok(()) => got_headers = Some(headers),
+                            Err(reason) => {
+                                eprintln!("  headers: banning {} for its page: {reason}", peer.addr);
+                                self.peer_book.ban(peer.addr);
+                                peer.close(&mut self.ring, &mut self.send_arena);
+                                peer.state = PeerState::Dead;
+                                continue;
+                            }
+                        }
                     }
                 }
                 if peer.state == PeerState::Ready && !peer.app.discovery_requested {
