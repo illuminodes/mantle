@@ -22,7 +22,7 @@ mod peer_book;
 mod peer_liveness;
 mod peer_score;
 mod routable;
-mod tip_quorum;
+mod tip_vote;
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -62,7 +62,7 @@ use crate::in_flight::InFlight;
 use crate::peer_book::PeerBook;
 use crate::peer_liveness::PeerLiveness;
 use crate::peer_score::PeerScore;
-use crate::tip_quorum::TipQuorum;
+use crate::tip_vote::TipVote;
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -76,7 +76,7 @@ const HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 const TRIED_LIMIT: usize = 24;
 const BLOCK_NO_PROGRESS_TIMEOUT_SECS: u64 = 300;
 const HEADERS_PHASE_DEADLINE_SECS: u64 = 120;
-const HEADERS_TIP_QUORUM: usize = 8;
+const HEADERS_TIP_WINDOW_SECS: u64 = 15;
 const TARGET_LIVE_PEERS: usize = 64;
 const RECV_BUF_CAPACITY: usize = 4 * 1024 * 1024;
 
@@ -528,8 +528,11 @@ where
     }
 
     /// Ask every ready peer for the headers after `request` until one sends
-    /// a page that ends above the held tip and passes `admission`, or enough
-    /// peers say they have nothing better (`None`).
+    /// a page that outworks the held headers and passes `admission`, or the
+    /// [`TipVote`] decides the peers have nothing better (`None`). A page is
+    /// taken as soon as it arrives; the next round asks every peer again
+    /// from the new tip, so a peer on a branch with still more work answers
+    /// then.
     #[allow(clippy::too_many_lines)]
     fn run_getheaders_session(
         &mut self,
@@ -574,6 +577,7 @@ where
         let mut version_payload = Vec::new();
         encode_version("/mantle-replay-iouring:0.1.0/", &mut version_payload);
         let mut last_status = Instant::now();
+        let mut tip_vote = TipVote::new(Duration::from_secs(HEADERS_TIP_WINDOW_SECS));
 
         loop {
             self.ring.push_tick(Duration::from_secs(1))?;
@@ -712,11 +716,16 @@ where
                 .values()
                 .filter(|peer| peer.state == PeerState::Ready)
                 .count();
-            if TipQuorum::new(HEADERS_TIP_QUORUM).reached(empty_votes, ready_peers) {
+            let now = Instant::now();
+            if tip_vote.reached(empty_votes, ready_peers, now) {
+                if empty_votes < ready_peers {
+                    eprintln!(
+                        "  headers: {empty_votes} of {ready_peers} ready peers have nothing better after {HEADERS_TIP_WINDOW_SECS}s"
+                    );
+                }
                 return Ok(None);
             }
 
-            let now = Instant::now();
             if now > phase_deadline {
                 if empty_votes > 0 {
                     eprintln!(
