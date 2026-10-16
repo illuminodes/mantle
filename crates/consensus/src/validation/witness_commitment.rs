@@ -11,13 +11,13 @@ use crate::tx_view::TxView;
 /// where `witness_root` is the merkle root of every wtxid with the coinbase
 /// wtxid replaced by zero, and `reserved` is the single 32-byte item of the
 /// coinbase input's witness.
-pub(super) struct WitnessCommitment<'a> {
+pub struct WitnessCommitment<'a> {
     script: &'a [u8],
 }
 
 impl<'a> WitnessCommitment<'a> {
     /// Mainnet height at which BIP141 (segwit) became active.
-    pub(super) const SEGWIT_HEIGHT: BlockHeight = BlockHeight::new(481_824);
+    pub const SEGWIT_HEIGHT: BlockHeight = BlockHeight::new(481_824);
 
     const PREFIX: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
     const MIN_SCRIPT_LEN: usize = 38;
@@ -44,7 +44,7 @@ impl<'a> WitnessCommitment<'a> {
     ///
     /// # Errors
     /// `BadWitnessNonceSize`, `BadWitnessMerkleMatch` or `UnexpectedWitness`.
-    pub(super) fn check(block: &'a Block, height: BlockHeight) -> Result<(), ValidationError> {
+    pub fn check(block: &'a Block, height: BlockHeight) -> Result<(), ValidationError> {
         let coinbase = &block.transactions[0];
         let commitment = if height >= Self::SEGWIT_HEIGHT {
             Self::find(coinbase)

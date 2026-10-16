@@ -1,4 +1,4 @@
-use crate::primitives::{BlockHeader, BlockTime, BlockVersion, Hash256, Nonce};
+use crate::primitives::{BlockHeader, BlockHeight, BlockTime, BlockVersion, Hash256, Nonce};
 
 use super::magic::Magic;
 
@@ -130,6 +130,25 @@ impl Network {
         }
     }
 
+    /// A block every honest header chain passes through, from Bitcoin Core's
+    /// `defaultAssumeValid`. A chain that skips it, or forks below it, is not
+    /// the network's chain however valid each header looks on its own.
+    ///
+    /// # Panics
+    /// Never in practice: parses a fixed compile-time string.
+    #[must_use]
+    pub fn checkpoint(self) -> Option<(BlockHeight, Hash256)> {
+        let (height, display_hex) = match self {
+            Self::Mainnet => (
+                966_143,
+                "00000000000000000000748969ec33043c0e52a763c6dd5193861f559f2c72e3",
+            ),
+            Self::Testnet3 | Self::Testnet4 | Self::Signet | Self::Regtest => return None,
+        };
+        let hash = Hash256::from_display_hex(display_hex).expect("hardcoded checkpoint must parse");
+        Some((BlockHeight::new(height), hash))
+    }
+
     /// Default seed peers as `host:port` strings. Entries may be either
     /// literal `IP:PORT` (mainnet's hand-picked list) or DNS `HOST:PORT`
     /// (testnet4 / signet — callers do the resolution at peer-list build
@@ -200,6 +219,18 @@ mod tests {
         // check at block 1.
         let hdr = Network::Mainnet.genesis_header().expect("mainnet has one");
         assert_eq!(hdr.hash(), Network::Mainnet.genesis_hash());
+    }
+
+    #[test]
+    fn mainnet_checkpoint_is_the_hash_of_its_header() {
+        let raw = "0080f029fd68e7f483b653e990c206b5fb8d2a0a97a950fd76140100000000000000000039d8fd42e4ee02f5a12c49458d9418b6ea3a36fa21f87832aa3d840fd6bf15d685d6a06a5e35021734689e4e";
+        let bytes: Vec<u8> = (0..raw.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&raw[at..at + 2], 16).expect("hex"))
+            .collect();
+        let header = BlockHeader::from_bytes(bytes.try_into().expect("80 bytes"));
+        let (_, hash) = Network::Mainnet.checkpoint().expect("mainnet has one");
+        assert_eq!(header.hash(), hash);
     }
 
     #[test]

@@ -90,6 +90,8 @@ pub enum ValidationError {
     },
     /// The requested block's parent is not in the chain view.
     UnknownParent,
+    /// The header sits at the network checkpoint height with another hash.
+    CheckpointMismatch,
     /// A transaction's lock-time is not yet satisfied (`IsFinalTx`, BIP113).
     NonFinalTransaction { tx_index: usize },
     /// The coinbase witness is not a single 32-byte reserved value (BIP141).
