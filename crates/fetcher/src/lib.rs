@@ -8,7 +8,11 @@
 //! headers over `getheaders`, downloads any blocks missing from the cache, and
 //! serves block bytes back by height.
 
+mod block_feed;
 mod ewma_latency;
+mod feed_item;
+mod feed_request;
+mod feed_worker;
 mod header_admission;
 mod hedge_policy;
 mod in_flight;
@@ -41,6 +45,10 @@ use quetzalcoatl::spsc::RingBuffer as SpscRing;
 use ququmatz::IoUring;
 use ququmatz::types::{AddressFamily, SockAddrIn, SocketFlags, SocketType, Timespec};
 
+pub use crate::block_feed::BlockFeed;
+pub use crate::feed_item::{FedBlock, FeedItem};
+pub use crate::feed_request::{BlocksRequest, HeaderRequest};
+pub use crate::feed_worker::FeedSpec;
 pub use crate::header_admission::{AdmitAll, HeaderAdmission};
 
 use crate::ewma_latency::EwmaLatency;

@@ -9,7 +9,7 @@ use mantle_validator::{
     Retired, Verdict, Wait,
 };
 
-use crate::block_feed::{BlockFeed, FeedItem};
+use mantle_fetcher::{AdmitAll, BlockFeed, FeedItem};
 use crate::failures::{FailureLog, FailureStage};
 use crate::report::Reporter;
 use crate::stage_clock::{Stage, StageClock};
@@ -59,7 +59,7 @@ impl ReplayLoop {
         &mut self,
         header_pairs: &[(BlockHeight, BlockHeader)],
         window: usize,
-        feed: &mut BlockFeed,
+        feed: &mut BlockFeed<AdmitAll>,
         snapshot: &HeaderSnapshot,
         reporter: &mut Reporter,
     ) -> Result<BlockHeight, String> {
@@ -94,18 +94,26 @@ impl ReplayLoop {
     /// Keep the prep threads fed with downloaded blocks.
     fn fill_prep<'h>(
         &mut self,
-        feed: &mut BlockFeed,
+        feed: &mut BlockFeed<AdmitAll>,
         headers: &mut impl Iterator<Item = &'h (BlockHeight, BlockHeader)>,
     ) -> Result<(), String> {
         while self.prep.has_room() {
             let Some(&(height, _)) = headers.next() else {
                 return Ok(());
             };
-            let block = match self.clock.time(Stage::Wait, || feed.next()) {
-                Some(FeedItem::Block(block)) => block,
-                Some(FeedItem::Failed(e)) => return Err(e),
-                Some(FeedItem::Headers(_)) | None => {
-                    return Err(format!("block feed ended before height {}", height.to_u32()));
+            let block = loop {
+                match self.clock.time(Stage::Wait, || feed.next_item()) {
+                    Some(FeedItem::Block(block)) => break block,
+                    Some(FeedItem::WindowDone { first, last, elapsed }) => eprintln!(
+                        "  downloaded {}..={} in {:.1}s",
+                        first.to_u32(),
+                        last.to_u32(),
+                        elapsed.as_secs_f64()
+                    ),
+                    Some(FeedItem::Failed(e)) => return Err(e),
+                    Some(FeedItem::Headers(..) | FeedItem::Done) | None => {
+                        return Err(format!("block feed ended before height {}", height.to_u32()));
+                    }
                 }
             };
             if block.height != height {

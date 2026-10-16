@@ -14,7 +14,6 @@
 //! CLI: `mantle-replay [--data-dir DIR] [--network NAME] [--peer HOST:PORT]…
 //!                    [--skip-script] [--start-height N] [--stop-height N] [--help]`.
 
-mod block_feed;
 mod failures;
 mod replay_loop;
 mod report;
@@ -35,7 +34,7 @@ use mantle_validator::{
     PrepPool, ScriptPool,
 };
 
-use crate::block_feed::{BlockFeed, FeedItem, FeedPlan};
+use mantle_fetcher::{AdmitAll, BlockFeed, BlocksRequest, FeedItem, FeedSpec, HeaderRequest};
 use crate::failures::FailureLog;
 use crate::replay_loop::ReplayLoop;
 use crate::report::Reporter;
@@ -638,25 +637,19 @@ fn run(args: &Args) -> Result<u64, String> {
         },
     );
 
-    let mut feed = BlockFeed::spawn(FeedPlan {
+    let mut feed = BlockFeed::spawn(FeedSpec {
         network: args.network,
         peers: args.extra_peers.addrs().to_vec(),
         cache_dir: block_cache_dir.to_owned(),
+        buffered: args.verify.window,
+    })
+    .map_err(|e| format!("spawn block feed: {e}"))?;
+    let (header_pairs, _) = feed.headers(HeaderRequest {
         start: start_height,
         stop: stop_height,
         locator,
-        window: args.verify.window,
-        discard_windows: args.verify.ephemeral,
-        download_only: args.download_only,
-    })
-    .map_err(|e| format!("spawn block feed: {e}"))?;
-    let header_pairs = match feed.next() {
-        Some(FeedItem::Headers(headers)) => headers,
-        Some(FeedItem::Failed(e)) => return Err(e),
-        Some(FeedItem::Block(_)) | None => {
-            return Err("block feed ended before sending headers".to_string());
-        }
-    };
+        admission: AdmitAll,
+    })?;
 
     if header_pairs.is_empty() {
         eprintln!("  no new headers from peers — already at tip");
@@ -672,10 +665,20 @@ fn run(args: &Args) -> Result<u64, String> {
         actual_stop.to_u32(),
     );
 
+    feed.request_blocks(BlocksRequest {
+        wanted: header_pairs.clone(),
+        window: if args.download_only { header_pairs.len() } else { args.verify.window },
+        discard_each_window: args.verify.ephemeral && !args.download_only,
+        deliver: !args.download_only,
+    })?;
     if args.download_only {
         eprintln!("  downloading blocks…");
-        if let Some(FeedItem::Failed(e)) = feed.next() {
-            return Err(e);
+        loop {
+            match feed.next_item() {
+                Some(FeedItem::Done) | None => break,
+                Some(FeedItem::Failed(e)) => return Err(e),
+                Some(_) => {}
+            }
         }
         eprintln!(
             "download complete: cached blocks {}..={} (no replay performed)",
