@@ -15,7 +15,7 @@ pub fn make_ring() -> Result<IoUring, io::Error> {
     let bare = std::env::var_os("MANTLE_URING_BARE").is_some_and(|v| v == "1");
     if bare {
         eprintln!("  io_uring: bare (MANTLE_URING_BARE=1)");
-    } else if let Ok(ring) = IoUring::builder(RING_ENTRIES).single_issuer().build() {
+    } else if let Ok(ring) = ququmatz::IoUringBuilder::new(RING_ENTRIES).single_issuer().build() {
         return Ok(ring);
     }
     IoUring::new(RING_ENTRIES).map_err(|e| io::Error::other(format!("IoUring::new: {e:?}")))

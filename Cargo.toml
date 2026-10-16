@@ -57,6 +57,6 @@ sha1 = "0.11"
 ripemd = "0.2"
 k256 = { version = "0.14.0", default-features = false }
 bitcoinconsensus = "0.106.0"
-ququmatz = "0.16.2"
+ququmatz = "0.17.0"
 quetzalcoatl = "0.15.2"
 

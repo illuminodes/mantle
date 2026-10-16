@@ -72,11 +72,11 @@ impl RingBudget {
         let mut last = None;
 
         for depth in self.candidates() {
-            match ququmatz::IoUring::builder(depth).build() {
+            match ququmatz::IoUringBuilder::new(depth).build() {
                 Ok(ring) => return Ok(ring),
                 Err(e) if Self::is_out_of_memory(&e) => {
                     std::thread::sleep(Self::RECLAIM_DELAY);
-                    match ququmatz::IoUring::builder(depth).build() {
+                    match ququmatz::IoUringBuilder::new(depth).build() {
                         Ok(ring) => return Ok(ring),
                         Err(retry) => last = Some(retry),
                     }
@@ -136,7 +136,7 @@ mod tests {
         assert!(!RingBudget::is_out_of_memory(&full));
 
         let no_completion =
-            ququmatz::Error::Completion(ququmatz::CompletionError::NoCompletion);
+            ququmatz::Error::Cqe(ququmatz::CompletionError::NoCompletion);
         assert!(!RingBudget::is_out_of_memory(&no_completion));
     }
 
