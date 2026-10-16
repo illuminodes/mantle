@@ -16,6 +16,7 @@ pub struct HeaderChain {
     work: Vec<ChainWork>,
     heights: PrehashedMap<Hash256, BlockHeight>,
     checkpoint: Option<(BlockHeight, Hash256)>,
+    minimum_work: ChainWork,
     allow_min_difficulty: bool,
 }
 
@@ -26,7 +27,11 @@ impl HeaderChain {
     pub fn for_network(network: Network) -> Option<Self> {
         let genesis = network.genesis_header()?;
         let allow_min_difficulty = matches!(network, Network::Testnet3 | Network::Testnet4);
-        Some(Self::from_genesis(genesis, allow_min_difficulty).with_checkpoint(network.checkpoint()))
+        Some(
+            Self::from_genesis(genesis, allow_min_difficulty)
+                .with_checkpoint(network.checkpoint())
+                .with_minimum_work(network.minimum_chain_work()),
+        )
     }
 
     #[must_use]
@@ -38,8 +43,26 @@ impl HeaderChain {
             headers: vec![genesis],
             heights,
             checkpoint: None,
+            minimum_work: ChainWork::ZERO,
             allow_min_difficulty,
         }
+    }
+
+    #[must_use]
+    pub const fn with_minimum_work(mut self, minimum_work: ChainWork) -> Self {
+        self.minimum_work = minimum_work;
+        self
+    }
+
+    /// Whether the chain carries the network's minimum work.
+    #[must_use]
+    pub fn has_minimum_work(&self) -> bool {
+        self.tip_work() >= self.minimum_work
+    }
+
+    #[must_use]
+    pub const fn minimum_work(&self) -> ChainWork {
+        self.minimum_work
     }
 
     #[must_use]
@@ -211,7 +234,7 @@ impl ChainView for HeaderChain {
 #[cfg(test)]
 mod tests {
     use mantle::network::Network;
-    use mantle::primitives::{BlockHeader, BlockHeight, BlockTime, BlockVersion, CompactBits, Hash256, Nonce};
+    use mantle::primitives::{BlockHeader, BlockHeight, BlockTime, BlockVersion, ChainWork, CompactBits, Hash256, Nonce};
 
     use super::HeaderChain;
     use crate::chain_view::ChainView;
@@ -444,6 +467,24 @@ mod tests {
         assert_eq!(chain.tip_work().to_u128(), 4 * 0x1_0001_0001);
         chain.truncate(BlockHeight::new(1));
         assert_eq!(chain.tip_work().to_u128(), 2 * 0x1_0001_0001);
+    }
+
+    #[test]
+    fn the_minimum_work_is_met_once_the_tip_work_reaches_it() {
+        let mut chain = MainnetFixture::chain().with_minimum_work(ChainWork::new(3 * 0x1_0001_0001));
+        chain.extend(MainnetFixture::header(1), &CLOCK).expect("block 1");
+
+        assert!(!chain.has_minimum_work());
+        chain.extend(MainnetFixture::header(2), &CLOCK).expect("block 2");
+        assert!(chain.has_minimum_work());
+    }
+
+    #[test]
+    fn mainnet_starts_far_below_its_minimum_work() {
+        let chain = MainnetFixture::chain();
+
+        assert_eq!(chain.minimum_work(), Network::Mainnet.minimum_chain_work());
+        assert!(!chain.has_minimum_work());
     }
 
     #[test]

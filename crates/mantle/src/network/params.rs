@@ -1,4 +1,4 @@
-use crate::primitives::{BlockHeader, BlockHeight, BlockTime, BlockVersion, Hash256, Nonce};
+use crate::primitives::{BlockHeader, BlockHeight, BlockTime, BlockVersion, ChainWork, Hash256, Nonce};
 
 use super::magic::Magic;
 
@@ -147,6 +147,20 @@ impl Network {
         };
         let hash = Hash256::from_display_hex(display_hex).expect("hardcoded checkpoint must parse");
         Some((BlockHeight::new(height), hash))
+    }
+
+    /// The work Bitcoin Core's `nMinimumChainWork` requires of the network's
+    /// chain; a chain with less is not the network's however valid it looks.
+    /// Mainnet's value is taken at the same block as [`Self::checkpoint`].
+    #[must_use]
+    pub const fn minimum_chain_work(self) -> ChainWork {
+        ChainWork::new(match self {
+            Self::Mainnet => 0x1_45ec_036a_cc5b_a740_052a_f1a0,
+            Self::Testnet3 => 0x17f4_9f70_2147_f10c_0eb6,
+            Self::Testnet4 => 0x0e34_6a55_8455_ade8_eca9,
+            Self::Signet => 0x1090_e9dc_1520,
+            Self::Regtest => 0,
+        })
     }
 
     /// Default seed peers as `host:port` strings. Entries may be either
