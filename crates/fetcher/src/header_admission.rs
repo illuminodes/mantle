@@ -6,7 +6,8 @@ use mantle::primitives::{BlockHeader, BlockHeight, Hash256};
 /// or none: a refused page leaves the admission as it was. A page that
 /// starts at or below the previous tip comes from a peer on another branch;
 /// taking it replaces every header from `first` up. The fetcher only offers
-/// such a page when it ends above the previous tip. It bans a peer whose
+/// such a page when it carries more work than the headers it replaces. It
+/// bans a peer whose
 /// page is refused and waits for another peer's page.
 pub trait HeaderAdmission {
     /// # Errors

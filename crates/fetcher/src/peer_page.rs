@@ -5,10 +5,11 @@ use crate::header_locator::{Attachment, HeaderLocator};
 /// What a peer's `headers` reply says about the chain we hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PeerPage {
-    /// The peer has nothing past our tip, or only a branch that ends at or
-    /// below it.
+    /// The peer has nothing past our tip, or only a branch with no more
+    /// work than the headers it would replace.
     NothingBetter,
-    /// Headers that attach to the locator and end above our tip.
+    /// Headers that attach to the locator and carry more work than the
+    /// held headers above their parent.
     Better {
         attachment: Attachment,
         parent: Hash256,
@@ -26,7 +27,7 @@ impl PeerPage {
         let parent = first.prev_block();
         let attachment = request.attach(parent)?;
         headers.truncate(attachment.room(end));
-        if headers.is_empty() || !request.extends(attachment, headers.len()) {
+        if !request.outworks(attachment, &headers) {
             return Some(Self::NothingBetter);
         }
         Some(Self::Better {
@@ -76,7 +77,8 @@ mod tests {
 
     #[test]
     fn an_empty_reply_has_nothing_better() {
-        let locator = HeaderLocator::new(BlockHeight::new(1), BranchFixture::base(), &BranchFixture::held(3));
+        let held = BranchFixture::held(3);
+        let locator = HeaderLocator::new(BlockHeight::new(1), BranchFixture::base(), &held);
 
         assert_eq!(PeerPage::read(&locator, BlockHeight::new(100), Vec::new()), Some(PeerPage::NothingBetter));
     }
@@ -110,7 +112,7 @@ mod tests {
     }
 
     #[test]
-    fn a_branch_no_longer_than_ours_is_nothing_better() {
+    fn a_branch_with_no_more_work_than_ours_is_nothing_better() {
         let held = BranchFixture::held(3);
         let locator = HeaderLocator::new(BlockHeight::new(1), BranchFixture::base(), &held);
         let fork = BranchFixture::branch(held[1].1.hash(), 1, 7);
@@ -120,7 +122,8 @@ mod tests {
 
     #[test]
     fn a_reply_off_the_locator_is_ignored() {
-        let locator = HeaderLocator::new(BlockHeight::new(1), BranchFixture::base(), &BranchFixture::held(3));
+        let held = BranchFixture::held(3);
+        let locator = HeaderLocator::new(BlockHeight::new(1), BranchFixture::base(), &held);
         let stray = BranchFixture::branch(Hash256::from_bytes([9; 32]), 2, 0);
 
         assert_eq!(PeerPage::read(&locator, BlockHeight::new(100), stray), None);

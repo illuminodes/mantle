@@ -1,6 +1,6 @@
 use mantle::collections::PrehashedMap;
 use mantle::network::Network;
-use mantle::primitives::{BlockHeader, BlockHeight, BlockTime, Hash256, OutPoint};
+use mantle::primitives::{BlockHeader, BlockHeight, BlockTime, ChainWork, Hash256, OutPoint};
 
 use crate::chain_view::{ChainView, Coin, TipInfo};
 use crate::error::{ChainViewError, ValidationError};
@@ -9,9 +9,11 @@ use crate::validation::{Clock, HeaderContextExt, HeaderValidationExt};
 /// A header chain grown from genesis that admits a header only when it
 /// extends the tip, meets its proof-of-work target, carries the difficulty
 /// the retarget rules require, passes the timestamp and version rules, and
-/// agrees with the network checkpoint.
+/// agrees with the network checkpoint. A branch replaces held headers only
+/// when it carries more work than they do.
 pub struct HeaderChain {
     headers: Vec<BlockHeader>,
+    work: Vec<ChainWork>,
     heights: PrehashedMap<Hash256, BlockHeight>,
     checkpoint: Option<(BlockHeight, Hash256)>,
     allow_min_difficulty: bool,
@@ -32,6 +34,7 @@ impl HeaderChain {
         let mut heights = PrehashedMap::default();
         heights.insert(genesis.hash(), BlockHeight::ZERO);
         Self {
+            work: vec![ChainWork::of_header(&genesis)],
             headers: vec![genesis],
             heights,
             checkpoint: None,
@@ -76,8 +79,10 @@ impl HeaderChain {
     /// was.
     ///
     /// # Errors
-    /// `UnknownParent` when `first` is genesis or above the next height, or
-    /// the first rule a header breaks, with that header's index.
+    /// `UnknownParent` when `first` is genesis or above the next height,
+    /// the first rule a header breaks, with that header's index, or
+    /// `InsufficientChainWork` (index of the last header) when the branch
+    /// replaces headers without carrying more work than they do.
     pub fn replace_from(
         &mut self,
         first: BlockHeight,
@@ -89,26 +94,42 @@ impl HeaderChain {
             _ => return Err((0, ValidationError::UnknownParent)),
         };
         let keep = usize::try_from(base.to_u32()).map_or(self.headers.len(), |index| index + 1);
+        let replaced_work = ChainWork::of_headers(&self.headers[keep..]);
         let replaced = self.headers.split_off(keep);
+        self.work.truncate(keep);
         for header in &replaced {
             self.heights.remove(&header.hash());
         }
-        for (index, header) in headers.iter().enumerate() {
-            if let Err(error) = self.extend(*header, clock) {
-                self.truncate(base);
-                for header in replaced {
-                    self.push(header);
-                }
-                return Err((index, error));
+        let outcome = headers
+            .iter()
+            .enumerate()
+            .try_for_each(|(index, header)| self.extend(*header, clock).map(|_| ()).map_err(|error| (index, error)))
+            .and_then(|()| {
+                let more = replaced.is_empty() || ChainWork::of_headers(headers) > replaced_work;
+                more.then_some(())
+                    .ok_or((headers.len().saturating_sub(1), ValidationError::InsufficientChainWork))
+            });
+        if outcome.is_err() {
+            self.truncate(base);
+            for header in replaced {
+                self.push(header);
             }
         }
-        Ok(())
+        outcome
     }
 
     fn push(&mut self, header: BlockHeader) {
         let height = BlockHeight::new(u32::try_from(self.headers.len()).unwrap_or(u32::MAX));
         self.heights.insert(header.hash(), height);
+        let total = self.tip_work() + ChainWork::of_header(&header);
+        self.work.push(total);
         self.headers.push(header);
+    }
+
+    /// The work of every header from genesis to the tip.
+    #[must_use]
+    pub fn tip_work(&self) -> ChainWork {
+        self.work.last().copied().unwrap_or(ChainWork::ZERO)
     }
 
     /// Drop every header above `height`.
@@ -119,6 +140,7 @@ impl HeaderChain {
             self.heights.remove(&header.hash());
         }
         self.headers.truncate(keep.max(1));
+        self.work.truncate(keep.max(1));
     }
 
     #[must_use]
@@ -214,6 +236,27 @@ mod tests {
 
         fn chain() -> HeaderChain {
             HeaderChain::for_network(Network::Mainnet).expect("mainnet has a genesis header")
+        }
+
+        fn easy_genesis() -> BlockHeader {
+            BlockHeader::new(
+                BlockVersion::new(1), Hash256::ZERO, Hash256::ZERO,
+                BlockTime::new(1_231_006_505), CompactBits::new(0x207f_ffff), Nonce::new(0),
+            )
+        }
+
+        fn easy_branch(parent: &BlockHeader, length: u32, salt: u8) -> Vec<BlockHeader> {
+            let mut prev = *parent;
+            (1..=length)
+                .map(|step| {
+                    let header = Self::mined(BlockHeader::new(
+                        BlockVersion::new(1), prev.hash(), Hash256::from_bytes([salt; 32]),
+                        prev.time() + step, prev.bits(), Nonce::new(0),
+                    ));
+                    prev = header;
+                    header
+                })
+                .collect()
         }
 
         fn mined(mut header: BlockHeader) -> BlockHeader {
@@ -355,6 +398,52 @@ mod tests {
             Some(BlockHeight::new(2))
         );
         assert!(chain.extend(MainnetFixture::header(3), &CLOCK).is_ok());
+    }
+
+    #[test]
+    fn a_branch_with_no_more_work_than_the_headers_it_replaces_is_refused() {
+        let genesis = MainnetFixture::easy_genesis();
+        let mut chain = HeaderChain::from_genesis(genesis, false);
+        let held = MainnetFixture::easy_branch(&genesis, 2, 1);
+        for header in &held {
+            chain.extend(*header, &CLOCK).expect("held");
+        }
+        let work = chain.tip_work();
+        let rival = MainnetFixture::easy_branch(&held[0], 1, 2);
+
+        assert_eq!(
+            chain.replace_from(BlockHeight::new(2), &rival, &CLOCK),
+            Err((0, ValidationError::InsufficientChainWork))
+        );
+        assert_eq!(chain.tip().hash, held[1].hash());
+        assert_eq!(chain.tip_work(), work);
+    }
+
+    #[test]
+    fn a_branch_with_more_work_replaces_and_adds_its_work() {
+        let genesis = MainnetFixture::easy_genesis();
+        let mut chain = HeaderChain::from_genesis(genesis, false);
+        let held = MainnetFixture::easy_branch(&genesis, 2, 1);
+        for header in &held {
+            chain.extend(*header, &CLOCK).expect("held");
+        }
+        let rival = MainnetFixture::easy_branch(&held[0], 2, 2);
+
+        assert_eq!(chain.replace_from(BlockHeight::new(2), &rival, &CLOCK), Ok(()));
+        assert_eq!(chain.tip().hash, rival[1].hash());
+        assert_eq!(chain.tip_work().to_u128(), 4 * 2);
+    }
+
+    #[test]
+    fn the_tip_work_sums_every_header_from_genesis() {
+        let mut chain = MainnetFixture::chain();
+        for height in 1..=3 {
+            chain.extend(MainnetFixture::header(height), &CLOCK).expect("valid");
+        }
+
+        assert_eq!(chain.tip_work().to_u128(), 4 * 0x1_0001_0001);
+        chain.truncate(BlockHeight::new(1));
+        assert_eq!(chain.tip_work().to_u128(), 2 * 0x1_0001_0001);
     }
 
     #[test]

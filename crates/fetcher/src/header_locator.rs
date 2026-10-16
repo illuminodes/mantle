@@ -1,5 +1,5 @@
 use mantle::network::{GetHeadersMsg, ProtocolVersion};
-use mantle::primitives::{BlockHeader, BlockHeight, Hash256};
+use mantle::primitives::{BlockHeader, BlockHeight, ChainWork, Hash256};
 
 /// The block locator for a `getheaders` request, built from the chain held
 /// so far, and the place a peer's answer attaches to that chain.
@@ -9,9 +9,9 @@ use mantle::primitives::{BlockHeader, BlockHeight, Hash256};
 /// answers from the newest hash it shares with us, so a page may replace
 /// the headers above that hash instead of extending the tip.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HeaderLocator {
+pub(crate) struct HeaderLocator<'a> {
     start: BlockHeight,
-    held: usize,
+    chain: &'a [(BlockHeight, BlockHeader)],
     hashes: Vec<Hash256>,
     keeps: Vec<usize>,
 }
@@ -23,12 +23,12 @@ pub(crate) struct Attachment {
     pub(crate) first: BlockHeight,
 }
 
-impl HeaderLocator {
+impl<'a> HeaderLocator<'a> {
     pub(crate) const DENSE: usize = 10;
 
     /// `chain` holds heights `start..` in order; `base` is the hash of the
     /// header before `start`.
-    pub(crate) fn new(start: BlockHeight, base: Hash256, chain: &[(BlockHeight, BlockHeader)]) -> Self {
+    pub(crate) fn new(start: BlockHeight, base: Hash256, chain: &'a [(BlockHeight, BlockHeader)]) -> Self {
         let mut hashes = Vec::new();
         let mut keeps = Vec::new();
         let mut keep = chain.len();
@@ -45,7 +45,7 @@ impl HeaderLocator {
         keeps.push(0);
         Self {
             start,
-            held: chain.len(),
+            chain,
             hashes,
             keeps,
         }
@@ -73,10 +73,12 @@ impl HeaderLocator {
         })
     }
 
-    /// Whether `length` headers attached at `attachment` end above the
-    /// held tip; a fork that ends at or below it is not taken.
-    pub(crate) const fn extends(&self, attachment: Attachment, length: usize) -> bool {
-        attachment.keep.saturating_add(length) > self.held
+    /// Whether `page`, attached at `attachment`, carries more work than the
+    /// held headers it would replace; a branch with equal or less work is
+    /// not taken.
+    pub(crate) fn outworks(&self, attachment: Attachment, page: &[BlockHeader]) -> bool {
+        let replaced = ChainWork::of_headers(self.chain.iter().skip(attachment.keep).map(|(_, header)| header));
+        !page.is_empty() && ChainWork::of_headers(page) > replaced
     }
 
     pub(crate) fn payload(&self) -> Vec<u8> {
@@ -164,14 +166,29 @@ mod tests {
         let locator = HeaderLocator::new(BlockHeight::new(1), ChainFixture::base(), &chain);
         let attachment = locator.attach(chain[3].1.hash()).expect("on the locator");
 
+        let rival = |length: u32| -> Vec<BlockHeader> { ChainFixture::chain(length).into_iter().map(|(_, header)| header).collect() };
+
         assert_eq!(attachment, Attachment { keep: 4, first: BlockHeight::new(5) });
-        assert!(!locator.extends(attachment, 1));
-        assert!(locator.extends(attachment, 2));
+        assert!(!locator.outworks(attachment, &rival(1)));
+        assert!(locator.outworks(attachment, &rival(2)));
+    }
+
+    #[test]
+    fn a_shorter_branch_on_a_harder_target_outworks_a_longer_easy_one() {
+        let chain = ChainFixture::chain(5);
+        let locator = HeaderLocator::new(BlockHeight::new(1), ChainFixture::base(), &chain);
+        let attachment = locator.attach(chain[1].1.hash()).expect("on the locator");
+        let mut hard = chain[2].1;
+        hard.set_bits(CompactBits::new(0x2000_ffff));
+
+        assert!(locator.outworks(attachment, &[hard]));
+        assert!(!locator.outworks(attachment, &[]));
     }
 
     #[test]
     fn an_unknown_parent_does_not_attach() {
-        let locator = HeaderLocator::new(BlockHeight::new(1), ChainFixture::base(), &ChainFixture::chain(3));
+        let chain = ChainFixture::chain(3);
+        let locator = HeaderLocator::new(BlockHeight::new(1), ChainFixture::base(), &chain);
 
         assert_eq!(locator.attach(Hash256::from_bytes([9; 32])), None);
     }
