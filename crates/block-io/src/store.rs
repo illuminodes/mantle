@@ -89,8 +89,13 @@ impl FileStore {
     }
 
     pub fn truncate(&mut self) -> io::Result<()> {
-        self.file.set_len(0)?;
-        self.write_offset = 0;
+        self.truncate_to(0)
+    }
+
+    pub fn truncate_to(&mut self, length: u64) -> io::Result<()> {
+        let length = length.min(self.write_offset);
+        self.file.set_len(length)?;
+        self.write_offset = length;
         Ok(())
     }
 }
@@ -171,6 +176,17 @@ impl BlockStore {
         save_blocks_index(&data_dir.join("blocks.idx"), &self.index)
     }
 
+    /// Forget every cached block at `height` and above; their bytes stay in
+    /// the data file until the next discard.
+    pub fn forget_from(&mut self, height: BlockHeight, data_dir: &Path) -> io::Result<()> {
+        let from = usize::try_from(height.to_u32()).unwrap_or(usize::MAX);
+        if from >= self.index.len() {
+            return Ok(());
+        }
+        self.index.truncate(from);
+        self.flush_index(data_dir)
+    }
+
     pub fn discard_all(&mut self, data_dir: &Path) -> io::Result<()> {
         self.store.truncate()?;
         self.index.clear();
@@ -248,6 +264,13 @@ impl HeaderStore {
 
     pub fn append_raw(&mut self, ring: &mut IoUring, data: &[u8]) -> io::Result<()> {
         self.store.append(ring, data)?;
+        self.store.file.sync_data()
+    }
+
+    /// Keep only the first `keep` headers.
+    pub fn truncate(&mut self, keep: usize) -> io::Result<()> {
+        let length = u64::try_from(keep.saturating_mul(HEADER_RECORD_SIZE)).unwrap_or(u64::MAX);
+        self.store.truncate_to(length)?;
         self.store.file.sync_data()
     }
 }

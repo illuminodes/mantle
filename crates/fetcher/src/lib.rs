@@ -14,6 +14,8 @@ mod feed_item;
 mod feed_request;
 mod feed_worker;
 mod header_admission;
+mod header_locator;
+mod peer_page;
 mod hedge_policy;
 mod in_flight;
 mod peer_book;
@@ -30,7 +32,7 @@ use std::time::{Duration, Instant};
 use mantle::codec::{Decode, Encode};
 use mantle::collections::{BuildPrehashedHasher, PrehashedMap};
 use mantle::network::{
-    Command, GetHeadersMsg, HeadersMsg, InvEntry, InvMsg, InvType, MessageHeader, Network,
+    Command, HeadersMsg, InvEntry, InvMsg, InvType, MessageHeader, Network,
 };
 use mantle::primitives::{BlockHeader, BlockHeight, Hash256};
 use std::ops::Deref;
@@ -53,6 +55,8 @@ pub use crate::header_admission::{AdmitAll, HeaderAdmission};
 
 use crate::ewma_latency::EwmaLatency;
 use crate::header_admission::HeaderPage;
+use crate::header_locator::{Attachment, HeaderLocator};
+use crate::peer_page::PeerPage;
 use crate::hedge_policy::{HedgeAction, HedgePolicy};
 use crate::in_flight::InFlight;
 use crate::peer_book::PeerBook;
@@ -386,77 +390,63 @@ where
             }
         }
 
-        let (mut next_height, mut current_locator) = match collected.last() {
-            None => (start.to_u32(), locator),
-            Some((h, hdr)) => (h.to_u32().saturating_add(1), hdr.hash()),
-        };
-
         loop {
-            let remaining = usize::try_from(
-                end.to_u32().saturating_sub(next_height).saturating_add(1),
-            )
-            .unwrap_or(usize::MAX);
-            let page = self.run_getheaders_session(
-                current_locator,
-                BlockHeight::new(next_height),
-                remaining,
-                admission,
-            )?;
-            if page.is_empty() {
+            let request = HeaderLocator::new(start, locator, &collected);
+            let Some((attachment, page)) = self.run_getheaders_session(&request, end, admission)? else {
                 eprintln!(
-                    "  headers: peers agree there are no headers past height {} — at tip",
-                    next_height.saturating_sub(1)
+                    "  headers: peers agree there are no better headers past height {} — at tip",
+                    collected.last().map_or(start.to_u32().saturating_sub(1), |(h, _)| h.to_u32())
                 );
                 break;
-            }
-            let page_len = page.len();
-            let mut page_bytes = Vec::with_capacity(page_len * 80);
-            let mut expected_prev = current_locator;
-            for (page_index, hdr) in page.into_iter().enumerate() {
-                if hdr.prev_block() != expected_prev {
-                    return Err(FetchError::UringErr(format!(
-                        "header continuity failure at requested height {} (page index {}): expected prev {}, got {}",
-                        next_height,
-                        page_index,
-                        expected_prev,
-                        hdr.prev_block(),
-                    )));
-                }
-                expected_prev = hdr.hash();
-                let h = BlockHeight::new(next_height);
-                if h > end {
-                    break;
-                }
-                page_bytes.extend_from_slice(&hdr.to_bytes());
-                collected.push((h, hdr));
-                next_height = next_height.wrapping_add(1);
-            }
-            if page_len == 0 {
-                return Err(FetchError::UringErr(
-                    "peer returned an empty header page unexpectedly".to_string(),
-                ));
-            }
-            if !page_bytes.is_empty() {
-                if collected.len() == page_bytes.len() / 80 {
-                    self.file_io.write_headers(start, page_bytes)?;
-                } else {
-                    self.file_io.append_headers(page_bytes)?;
-                }
-            }
+            };
+            self.store_page(start, &mut collected, attachment, &page)?;
             eprintln!(
-                "  headers: got {page_len} in page, {} durable total (height {}..={})",
+                "  headers: got {} in page, {} durable total (height {}..={})",
+                page.len(),
                 collected.len(),
                 start.to_u32(),
-                next_height.saturating_sub(1),
+                collected.last().map_or(0, |(h, _)| h.to_u32()),
             );
             if collected.last().is_some_and(|(h, _)| *h >= end) {
                 break;
             }
-            let Some(last) = collected.last() else { break };
-            current_locator = last.1.hash();
         }
 
         Ok(collected)
+    }
+
+    /// Put an admitted page into `collected` and the header file, dropping
+    /// the headers it replaces and the cached blocks above its parent.
+    fn store_page(
+        &mut self,
+        start: BlockHeight,
+        collected: &mut Vec<(BlockHeight, BlockHeader)>,
+        attachment: Attachment,
+        page: &[BlockHeader],
+    ) -> Result<(), FetchError> {
+        if attachment.keep < collected.len() {
+            eprintln!(
+                "  headers: reorg replaces {} headers from height {}",
+                collected.len() - attachment.keep,
+                attachment.first.to_u32(),
+            );
+            collected.truncate(attachment.keep);
+            self.file_io.forget_blocks_from(attachment.first)?;
+            if attachment.keep > 0 {
+                self.file_io.truncate_headers(attachment.keep)?;
+            }
+        }
+        let mut bytes = Vec::with_capacity(page.len() * 80);
+        for (offset, header) in (0_u32..).zip(page) {
+            bytes.extend_from_slice(&header.to_bytes());
+            collected.push((BlockHeight::new(attachment.first.to_u32() + offset), *header));
+        }
+        if attachment.keep == 0 {
+            self.file_io.write_headers(start, bytes)?;
+        } else {
+            self.file_io.append_headers(bytes)?;
+        }
+        Ok(())
     }
 
     /// Download every block in `headers` that is not already cached, then
@@ -531,19 +521,23 @@ where
             Err(reason) => {
                 eprintln!("  headers: discarding {} cached headers: {reason}", cached.len());
                 self.file_io.write_headers(start, Vec::new())?;
+                self.file_io.forget_blocks_from(start)?;
                 Ok(Vec::new())
             }
         }
     }
 
+    /// Ask every ready peer for the headers after `request` until one sends
+    /// a page that ends above the held tip and passes `admission`, or enough
+    /// peers say they have nothing better (`None`).
     #[allow(clippy::too_many_lines)]
     fn run_getheaders_session(
         &mut self,
-        locator: Hash256,
-        first: BlockHeight,
-        limit: usize,
+        request: &HeaderLocator,
+        end: BlockHeight,
         admission: &mut impl HeaderAdmission,
-    ) -> Result<Vec<BlockHeader>, FetchError> {
+    ) -> Result<Option<(Attachment, Vec<BlockHeader>)>, FetchError> {
+        let locator = request.tip();
         self.ensure_peers()?;
         if self.peers.is_empty() {
             return Err(FetchError::PoolExhausted);
@@ -552,6 +546,7 @@ where
             if peer.app.headers_request.is_some_and(|(l, _)| l != locator) {
                 peer.app.headers_request = None;
             }
+            peer.app.headers_empty_for = None;
         }
         eprintln!(
             "  headers: requesting next page with {} active peers and {} candidates",
@@ -575,7 +570,7 @@ where
         }
 
         let phase_deadline = Instant::now() + Duration::from_secs(HEADERS_PHASE_DEADLINE_SECS);
-        let payload = getheaders_payload(locator);
+        let payload = request.payload();
         let mut version_payload = Vec::new();
         encode_version("/mantle-replay-iouring:0.1.0/", &mut version_payload);
         let mut last_status = Instant::now();
@@ -631,7 +626,7 @@ where
             }
 
             // Parse frames: handshake + headers
-            let mut got_headers: Option<Vec<BlockHeader>> = None;
+            let mut got_headers: Option<(Attachment, Vec<BlockHeader>)> = None;
             let mut discovered = Vec::new();
             for (slot, peer) in self.peers.iter_mut() {
                 if peer.state == PeerState::Dead {
@@ -653,21 +648,20 @@ where
                                 &mut headers,
                             )
                             .is_ok()
-                                && headers.first().is_none_or(|h| h.prev_block() == locator)
                             {
-                                peer_headers = Some(headers);
+                                peer_headers = PeerPage::read(request, end, headers);
                             }
                         }
                     },
                 )?;
-                if let Some(mut headers) = peer_headers {
+                if let Some(page) = peer_headers {
                     peer.app.headers_request = None;
-                    headers.truncate(limit);
-                    if headers.is_empty() {
-                        peer.app.headers_empty_for = Some(locator);
-                    } else if got_headers.is_none() {
-                        match HeaderPage::new(locator, &headers).admit(first, admission) {
-                            Ok(()) => got_headers = Some(headers),
+                    if let PeerPage::Better { attachment, parent, headers } = page {
+                        if got_headers.is_some() {
+                            continue;
+                        }
+                        match HeaderPage::new(parent, &headers).admit(attachment.first, admission) {
+                            Ok(()) => got_headers = Some((attachment, headers)),
                             Err(reason) => {
                                 eprintln!("  headers: banning {} for its page: {reason}", peer.addr);
                                 self.peer_book.ban(peer.addr);
@@ -676,6 +670,8 @@ where
                                 continue;
                             }
                         }
+                    } else {
+                        peer.app.headers_empty_for = Some(locator);
                     }
                 }
                 if peer.state == PeerState::Ready && !peer.app.discovery_requested {
@@ -702,8 +698,8 @@ where
                 self.ensure_peers()?;
             }
 
-            if let Some(headers) = got_headers {
-                return Ok(headers);
+            if got_headers.is_some() {
+                return Ok(got_headers);
             }
 
             let empty_votes = self
@@ -717,7 +713,7 @@ where
                 .filter(|peer| peer.state == PeerState::Ready)
                 .count();
             if TipQuorum::new(HEADERS_TIP_QUORUM).reached(empty_votes, ready_peers) {
-                return Ok(Vec::new());
+                return Ok(None);
             }
 
             let now = Instant::now();
@@ -726,7 +722,7 @@ where
                     eprintln!(
                         "  headers: deadline passed with {empty_votes} empty replies and no headers; treating as tip"
                     );
-                    return Ok(Vec::new());
+                    return Ok(None);
                 }
                 return Err(FetchError::Timeout("headers"));
             }
@@ -1435,13 +1431,3 @@ fn encode_getdata(hashes: &[Hash256]) -> Vec<u8> {
     buf
 }
 
-fn getheaders_payload(locator: Hash256) -> Vec<u8> {
-    let msg = GetHeadersMsg {
-        version: mantle::network::ProtocolVersion::new(70016),
-        locator_hashes: vec![locator],
-        stop_hash: Hash256::ZERO,
-    };
-    let mut buf = Vec::new();
-    msg.encode(&mut buf).expect("Vec<u8> Write is infallible");
-    buf
-}

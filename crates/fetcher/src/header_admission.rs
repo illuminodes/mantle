@@ -3,8 +3,11 @@ use mantle::primitives::{BlockHeader, BlockHeight, Hash256};
 /// Decides whether a run of headers may join the chain being synchronized.
 ///
 /// `admit` sees `headers` as heights `first..`, and either takes all of them
-/// or none: a refused page leaves the admission as it was. The fetcher bans a
-/// peer whose page is refused and waits for another peer's page.
+/// or none: a refused page leaves the admission as it was. A page that
+/// starts at or below the previous tip comes from a peer on another branch;
+/// taking it replaces every header from `first` up. The fetcher only offers
+/// such a page when it ends above the previous tip. It bans a peer whose
+/// page is refused and waits for another peer's page.
 pub trait HeaderAdmission {
     /// # Errors
     /// The reason the page is refused.
@@ -21,25 +24,25 @@ impl HeaderAdmission for AdmitAll {
     }
 }
 
-/// A page of headers a peer sent in answer to `getheaders(locator)`.
+/// A page of headers whose first header builds on `parent`.
 pub(crate) struct HeaderPage<'a> {
-    locator: Hash256,
+    parent: Hash256,
     headers: &'a [BlockHeader],
 }
 
 impl<'a> HeaderPage<'a> {
-    pub(crate) const fn new(locator: Hash256, headers: &'a [BlockHeader]) -> Self {
-        Self { locator, headers }
+    pub(crate) const fn new(parent: Hash256, headers: &'a [BlockHeader]) -> Self {
+        Self { parent, headers }
     }
 
     /// Check that each header links to the one before it, starting at the
-    /// locator, then hand the page to `admission`.
+    /// parent, then hand the page to `admission`.
     pub(crate) fn admit(
         &self,
         first: BlockHeight,
         admission: &mut impl HeaderAdmission,
     ) -> Result<(), String> {
-        let mut expected = self.locator;
+        let mut expected = self.parent;
         for (index, header) in self.headers.iter().enumerate() {
             if header.prev_block() != expected {
                 return Err(format!("header {index} of the page does not link to the one before it"));

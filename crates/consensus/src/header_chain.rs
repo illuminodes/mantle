@@ -67,9 +67,48 @@ impl HeaderChain {
         {
             return Err(ValidationError::CheckpointMismatch);
         }
-        self.heights.insert(hash, context.height);
-        self.headers.push(header);
+        self.push(header);
         Ok(context.height)
+    }
+
+    /// Put `headers` at heights `first..`, replacing every header held from
+    /// `first` up. Either all of them are taken or the chain is left as it
+    /// was.
+    ///
+    /// # Errors
+    /// `UnknownParent` when `first` is genesis or above the next height, or
+    /// the first rule a header breaks, with that header's index.
+    pub fn replace_from(
+        &mut self,
+        first: BlockHeight,
+        headers: &[BlockHeader],
+        clock: &impl Clock,
+    ) -> Result<(), (usize, ValidationError)> {
+        let base = match first.to_u32().checked_sub(1) {
+            Some(base) if base <= self.tip_height().to_u32() => BlockHeight::new(base),
+            _ => return Err((0, ValidationError::UnknownParent)),
+        };
+        let keep = usize::try_from(base.to_u32()).map_or(self.headers.len(), |index| index + 1);
+        let replaced = self.headers.split_off(keep);
+        for header in &replaced {
+            self.heights.remove(&header.hash());
+        }
+        for (index, header) in headers.iter().enumerate() {
+            if let Err(error) = self.extend(*header, clock) {
+                self.truncate(base);
+                for header in replaced {
+                    self.push(header);
+                }
+                return Err((index, error));
+            }
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, header: BlockHeader) {
+        let height = BlockHeight::new(u32::try_from(self.headers.len()).unwrap_or(u32::MAX));
+        self.heights.insert(header.hash(), height);
+        self.headers.push(header);
     }
 
     /// Drop every header above `height`.
@@ -276,6 +315,59 @@ mod tests {
         assert_eq!(
             disagreeing.extend(MainnetFixture::header(2), &CLOCK),
             Err(ValidationError::CheckpointMismatch)
+        );
+    }
+
+    #[test]
+    fn a_valid_branch_replaces_the_headers_above_its_parent() {
+        let mut chain = MainnetFixture::chain();
+        chain.extend(MainnetFixture::header(1), &CLOCK).expect("block 1");
+        let mut stale = MainnetFixture::header(1);
+        stale.set_prev_block(MainnetFixture::header(1).hash());
+        chain.push(stale);
+
+        let replaced = chain.replace_from(
+            BlockHeight::new(2),
+            &[MainnetFixture::header(2), MainnetFixture::header(3)],
+            &CLOCK,
+        );
+
+        assert_eq!(replaced, Ok(()));
+        assert_eq!(chain.tip().hash, MainnetFixture::header(3).hash());
+        assert!(chain.height_of(&stale.hash()).expect("view").is_none());
+    }
+
+    #[test]
+    fn an_invalid_branch_leaves_the_chain_as_it_was() {
+        let mut chain = MainnetFixture::chain();
+        for height in 1..=2 {
+            chain.extend(MainnetFixture::header(height), &CLOCK).expect("valid");
+        }
+        let mut forged = MainnetFixture::header(2);
+        forged.set_nonce(Nonce::new(forged.nonce().to_u32().wrapping_add(1)));
+
+        let replaced = chain.replace_from(BlockHeight::new(2), &[forged], &CLOCK);
+
+        assert_eq!(replaced, Err((0, ValidationError::InsufficientProofOfWork)));
+        assert_eq!(chain.tip().hash, MainnetFixture::header(2).hash());
+        assert_eq!(
+            chain.height_of(&MainnetFixture::header(2).hash()).expect("view"),
+            Some(BlockHeight::new(2))
+        );
+        assert!(chain.extend(MainnetFixture::header(3), &CLOCK).is_ok());
+    }
+
+    #[test]
+    fn a_branch_must_attach_to_a_held_header_above_genesis() {
+        let mut chain = MainnetFixture::chain();
+
+        assert_eq!(
+            chain.replace_from(BlockHeight::ZERO, &[], &CLOCK),
+            Err((0, ValidationError::UnknownParent))
+        );
+        assert_eq!(
+            chain.replace_from(BlockHeight::new(2), &[MainnetFixture::header(2)], &CLOCK),
+            Err((0, ValidationError::UnknownParent))
         );
     }
 

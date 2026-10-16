@@ -42,6 +42,12 @@ pub enum FileReq {
     AppendHeaders {
         data: Vec<u8>,
     },
+    TruncateHeaders {
+        keep: usize,
+    },
+    ForgetBlocksFrom {
+        height: BlockHeight,
+    },
     LoadCachedHeaders {
         start: BlockHeight,
     },
@@ -166,6 +172,27 @@ where
 
     pub fn append_headers(&mut self, data: Vec<u8>) -> io::Result<()> {
         self.send(FileReq::AppendHeaders { data })?;
+        match self.rx.pop_block() {
+            Some(FileResp::Ok) => Ok(()),
+            Some(FileResp::Err(e)) => Err(e),
+            _ => Err(io::Error::other("file-io unexpected response")),
+        }
+    }
+
+    /// Keep only the first `keep` cached headers.
+    pub fn truncate_headers(&mut self, keep: usize) -> io::Result<()> {
+        self.send(FileReq::TruncateHeaders { keep })?;
+        match self.rx.pop_block() {
+            Some(FileResp::Ok) => Ok(()),
+            Some(FileResp::Err(e)) => Err(e),
+            _ => Err(io::Error::other("file-io unexpected response")),
+        }
+    }
+
+    /// Forget every cached block at `height` and above, so they are fetched
+    /// again; used when the headers above `height` were replaced.
+    pub fn forget_blocks_from(&mut self, height: BlockHeight) -> io::Result<()> {
+        self.send(FileReq::ForgetBlocksFrom { height })?;
         match self.rx.pop_block() {
             Some(FileResp::Ok) => Ok(()),
             Some(FileResp::Err(e)) => Err(e),
@@ -335,6 +362,8 @@ where
                 FileReq::HasBlock { height } => self.handle_has_block(height),
                 FileReq::WriteHeaders { start, data } => self.handle_write_headers(start, &data),
                 FileReq::AppendHeaders { data } => self.handle_append_headers(&data),
+                FileReq::TruncateHeaders { keep } => self.handle_truncate_headers(keep),
+                FileReq::ForgetBlocksFrom { height } => self.handle_forget_blocks_from(height),
                 FileReq::LoadCachedHeaders { start } => self.handle_load_cached_headers(start),
                 FileReq::FlushBlockIndex => self.handle_flush_block_index(),
                 FileReq::DiscardBlocks => self.handle_discard_blocks(&mut writes_since_flush),
@@ -496,6 +525,20 @@ where
 
     fn handle_append_headers(&mut self, data: &[u8]) -> FileResp {
         match self.headers.append_raw(&mut self.ring, data) {
+            Ok(()) => FileResp::Ok,
+            Err(error) => FileResp::Err(error),
+        }
+    }
+
+    fn handle_truncate_headers(&mut self, keep: usize) -> FileResp {
+        match self.headers.truncate(keep) {
+            Ok(()) => FileResp::Ok,
+            Err(error) => FileResp::Err(error),
+        }
+    }
+
+    fn handle_forget_blocks_from(&mut self, height: BlockHeight) -> FileResp {
+        match self.blocks.forget_from(height, &self.data_dir) {
             Ok(()) => FileResp::Ok,
             Err(error) => FileResp::Err(error),
         }
@@ -743,6 +786,50 @@ mod tests {
             assert_eq!(headers.len(), 1);
             assert_eq!(headers[0].0, BlockHeight::new(5));
             assert_eq!(headers[0].1, hdr);
+        });
+        assert!(result.is_ok());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn truncated_headers_are_gone_and_appends_continue_after_the_kept_ones() {
+        let dir = test_data_dir();
+        let first = sample_block().header;
+        let mut second = first;
+        second.set_prev_block(first.hash());
+        let mut replacement = first;
+        replacement.set_nonce(Nonce::new(77));
+
+        let result = with_file_io(&dir, |handle, _slab_reader| {
+            let mut bytes = first.to_bytes().to_vec();
+            bytes.extend_from_slice(&second.to_bytes());
+            handle.write_headers(BlockHeight::new(1), bytes).expect("write_headers");
+            handle.truncate_headers(1).expect("truncate");
+            handle
+                .append_headers(replacement.to_bytes().to_vec())
+                .expect("append");
+            let headers = handle.load_cached_headers(BlockHeight::new(1)).expect("load");
+            assert_eq!(headers, vec![(BlockHeight::new(1), first), (BlockHeight::new(2), replacement)]);
+        });
+        assert!(result.is_ok());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn forgotten_blocks_are_missing_and_those_below_stay() {
+        let dir = test_data_dir();
+        let mut encoded = Vec::new();
+        sample_block().encode(&mut encoded).expect("encode block");
+
+        let result = with_file_io(&dir, |handle, _slab_reader| {
+            for height in 1..=3 {
+                handle.write_block(BlockHeight::new(height), encoded.clone()).expect("write");
+            }
+            handle.forget_blocks_from(BlockHeight::new(2)).expect("forget");
+            assert!(handle.has_block(BlockHeight::new(1)));
+            assert!(!handle.has_block(BlockHeight::new(2)));
+            assert!(!handle.has_block(BlockHeight::new(3)));
+            handle.forget_blocks_from(BlockHeight::new(50)).expect("nothing to forget");
         });
         assert!(result.is_ok());
         cleanup(&dir);
