@@ -229,13 +229,11 @@ impl FileIoHandle {
         let (req_tx, req_rx) = req_ring.split();
         let (resp_tx, resp_rx) = resp_ring.split();
 
-        // Leak a Slab for the 'static detached-thread path.
-        let slab: &'static Slab = Box::leak(Box::new(Slab::new()));
-        let (slab_writer, _slab_reader) = slab.split();
-
         std::thread::Builder::new()
             .name("file-io".into())
             .spawn(move || {
+                let slab = Slab::new();
+                let (slab_writer, _slab_reader) = slab.split();
                 FileIoWorker {
                     req_rx,
                     resp_tx,
