@@ -1,7 +1,7 @@
 use std::io;
 
 use crate::codec::{DecodeRef, Error, VarInt};
-use crate::tx::TransactionRef;
+use crate::tx::{Transaction, TransactionRef};
 
 use super::header::BlockHeader;
 
@@ -90,7 +90,7 @@ where
             .map_err(|e| Error::Io(io::Error::new(io::ErrorKind::InvalidData, e.to_string())))?;
 
         self.arena.reserve(rest.len());
-        self.txs.reserve(tx_count.saturating_sub(self.txs.capacity()));
+        self.txs.reserve(tx_count.min(rest.len() / Transaction::MIN_SERIALIZED_SIZE));
 
         for i in 0..tx_count {
             let (tx, after) = TransactionRef::decode_ref(rest)?;
@@ -158,7 +158,7 @@ where
         arena_buf.reserve(rest.len());
 
         let txs = txs_buf;
-        txs.reserve(tx_count.saturating_sub(txs.capacity()));
+        txs.reserve(tx_count.min(rest.len() / Transaction::MIN_SERIALIZED_SIZE));
 
         for i in 0..tx_count {
             let (tx, after) = TransactionRef::decode_ref(rest)?;

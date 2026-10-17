@@ -149,8 +149,19 @@ impl Encode for Transaction {
 }
 
 impl Transaction {
+    /// Largest serialization any transaction can have: a whole block.
+    pub const MAX_SERIALIZED_SIZE: usize = 4_000_000;
+    /// Outpoint (36) + empty script length (1) + sequence (4).
+    pub const MIN_INPUT_SIZE: usize = 41;
+    /// Value (8) + empty script length (1).
+    pub const MIN_OUTPUT_SIZE: usize = 9;
+    /// Version (4) + input count (1) + output count (1) + locktime (4).
+    pub const MIN_SERIALIZED_SIZE: usize = 10;
+    pub const MAX_INPUTS: usize = Self::MAX_SERIALIZED_SIZE / Self::MIN_INPUT_SIZE;
+    pub const MAX_OUTPUTS: usize = Self::MAX_SERIALIZED_SIZE / Self::MIN_OUTPUT_SIZE;
+    const PREALLOCATE_CAP: usize = 1024;
+
     /// Decode with caller-specified per-list caps.
-    /// `MAX_INPUTS` and `MAX_OUTPUTS` default to Bitcoin's practical consensus limit.
     ///
     /// # Errors
     /// Returns `InvalidData` if either list count exceeds its cap, or on any I/O error.
@@ -184,7 +195,7 @@ impl Transaction {
         if input_count > MAX_INPUTS {
             return Err(Error::LengthOverflow(input_count as u64));
         }
-        let mut inputs = Vec::with_capacity(input_count);
+        let mut inputs = Vec::with_capacity(input_count.min(Self::PREALLOCATE_CAP));
         for _ in 0..input_count {
             inputs.push(TxIn::decode(r)?);
         }
@@ -197,7 +208,7 @@ impl Transaction {
         if output_count > MAX_OUTPUTS {
             return Err(Error::LengthOverflow(output_count as u64));
         }
-        let mut outputs = Vec::with_capacity(output_count);
+        let mut outputs = Vec::with_capacity(output_count.min(Self::PREALLOCATE_CAP));
         for _ in 0..output_count {
             outputs.push(TxOut::decode(r)?);
         }
@@ -220,7 +231,7 @@ impl Transaction {
 
 impl Decode for Transaction {
     fn decode(r: &mut impl Read) -> Result<Self, Error> {
-        Self::decode_limited::<10_000, 10_000>(r)
+        Self::decode_limited::<{ Self::MAX_INPUTS }, { Self::MAX_OUTPUTS }>(r)
     }
 }
 
@@ -493,6 +504,32 @@ mod tests {
         let bytes = encode(&tx);
         let err = Transaction::decode_limited::<10_000, 3>(&mut std::io::Cursor::new(&bytes));
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn a_transaction_with_twenty_thousand_outputs_decodes() {
+        let tx = Transaction {
+            version: TxVersion::new(1),
+            inputs: vec![],
+            outputs: (0..20_000)
+                .map(|_| TxOut {
+                    value: Satoshi::new(546),
+                    script_pubkey: vec![0x51].into(),
+                })
+                .collect(),
+            locktime: Locktime::new(0),
+        };
+        let decoded = decode::<Transaction>(&encode(&tx));
+        assert_eq!(decoded.outputs.len(), 20_000);
+    }
+
+    #[test]
+    fn a_count_no_transaction_can_hold_is_rejected_without_allocating() {
+        let mut buf = Vec::new();
+        TxVersion::new(1).encode(&mut buf).unwrap();
+        buf.push(0xfe);
+        buf.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(Transaction::decode(&mut std::io::Cursor::new(&buf)).is_err());
     }
 
     #[test]

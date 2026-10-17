@@ -23,6 +23,9 @@ impl Encode for Block {
 }
 
 impl Block {
+    pub const MAX_TXS: usize = Transaction::MAX_SERIALIZED_SIZE / Transaction::MIN_SERIALIZED_SIZE;
+    const PREALLOCATE_CAP: usize = 4096;
+
     /// Block weight per BIP141: base size × 4 + witness-only size × 1.
     ///
     /// Base size is the non-witness serialisation (no marker/flag/witness
@@ -68,7 +71,7 @@ impl Block {
                 "tx count exceeds limit",
             )));
         }
-        let mut transactions = Vec::with_capacity(tx_count);
+        let mut transactions = Vec::with_capacity(tx_count.min(Self::PREALLOCATE_CAP));
         for _ in 0..tx_count {
             transactions.push(Transaction::decode_limited::<MAX_INPUTS, MAX_OUTPUTS>(r)?);
         }
@@ -81,7 +84,11 @@ impl Block {
 
 impl Decode for Block {
     fn decode(r: &mut impl Read) -> Result<Self, Error> {
-        Self::decode_limited::<10_000, 10_000, 10_000>(r)
+        Self::decode_limited::<
+            { Self::MAX_TXS },
+            { Transaction::MAX_INPUTS },
+            { Transaction::MAX_OUTPUTS },
+        >(r)
     }
 }
 
@@ -321,6 +328,29 @@ mod tests {
         let bytes = encode(&block);
         let err = Block::decode_limited::<3, 10_000, 10_000>(&mut std::io::Cursor::new(&bytes));
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn a_block_with_more_than_ten_thousand_transactions_decodes() {
+        let tx = Transaction {
+            version: TxVersion::new(1),
+            inputs: vec![],
+            outputs: vec![],
+            locktime: Locktime::new(0),
+        };
+        let block = Block {
+            header: BlockHeader::new(
+                BlockVersion::new(1),
+                Hash256::ZERO,
+                Hash256::ZERO,
+                BlockTime::new(0),
+                CompactBits::new(0),
+                Nonce::new(0),
+            ),
+            transactions: vec![tx; 12_000],
+        };
+        let decoded = decode::<Block>(&encode(&block));
+        assert_eq!(decoded.transactions.len(), 12_000);
     }
 
     #[test]
