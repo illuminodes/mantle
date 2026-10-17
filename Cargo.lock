@@ -808,6 +808,7 @@ dependencies = [
  "mantle-transport",
  "mantle-utxo-hash",
  "mantle-validator",
+ "pprof",
  "quetzalcoatl",
  "ququmatz",
 ]
@@ -816,6 +817,7 @@ dependencies = [
 name = "mantle-storage"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "mantle",
  "mantle-consensus",
  "quetzalcoatl",

@@ -5,6 +5,7 @@
 )]
 
 mod handle;
+mod single_op;
 mod slab;
 mod store;
 

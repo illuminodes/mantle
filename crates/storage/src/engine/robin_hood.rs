@@ -20,6 +20,7 @@ use super::{Engine, EngineError};
 use crate::types::{CommitBlockReq, Durability, LookupResult};
 
 mod chunk_cache;
+mod completions;
 mod flush_pass;
 mod growth;
 mod placement_stream;
@@ -587,7 +588,7 @@ impl RobinHoodTable {
         arena.resize(needed, 0);
 
         loop {
-            let mut submitted = 0u32;
+            let mut owed = completions::OwedCompletions::default();
             for i in 0..n {
                 if resolved[i] {
                     continue;
@@ -606,19 +607,17 @@ impl RobinHoodTable {
                 if !self.try_push_read(ring, sqe)? {
                     break;
                 }
-                submitted += 1;
+                owed.pushed();
             }
 
-            if submitted == 0 {
+            if owed.owed() == 0 {
                 break;
             }
 
-            ring.submit_and_wait(submitted).map_err(uring_err)?;
-
-            while let Some(cqe) = ring.complete() {
+            owed.drain(ring, |cqe| {
                 let i = usize::try_from(cqe.user_data()).expect("user_data index fits usize");
                 if i >= n {
-                    continue;
+                    return Ok(());
                 }
 
                 let res = cqe.raw_result();
@@ -633,21 +632,20 @@ impl RobinHoodTable {
                 let bucket = Bucket::decode(buf);
 
                 if bucket.is_empty() || bucket.probe_distance < dists[i] {
-                    // Not found — empty slot or Robin Hood invariant says stop.
                     resolved[i] = true;
-                    continue;
+                    return Ok(());
                 }
 
                 if bucket.matches(&ops[i]) {
-                    // Found.
                     results[i] = Some(bucket.to_coin(&self.overflow)?);
                     resolved[i] = true;
-                    continue;
+                    return Ok(());
                 }
 
                 dists[i] += 1;
                 slots[i] = (slots[i] + 1) & self.mask;
-            }
+                Ok(())
+            })?;
         }
 
         Ok(())

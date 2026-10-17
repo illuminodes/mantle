@@ -156,22 +156,11 @@ impl SlabWriter<'_> {
             )));
         }
         let dst = &mut self.slot_buf_mut(slot)[..len_usize];
-        // SAFETY: `dst` outlives the loop below, which blocks until this read completes.
-        let sqe = unsafe { ququmatz::Sqe::read(store.fd(), dst, offset) }.user_data(u64::MAX);
-        ring.push(sqe)
-            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
-        loop {
-            ring.submit_and_wait(1)
-                .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
-            while let Some(cqe) = ring.complete() {
-                if cqe.user_data() == u64::MAX {
-                    if cqe.raw_result() < 0 {
-                        return Err(std::io::Error::from_raw_os_error(-cqe.raw_result()));
-                    }
-                    return Ok(self.fill(slot, len));
-                }
-            }
-        }
+        // SAFETY: `SingleOp::run` blocks until this read completes, so `dst`
+        // outlives it.
+        let sqe = unsafe { ququmatz::Sqe::read(store.fd(), dst, offset) };
+        crate::single_op::SingleOp::run(ring, sqe)?;
+        Ok(self.fill(slot, len))
     }
 }
 

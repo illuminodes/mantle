@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::io;
 
+use super::completions::OwedCompletions;
 use super::{pread_exact, uring_err, Bucket, RobinHoodTable, BUCKET_SIZE};
 
 pub(super) const CHUNK_SLOTS: u64 = 64;
@@ -153,12 +154,15 @@ impl ChunkCache {
 /// fills and when drained, every completion checked for a full transfer.
 struct UringBatch {
     len: u32,
-    pending: u32,
+    owed: OwedCompletions,
 }
 
 impl UringBatch {
     fn new(len: u32) -> Self {
-        Self { len, pending: 0 }
+        Self {
+            len,
+            owed: OwedCompletions::default(),
+        }
     }
 
     fn push(
@@ -170,7 +174,7 @@ impl UringBatch {
         loop {
             match ring.push(table.apply_fd_flags(sqe)) {
                 Ok(()) => {
-                    self.pending += 1;
+                    self.owed.pushed();
                     return Ok(());
                 }
                 Err(ququmatz::Error::Submit(ququmatz::SubmitError::QueueFull)) => {
@@ -182,23 +186,19 @@ impl UringBatch {
     }
 
     fn drain(&mut self, ring: &mut ququmatz::IoUring) -> io::Result<()> {
-        if self.pending == 0 {
-            return Ok(());
-        }
-        ring.submit_and_wait(self.pending).map_err(uring_err)?;
-        let mut short = None;
-        while let Some(cqe) = ring.complete() {
+        let len = self.len;
+        self.owed.drain(ring, |cqe| {
             let res = cqe.raw_result();
             if res < 0 {
-                short = Some(io::Error::from_raw_os_error(-res));
-            } else if u32::try_from(res).ok() != Some(self.len) {
-                short = Some(io::Error::new(
+                Err(io::Error::from_raw_os_error(-res))
+            } else if u32::try_from(res).ok() == Some(len) {
+                Ok(())
+            } else {
+                Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    format!("table chunk transfer of {res} bytes, expected {}", self.len),
-                ));
+                    format!("table chunk transfer of {res} bytes, expected {len}"),
+                ))
             }
-        }
-        self.pending = 0;
-        short.map_or(Ok(()), Err)
+        })
     }
 }

@@ -18,3 +18,4 @@ ququmatz.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+libc = "0.2"

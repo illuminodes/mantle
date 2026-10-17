@@ -116,6 +116,26 @@ fn uring_err(e: ququmatz::Error) -> FetchError {
     FetchError::UringErr(format!("{e:?}"))
 }
 
+/// The event loop's blocking wait. A signal arriving during the wait makes
+/// `io_uring_enter` return `EINTR`; that is an early wake-up, not a failure,
+/// and the loop drains whatever completed and waits again.
+struct LoopWait;
+
+impl LoopWait {
+    const EINTR: i32 = 4;
+
+    fn wait(ring: &mut IoUring) -> Result<(), FetchError> {
+        match ring.submit_and_wait(1) {
+            Ok(_) => Ok(()),
+            Err(
+                ququmatz::Error::Syscall(errno)
+                | ququmatz::Error::Submit(ququmatz::SubmitError::Syscall(errno)),
+            ) if errno.raw() == Self::EINTR => Ok(()),
+            Err(e) => Err(uring_err(e)),
+        }
+    }
+}
+
 // ── Fetcher-specific peer extension ────────────────────────────────────────
 
 #[derive(Debug)]
@@ -615,7 +635,7 @@ where
 
         loop {
             self.ring.push_tick(Duration::from_secs(1))?;
-            self.ring.submit_and_wait(1).map_err(uring_err)?;
+            LoopWait::wait(&mut self.ring)?;
 
             let mut drained = 0usize;
             while drained < CQE_DRAIN_CAP {
@@ -901,7 +921,7 @@ where
 
         loop {
             self.ring.push_tick(Duration::from_secs(1))?;
-            self.ring.submit_and_wait(1).map_err(uring_err)?;
+            LoopWait::wait(&mut self.ring)?;
 
             let mut arrivals: Vec<(Hash256, u16)> = Vec::new();
             let mut drained = 0usize;
