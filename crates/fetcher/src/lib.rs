@@ -22,7 +22,7 @@ mod peer_book;
 mod peer_liveness;
 mod peer_score;
 mod routable;
-mod tip_vote;
+mod header_round;
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -62,7 +62,7 @@ use crate::in_flight::InFlight;
 use crate::peer_book::PeerBook;
 use crate::peer_liveness::PeerLiveness;
 use crate::peer_score::PeerScore;
-use crate::tip_vote::TipVote;
+use crate::header_round::HeaderRound;
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -77,6 +77,7 @@ const TRIED_LIMIT: usize = 24;
 const BLOCK_NO_PROGRESS_TIMEOUT_SECS: u64 = 300;
 const HEADERS_PHASE_DEADLINE_SECS: u64 = 120;
 const HEADERS_TIP_WINDOW_SECS: u64 = 15;
+const HEADERS_PAGE_WINDOW_SECS: u64 = 3;
 const TARGET_LIVE_PEERS: usize = 64;
 const RECV_BUF_CAPACITY: usize = 4 * 1024 * 1024;
 
@@ -123,7 +124,7 @@ struct FetcherExt {
     assigned_count: u32,
     delivered_count: u32,
     headers_request: Option<(Hash256, Instant)>,
-    headers_empty_for: Option<Hash256>,
+    headers_answered_for: Option<Hash256>,
     discovery_requested: bool,
     score: PeerScore,
     liveness: PeerLiveness,
@@ -136,7 +137,7 @@ impl FetcherExt {
             assigned_count: 0,
             delivered_count: 0,
             headers_request: None,
-            headers_empty_for: None,
+            headers_answered_for: None,
             discovery_requested: false,
             score: PeerScore::new(),
             liveness: PeerLiveness::new(),
@@ -527,12 +528,42 @@ where
         }
     }
 
-    /// Ask every ready peer for the headers after `request` until one sends
-    /// a page that outworks the held headers and passes `admission`, or the
-    /// [`TipVote`] decides the peers have nothing better (`None`). A page is
-    /// taken as soon as it arrives; the next round asks every peer again
-    /// from the new tip, so a peer on a branch with still more work answers
-    /// then.
+    /// Admit the round's best page that `admission` accepts, banning the
+    /// peers behind each page it refuses on the way.
+    fn settle_round(
+        &mut self,
+        round: HeaderRound,
+        admission: &mut impl HeaderAdmission,
+    ) -> Option<(Attachment, Vec<BlockHeader>)> {
+        let distinct = round.distinct_pages();
+        if distinct > 1 {
+            eprintln!("  headers: peers offered {distinct} different pages; taking the one with the most work");
+        }
+        for candidate in round.into_ranked() {
+            match HeaderPage::new(candidate.parent, &candidate.headers).admit(candidate.attachment.first, admission) {
+                Ok(()) => return Some((candidate.attachment, candidate.headers)),
+                Err(reason) => {
+                    for addr in &candidate.senders {
+                        eprintln!("  headers: banning {addr} for its page: {reason}");
+                        self.peer_book.ban(*addr);
+                    }
+                    for (_slot, peer) in self.peers.iter_mut() {
+                        if candidate.senders.contains(&peer.addr) && peer.state != PeerState::Dead {
+                            peer.close(&mut self.ring, &mut self.send_arena);
+                            peer.state = PeerState::Dead;
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Ask every ready peer for the headers after `request` and collect the
+    /// replies in a [`HeaderRound`]. Once the round is over, the page that
+    /// adds the most work and passes `admission` is returned; peers whose
+    /// page was refused are banned. `None` when no peer offered a page that
+    /// outworks the held headers, or every offered page was refused.
     #[allow(clippy::too_many_lines)]
     fn run_getheaders_session(
         &mut self,
@@ -549,7 +580,7 @@ where
             if peer.app.headers_request.is_some_and(|(l, _)| l != locator) {
                 peer.app.headers_request = None;
             }
-            peer.app.headers_empty_for = None;
+            peer.app.headers_answered_for = None;
         }
         eprintln!(
             "  headers: requesting next page with {} active peers and {} candidates",
@@ -577,7 +608,10 @@ where
         let mut version_payload = Vec::new();
         encode_version("/mantle-replay-iouring:0.1.0/", &mut version_payload);
         let mut last_status = Instant::now();
-        let mut tip_vote = TipVote::new(Duration::from_secs(HEADERS_TIP_WINDOW_SECS));
+        let mut round = HeaderRound::new(
+            Duration::from_secs(HEADERS_PAGE_WINDOW_SECS),
+            Duration::from_secs(HEADERS_TIP_WINDOW_SECS),
+        );
 
         loop {
             self.ring.push_tick(Duration::from_secs(1))?;
@@ -629,9 +663,8 @@ where
                 )?;
             }
 
-            // Parse frames: handshake + headers
-            let mut got_headers: Option<(Attachment, Vec<BlockHeader>)> = None;
             let mut discovered = Vec::new();
+            let arrived = Instant::now();
             for (slot, peer) in self.peers.iter_mut() {
                 if peer.state == PeerState::Dead {
                     continue;
@@ -658,25 +691,12 @@ where
                         }
                     },
                 )?;
-                if let Some(page) = peer_headers {
+                if let Some(page) = peer_headers
+                    && peer.app.headers_answered_for != Some(locator)
+                {
                     peer.app.headers_request = None;
-                    if let PeerPage::Better { attachment, parent, headers } = page {
-                        if got_headers.is_some() {
-                            continue;
-                        }
-                        match HeaderPage::new(parent, &headers).admit(attachment.first, admission) {
-                            Ok(()) => got_headers = Some((attachment, headers)),
-                            Err(reason) => {
-                                eprintln!("  headers: banning {} for its page: {reason}", peer.addr);
-                                self.peer_book.ban(peer.addr);
-                                peer.close(&mut self.ring, &mut self.send_arena);
-                                peer.state = PeerState::Dead;
-                                continue;
-                            }
-                        }
-                    } else {
-                        peer.app.headers_empty_for = Some(locator);
-                    }
+                    peer.app.headers_answered_for = Some(locator);
+                    round.offer(page, peer.addr, arrived);
                 }
                 if peer.state == PeerState::Ready && !peer.app.discovery_requested {
                     let fd = peer.fd().ok_or(FetchError::NoPeers)?;
@@ -702,14 +722,10 @@ where
                 self.ensure_peers()?;
             }
 
-            if got_headers.is_some() {
-                return Ok(got_headers);
-            }
-
-            let empty_votes = self
+            let answered = self
                 .peers
                 .values()
-                .filter(|peer| peer.app.headers_empty_for == Some(locator))
+                .filter(|peer| peer.app.headers_answered_for == Some(locator))
                 .count();
             let ready_peers = self
                 .peers
@@ -717,22 +733,14 @@ where
                 .filter(|peer| peer.state == PeerState::Ready)
                 .count();
             let now = Instant::now();
-            if tip_vote.reached(empty_votes, ready_peers, now) {
-                if empty_votes < ready_peers {
-                    eprintln!(
-                        "  headers: {empty_votes} of {ready_peers} ready peers have nothing better after {HEADERS_TIP_WINDOW_SECS}s"
-                    );
+            let deadline_passed = now > phase_deadline;
+            if round.is_over(answered, ready_peers, now) || (deadline_passed && answered > 0) {
+                if answered < ready_peers {
+                    eprintln!("  headers: round closed with {answered} of {ready_peers} ready peers answered");
                 }
-                return Ok(None);
+                return Ok(self.settle_round(round, admission));
             }
-
-            if now > phase_deadline {
-                if empty_votes > 0 {
-                    eprintln!(
-                        "  headers: deadline passed with {empty_votes} empty replies and no headers; treating as tip"
-                    );
-                    return Ok(None);
-                }
+            if deadline_passed {
                 return Err(FetchError::Timeout("headers"));
             }
             if now.duration_since(last_status) >= Duration::from_secs(5) {
@@ -819,7 +827,7 @@ where
             for (slot, peer) in self.peers.iter_mut() {
                 if peer.state != PeerState::Ready
                     || peer.app.headers_request.is_some()
-                    || peer.app.headers_empty_for == Some(locator)
+                    || peer.app.headers_answered_for == Some(locator)
                 {
                     continue;
                 }

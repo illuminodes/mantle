@@ -3,6 +3,7 @@ use std::net::{SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use mantle::codec::{Decode, Encode};
 use mantle::network::{Command, GetHeadersMsg, HeadersMsg, MessageHeader, Network, encode_message};
@@ -15,17 +16,23 @@ struct FakeNode {
     stream: TcpStream,
     buffer: Vec<u8>,
     chain: Arc<Mutex<Vec<BlockHeader>>>,
+    delay: Duration,
 }
 
 impl FakeNode {
     fn spawn(chain: Arc<Mutex<Vec<BlockHeader>>>) -> (SocketAddrV4, JoinHandle<()>) {
+        Self::spawn_slow(chain, Duration::ZERO)
+    }
+
+    /// A node that waits `delay` before answering each `getheaders`.
+    fn spawn_slow(chain: Arc<Mutex<Vec<BlockHeader>>>, delay: Duration) -> (SocketAddrV4, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let SocketAddr::V4(address) = listener.local_addr().expect("address") else {
             panic!("ipv4 expected");
         };
         let thread = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept");
-            Self { stream, buffer: Vec::new(), chain }.serve();
+            Self { stream, buffer: Vec::new(), chain, delay }.serve();
         });
         (address, thread)
     }
@@ -41,6 +48,7 @@ impl FakeNode {
                 }
                 "getheaders" => {
                     let request = GetHeadersMsg::decode(&mut payload.as_slice()).expect("getheaders");
+                    thread::sleep(self.delay);
                     let reply = HeadersMsg(self.after(&request.locator_hashes));
                     let mut body = Vec::new();
                     reply.encode(&mut body).expect("headers");
@@ -99,8 +107,8 @@ struct ReorgFixture {
 }
 
 impl ReorgFixture {
-    fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("fetcher-header-reorg-{}", std::process::id()));
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("fetcher-header-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
         Self { dir }
@@ -127,10 +135,10 @@ impl ReorgFixture {
     /// The kernel tears down a closed ring and its registered buffers on a
     /// workqueue, so right after the unit-test binary exits the memory they
     /// held can still count against this process and a new ring is refused.
-    fn fetcher(&self, peer: SocketAddrV4) -> Fetcher {
+    fn fetcher(&self, peers: &[SocketAddrV4]) -> Fetcher {
         let mut attempts = 0;
         loop {
-            match Fetcher::new(Network::Regtest, vec![peer], &self.dir) {
+            match Fetcher::new(Network::Regtest, peers.to_vec(), &self.dir) {
                 Ok(fetcher) => return fetcher,
                 Err(error) if attempts < 50 => {
                     attempts += 1;
@@ -155,14 +163,14 @@ impl Drop for ReorgFixture {
 
 #[test]
 fn a_sync_whose_cached_tip_was_orphaned_follows_the_longer_branch() {
-    let fixture = ReorgFixture::new();
+    let fixture = ReorgFixture::new("reorg");
     let first = ReorgFixture::branch(Network::Regtest.genesis_hash(), 3, 0);
     let mut longer = first[..2].to_vec();
     longer.extend(ReorgFixture::branch(first[1].hash(), 2, 1));
     let chain = Arc::new(Mutex::new(first.clone()));
     let (address, node) = FakeNode::spawn(Arc::clone(&chain));
 
-    let mut fetcher = fixture.fetcher(address);
+    let mut fetcher = fixture.fetcher(&[address]);
     let start = BlockHeight::new(1);
     let stop = BlockHeight::new(u32::MAX);
     let genesis = Network::Regtest.genesis_hash();
@@ -176,4 +184,24 @@ fn a_sync_whose_cached_tip_was_orphaned_follows_the_longer_branch() {
 
     assert_eq!(ReorgFixture::hashes(&resynced), longer.iter().map(BlockHeader::hash).collect::<Vec<_>>());
     assert_eq!(resynced.last().map(|(height, _)| *height), Some(BlockHeight::new(4)));
+}
+
+#[test]
+fn the_branch_with_the_most_work_wins_even_when_it_answers_last() {
+    let fixture = ReorgFixture::new("most-work");
+    let genesis = Network::Regtest.genesis_hash();
+    let light = ReorgFixture::branch(genesis, 3, 0);
+    let heavy = ReorgFixture::branch(genesis, 5, 1);
+    let (quick, quick_node) = FakeNode::spawn(Arc::new(Mutex::new(light)));
+    let (slow, slow_node) = FakeNode::spawn_slow(Arc::new(Mutex::new(heavy.clone())), Duration::from_millis(500));
+
+    let mut fetcher = fixture.fetcher(&[quick, slow]);
+    let synced = fetcher
+        .sync_headers(BlockHeight::new(1), BlockHeight::new(u32::MAX), genesis)
+        .expect("sync");
+    drop(fetcher);
+    quick_node.join().expect("quick node");
+    slow_node.join().expect("slow node");
+
+    assert_eq!(ReorgFixture::hashes(&synced), heavy.iter().map(BlockHeader::hash).collect::<Vec<_>>());
 }

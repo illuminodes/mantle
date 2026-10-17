@@ -73,12 +73,14 @@ impl<'a> HeaderLocator<'a> {
         })
     }
 
-    /// Whether `page`, attached at `attachment`, carries more work than the
-    /// held headers it would replace; a branch with equal or less work is
-    /// not taken.
-    pub(crate) fn outworks(&self, attachment: Attachment, page: &[BlockHeader]) -> bool {
+    /// The work `page`, attached at `attachment`, adds over the held headers
+    /// it would replace; `None` when it adds nothing, so a branch with equal
+    /// or less work is not taken. Gains of pages attached at different
+    /// heights compare as the work of the chains they would leave.
+    pub(crate) fn gain(&self, attachment: Attachment, page: &[BlockHeader]) -> Option<ChainWork> {
         let replaced = ChainWork::of_headers(self.chain.iter().skip(attachment.keep).map(|(_, header)| header));
-        !page.is_empty() && ChainWork::of_headers(page) > replaced
+        let offered = ChainWork::of_headers(page);
+        (offered > replaced).then(|| offered.saturating_sub(replaced))
     }
 
     pub(crate) fn payload(&self) -> Vec<u8> {
@@ -169,8 +171,8 @@ mod tests {
         let rival = |length: u32| -> Vec<BlockHeader> { ChainFixture::chain(length).into_iter().map(|(_, header)| header).collect() };
 
         assert_eq!(attachment, Attachment { keep: 4, first: BlockHeight::new(5) });
-        assert!(!locator.outworks(attachment, &rival(1)));
-        assert!(locator.outworks(attachment, &rival(2)));
+        assert_eq!(locator.gain(attachment, &rival(1)), None);
+        assert_eq!(locator.gain(attachment, &rival(2)), Some(mantle::primitives::ChainWork::new(2)));
     }
 
     #[test]
@@ -181,8 +183,8 @@ mod tests {
         let mut hard = chain[2].1;
         hard.set_bits(CompactBits::new(0x2000_ffff));
 
-        assert!(locator.outworks(attachment, &[hard]));
-        assert!(!locator.outworks(attachment, &[]));
+        assert!(locator.gain(attachment, &[hard]).is_some());
+        assert_eq!(locator.gain(attachment, &[]), None);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use mantle::primitives::{BlockHeader, BlockHeight, Hash256};
+use mantle::primitives::{BlockHeader, BlockHeight, ChainWork, Hash256};
 
 use crate::header_locator::{Attachment, HeaderLocator};
 
@@ -14,6 +14,7 @@ pub(crate) enum PeerPage {
         attachment: Attachment,
         parent: Hash256,
         headers: Vec<BlockHeader>,
+        gain: ChainWork,
     },
 }
 
@@ -27,20 +28,21 @@ impl PeerPage {
         let parent = first.prev_block();
         let attachment = request.attach(parent)?;
         headers.truncate(attachment.room(end));
-        if !request.outworks(attachment, &headers) {
+        let Some(gain) = request.gain(attachment, &headers) else {
             return Some(Self::NothingBetter);
-        }
+        };
         Some(Self::Better {
             attachment,
             parent,
             headers,
+            gain,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use mantle::primitives::{BlockHeader, BlockHeight, BlockTime, BlockVersion, CompactBits, Hash256, Nonce};
+    use mantle::primitives::{BlockHeader, BlockHeight, BlockTime, BlockVersion, ChainWork, CompactBits, Hash256, Nonce};
 
     use super::PeerPage;
     use crate::header_locator::{Attachment, HeaderLocator};
@@ -95,6 +97,7 @@ mod tests {
                 attachment: Attachment { keep: 3, first: BlockHeight::new(4) },
                 parent: held[2].1.hash(),
                 headers: next,
+                gain: ChainWork::new(4),
             })
         );
     }

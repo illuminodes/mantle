@@ -48,6 +48,11 @@ impl ChainWork {
     }
 
     #[must_use]
+    pub const fn saturating_sub(self, rhs: Self) -> Self {
+        Self(self.0.saturating_sub(rhs.0))
+    }
+
+    #[must_use]
     pub fn of_header(header: &BlockHeader) -> Self {
         Self::of_bits(header.bits())
     }
@@ -115,6 +120,12 @@ mod tests {
     fn bits_without_a_target_are_worth_nothing() {
         assert_eq!(ChainWork::of_bits(CompactBits::new(0x1d00_0000)), ChainWork::ZERO);
         assert_eq!(ChainWork::of_bits(CompactBits::new(0x0180_0001)), ChainWork::ZERO);
+    }
+
+    #[test]
+    fn differences_stop_at_zero() {
+        assert_eq!(ChainWork::new(5).saturating_sub(ChainWork::new(3)), ChainWork::new(2));
+        assert_eq!(ChainWork::new(3).saturating_sub(ChainWork::new(5)), ChainWork::ZERO);
     }
 
     #[test]
