@@ -13,6 +13,7 @@ use mantle_fetcher::{AdmitAll, BlockFeed, FeedItem};
 use crate::failures::{FailureLog, FailureStage};
 use crate::report::Reporter;
 use crate::stage_clock::{Stage, StageClock};
+use crate::window_meter::WindowMeter;
 use mantle_replay::block_files::BlockFiles;
 use mantle_replay::utxo_hash_check::{UtxoHashTracker, UtxoHashVerdict};
 
@@ -64,6 +65,7 @@ impl ReplayLoop {
         reporter: &mut Reporter,
     ) -> Result<BlockHeight, String> {
         let mut to_submit = header_pairs.iter();
+        let mut meter = WindowMeter::start(&self.pipeline);
         for chunk in header_pairs.chunks(window) {
             for _ in chunk {
                 self.fill_prep(feed, &mut to_submit)?;
@@ -81,11 +83,12 @@ impl ReplayLoop {
                 self.retire(Wait::Always, reporter)?;
             }
             eprintln!(
-                "  window {}..={}: {}, {} blocks in flight",
+                "  window {}..={}: {}, {} blocks in flight; {}",
                 chunk[0].0.to_u32(),
                 chunk[chunk.len() - 1].0.to_u32(),
                 self.clock.take_line(),
-                self.pipeline.in_flight()
+                self.pipeline.in_flight(),
+                meter.take_line(&self.pipeline),
             );
         }
         Ok(self.last_committed)

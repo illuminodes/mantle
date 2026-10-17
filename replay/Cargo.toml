@@ -38,3 +38,7 @@ mantle-utxo-hash = { path = "../crates/utxo-hash" }
 mantle-validator = { path = "../crates/validator" }
 ququmatz.workspace = true
 quetzalcoatl.workspace = true
+pprof = { version = "0.14", optional = true }
+
+[features]
+cpu-profile = ["dep:pprof"]

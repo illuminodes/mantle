@@ -14,10 +14,12 @@
 //! CLI: `mantle-replay [--data-dir DIR] [--network NAME] [--peer HOST:PORT]…
 //!                    [--skip-script] [--start-height N] [--stop-height N] [--help]`.
 
+mod cpu_profile;
 mod failures;
 mod replay_loop;
 mod report;
 mod stage_clock;
+mod window_meter;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -59,6 +61,7 @@ struct Args {
     /// reports as its current tip after a single `getheaders` page.
     stop_height: Option<BlockHeight>,
     locator_hash: Option<Hash256>,
+    cpu_profile: bool,
     verify: VerifyOpts,
 }
 
@@ -67,6 +70,7 @@ struct VerifyOpts {
     failures_file: Option<PathBuf>,
     failure_blocks_dir: Option<PathBuf>,
     ephemeral: bool,
+    discard_blocks: bool,
     window: usize,
     progress_every: std::time::Duration,
     utxo_hash_file: Option<PathBuf>,
@@ -172,8 +176,12 @@ Options:
     --ephemeral           Do not keep the chain: download blocks in windows,
                           delete each window after validating it, and remove
                           --data-dir on exit. Requires an empty --data-dir.
+    --discard-blocks      Delete each window's blocks after validating it, but
+                          keep the validated chain state in --data-dir so a
+                          later run can resume from it. Implied by --ephemeral.
     --window N            Blocks per download window (default: 1000 with
-                          --ephemeral, whole range otherwise).
+                          --ephemeral or --discard-blocks, whole range
+                          otherwise).
     --progress-secs N     Seconds between replay progress lines (default: 2).
                           Raise it for long CI runs to stay under the job
                           log size limit.
@@ -184,6 +192,8 @@ Options:
                           --start-height 1 (the hash starts from genesis).
     --utxo-hash-every N   Track the UTXO set MuHash and print it every N
                           blocks as a `UTXO HASH` line.
+    --cpu-profile         Sample CPU use and print the hottest functions per
+                          thread at exit. Needs `--features cpu-profile`.
     --help                Print this message and exit.
 ";
 
@@ -204,10 +214,12 @@ fn parse_args() -> Result<Args, String> {
     let mut failures_file: Option<PathBuf> = None;
     let mut failure_blocks_dir: Option<PathBuf> = None;
     let mut ephemeral = false;
+    let mut discard_blocks = false;
     let mut window: Option<usize> = None;
     let mut progress_secs: u64 = 2;
     let mut utxo_hash_file: Option<PathBuf> = None;
     let mut utxo_hash_every: Option<u32> = None;
+    let mut cpu_profile = false;
 
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -279,6 +291,12 @@ fn parse_args() -> Result<Args, String> {
             }
             "--ephemeral" => {
                 ephemeral = true;
+            }
+            "--discard-blocks" => {
+                discard_blocks = true;
+            }
+            "--cpu-profile" => {
+                cpu_profile = true;
             }
             "--failures-file" => {
                 i += 1;
@@ -364,6 +382,10 @@ fn parse_args() -> Result<Args, String> {
     if ephemeral && block_cache_dir.is_some() {
         return Err("--ephemeral keeps blocks under --data-dir; drop --block-cache-dir".to_string());
     }
+    let discard_blocks = discard_blocks || ephemeral;
+    if discard_blocks && download_only {
+        return Err("--discard-blocks cannot be combined with --download-only".to_string());
+    }
     if failures_file.is_some() && !keep_going {
         return Err("--failures-file requires --keep-going".to_string());
     }
@@ -393,7 +415,7 @@ fn parse_args() -> Result<Args, String> {
                 .to_string(),
         );
     }
-    let window = window.unwrap_or(if ephemeral {
+    let window = window.unwrap_or(if discard_blocks {
         DEFAULT_EPHEMERAL_WINDOW
     } else {
         usize::MAX
@@ -411,11 +433,13 @@ fn parse_args() -> Result<Args, String> {
         start_height,
         stop_height,
         locator_hash,
+        cpu_profile,
         verify: VerifyOpts {
             keep_going,
             failures_file,
             failure_blocks_dir,
             ephemeral,
+            discard_blocks,
             window,
             progress_every: std::time::Duration::from_secs(progress_secs),
             utxo_hash_file,
@@ -668,7 +692,7 @@ fn run(args: &Args) -> Result<u64, String> {
     feed.request_blocks(BlocksRequest {
         wanted: header_pairs.clone(),
         window: if args.download_only { header_pairs.len() } else { args.verify.window },
-        discard_each_window: args.verify.ephemeral && !args.download_only,
+        discard_each_window: args.verify.discard_blocks,
         deliver: !args.download_only,
     })?;
     if args.download_only {
@@ -739,6 +763,7 @@ fn run(args: &Args) -> Result<u64, String> {
     );
 
     let mut reporter = Reporter::new(start_height, actual_stop, args.verify.progress_every);
+    let profile = crate::cpu_profile::CpuProfile::start(args.cpu_profile);
     let last_committed = ctx.run(
         &header_pairs,
         args.verify.window,
@@ -746,6 +771,7 @@ fn run(args: &Args) -> Result<u64, String> {
         &snapshot,
         &mut reporter,
     )?;
+    profile.finish();
     drop(feed);
     reporter.done(last_committed);
 
