@@ -21,7 +21,8 @@ fn mantle_agrees_with_core_on_every_script_asset() {
         eprintln!("SCRIPT_ASSETS_JSON unset; skipping the script assets differential test");
         return;
     };
-    let text = std::fs::read_to_string(&path).expect("read script_assets_test.json");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("SCRIPT_ASSETS_JSON={}: {e}", path.to_string_lossy()));
     let cases: Vec<serde_json::Value> = serde_json::from_str(&text).expect("parse JSON");
     assert!(!cases.is_empty(), "no cases in {}", path.to_string_lossy());
 
