@@ -476,17 +476,44 @@ fn op_if_skipped_branch_runs_else() {
     assert_eq!(s.peek(0).expect("ok"), &[0x06]);
 }
 
+fn run_as(
+    script: &[u8],
+    flags: ScriptFlags,
+    sig_version: SigVersion,
+) -> Result<Stack, ScriptError> {
+    let checker = NopSigChecker;
+    let mut interp = Interpreter::new(&checker, flags, sig_version);
+    if sig_version == SigVersion::Tapscript {
+        interp.tapscript = Some(dummy_tapscript_ctx());
+    }
+    interp.eval(script)?;
+    Ok(interp.stack)
+}
+
+const NON_MINIMAL_IF: &[u8] = &[0x01, 0x02, 0x63, 0x51, 0x68];
+
 #[test]
-fn op_if_minimalif_rejects_non_minimal() {
-    // Push 0x02 (not minimal: must be empty or [0x01]) then OP_IF under MINIMALIF.
-    let r = run_flags(&[0x01, 0x02, 0x63, 0x51, 0x68], ScriptFlags::MINIMALIF);
+fn minimalif_flag_applies_to_witness_v0_only() {
+    let r = run_as(
+        NON_MINIMAL_IF,
+        ScriptFlags::MINIMALIF,
+        SigVersion::WitnessV0,
+    );
     assert!(matches!(r, Err(ScriptError::MinimalIf)));
+    assert!(run_as(NON_MINIMAL_IF, ScriptFlags::NONE, SigVersion::WitnessV0).is_ok());
+    assert!(run_as(NON_MINIMAL_IF, ScriptFlags::MINIMALIF, SigVersion::Base).is_ok());
 }
 
 #[test]
-fn op_if_minimalif_accepts_minimal_true() {
-    // Push [0x01] then OP_IF — minimal true under MINIMALIF.
-    let s = run_flags(&[0x51, 0x63, 0x55, 0x68], ScriptFlags::MINIMALIF).expect("ok");
+fn minimalif_is_consensus_in_tapscript() {
+    let r = run_as(NON_MINIMAL_IF, ScriptFlags::NONE, SigVersion::Tapscript);
+    assert!(matches!(r, Err(ScriptError::MinimalIf)));
+    let s = run_as(
+        &[0x51, 0x63, 0x55, 0x68],
+        ScriptFlags::NONE,
+        SigVersion::Tapscript,
+    )
+    .expect("minimal true");
     assert_eq!(s.peek(0).expect("ok"), &[0x05]);
 }
 
@@ -705,20 +732,29 @@ fn run_tapscript(script: &[u8]) -> Result<Stack, ScriptError> {
 }
 
 fn run_tapscript_flags(script: &[u8], flags: ScriptFlags) -> Result<Stack, ScriptError> {
-    let checker = NopSigChecker;
-    let mut interp = Interpreter::new(&checker, flags, SigVersion::Tapscript);
-    // Provide a dummy tapscript context so OP_CHECKSIG / OP_CHECKSIGADD
-    // can reach the Schnorr verification path (instead of returning BadOpcode).
-    interp.tapscript = Some(super::TapscriptCtx {
+    run_as(script, flags, SigVersion::Tapscript)
+}
+
+fn dummy_tapscript_ctx() -> super::TapscriptCtx {
+    dummy_tapscript_ctx_with_weight(i64::MAX)
+}
+
+fn dummy_tapscript_ctx_with_weight(weight_left: i64) -> super::TapscriptCtx {
+    let tx = mantle::primitives::Transaction {
+        version: mantle::primitives::TxVersion::new(2),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        locktime: mantle::primitives::Locktime::new(0),
+    };
+    super::TapscriptCtx {
         leaf_hash: [0u8; 32],
         spent_amount: mantle::primitives::Satoshi::ZERO,
         spent_spk: Vec::new(),
-        // SAFETY: Bip341Cache is only used for sighash computation which
-        // NopSigChecker never reaches — all fields can be zeroed.
-        bip341_cache: unsafe { std::mem::zeroed() },
-    });
-    interp.eval(script)?;
-    Ok(interp.stack)
+        bip341_cache: crate::script::sighash::Bip341Cache::new(&tx, &[], &[]),
+        annex: None,
+        weight_left,
+        codesep_opcode_pos: u32::MAX,
+    }
 }
 
 #[test]
@@ -734,58 +770,114 @@ fn op_checksig_tapscript_empty_sig_pushes_false() {
     assert!(!s.peek(0).expect("ok").is_truthy());
 }
 
+fn push_sig_and_key(sig: &[u8], key: &[u8]) -> Vec<u8> {
+    let mut script = Vec::new();
+    for item in [sig, key] {
+        if item.is_empty() {
+            script.push(0x00);
+        } else {
+            script.push(u8::try_from(item.len()).expect("short push"));
+            script.extend_from_slice(item);
+        }
+    }
+    script
+}
+
 #[test]
-fn op_checksig_tapscript_non32byte_pubkey_pushes_false() {
-    // sig=OP_0(empty), pubkey=20-byte (not 32) → unknown pubkey type, pushes false.
-    let mut script = vec![0x00]; // OP_0 (sig)
-    script.push(0x14); // OP_PUSHBYTES_20
-    script.extend_from_slice(&[0xab; 20]);
-    script.push(0xac); // OP_CHECKSIG
-    let s = run_tapscript(&script).expect("unknown pubkey type is clean failure");
-    assert_eq!(s.len(), 1);
+fn tapscript_unknown_key_type_with_a_signature_succeeds() {
+    let mut script = push_sig_and_key(&[0xff], &[0xab; 20]);
+    script.push(0xac);
+    let s = run_tapscript(&script).expect("unknown key types always succeed");
+    assert!(s.peek(0).expect("ok").is_truthy());
+}
+
+#[test]
+fn tapscript_unknown_key_type_without_a_signature_pushes_false() {
+    let mut script = push_sig_and_key(&[], &[0xab; 20]);
+    script.push(0xac);
+    let s = run_tapscript(&script).expect("empty sig is a clean failure");
     assert!(!s.peek(0).expect("ok").is_truthy());
 }
 
 #[test]
-fn op_checksig_tapscript_bad_sig_nullfail() {
-    // Non-empty sig that fails verification under NULLFAIL → SigNullFail error.
-    // NopSigChecker always returns false for check_schnorr_sig.
-    let mut script = Vec::new();
-    // Push a non-empty sig (1 byte).
-    script.push(0x01); // OP_PUSHBYTES_1
-    script.push(0xff); // sig byte
-    // Push 32-byte pubkey.
-    script.push(0x20); // OP_PUSHBYTES_32
-    script.extend_from_slice(&[0xab; 32]);
-    script.push(0xac); // OP_CHECKSIG
-    let r = run_tapscript_flags(&script, ScriptFlags::NULLFAIL);
-    assert!(matches!(r, Err(ScriptError::SigNullFail)));
+fn tapscript_failed_signature_fails_the_script_without_nullfail() {
+    let mut script = push_sig_and_key(&[0xff], &[0xab; 32]);
+    script.push(0xac);
+    script.push(0x91);
+    assert_eq!(
+        run_tapscript(&script).map(|_| ()),
+        Err(ScriptError::SchnorrSig)
+    );
 }
 
 #[test]
-fn op_checksig_tapscript_bad_sig_no_nullfail_pushes_false() {
-    // Non-empty sig that fails, but NULLFAIL is off → pushes false.
-    let mut script = Vec::new();
-    script.push(0x01); // OP_PUSHBYTES_1
-    script.push(0xff); // sig byte
-    script.push(0x20); // OP_PUSHBYTES_32
-    script.extend_from_slice(&[0xab; 32]);
-    script.push(0xac); // OP_CHECKSIG
-    let s = run_tapscript(&script).expect("no NULLFAIL → clean failure");
-    assert_eq!(s.len(), 1);
-    assert!(!s.peek(0).expect("ok").is_truthy());
+fn tapscript_empty_pubkey_fails_even_without_a_signature() {
+    let mut script = push_sig_and_key(&[], &[]);
+    script.push(0xac);
+    assert_eq!(
+        run_tapscript(&script).map(|_| ()),
+        Err(ScriptError::TapscriptEmptyPubkey)
+    );
+}
+
+#[test]
+fn tapscript_signatures_spend_the_validation_weight_budget() {
+    let mut script = push_sig_and_key(&[0xff], &[0xab; 20]);
+    script.push(0xac);
+    let checker = NopSigChecker;
+    let run_with = |weight| {
+        let mut interp = Interpreter::new(&checker, ScriptFlags::NONE, SigVersion::Tapscript);
+        interp.tapscript = Some(dummy_tapscript_ctx_with_weight(weight));
+        interp.eval(&script)
+    };
+    assert_eq!(run_with(49), Err(ScriptError::TapscriptValidationWeight));
+    assert_eq!(run_with(50), Ok(()));
+}
+
+#[test]
+fn tapscript_empty_signatures_cost_no_weight() {
+    let mut script = push_sig_and_key(&[], &[0xab; 32]);
+    script.push(0xac);
+    let checker = NopSigChecker;
+    let mut interp = Interpreter::new(&checker, ScriptFlags::NONE, SigVersion::Tapscript);
+    interp.tapscript = Some(dummy_tapscript_ctx_with_weight(0));
+    assert_eq!(interp.eval(&script), Ok(()));
+}
+
+#[test]
+fn tapscript_codeseparator_position_counts_opcodes_including_dead_branches() {
+    let script = [0x00, 0x63, 0xab, 0x68, 0x02, 0xaa, 0xbb, 0x75, 0xab];
+    let checker = NopSigChecker;
+    let mut interp = Interpreter::new(&checker, ScriptFlags::NONE, SigVersion::Tapscript);
+    interp.tapscript = Some(dummy_tapscript_ctx());
+    interp.eval(&script).expect("runs");
+    assert_eq!(
+        interp.tapscript.as_ref().map(|c| c.codesep_opcode_pos),
+        Some(6)
+    );
+}
+
+#[test]
+fn tapscript_codeseparator_in_a_dead_branch_is_not_recorded() {
+    let script = [0x00, 0x63, 0xab, 0x68];
+    let checker = NopSigChecker;
+    let mut interp = Interpreter::new(&checker, ScriptFlags::NONE, SigVersion::Tapscript);
+    interp.tapscript = Some(dummy_tapscript_ctx());
+    interp.eval(&script).expect("runs");
+    assert_eq!(
+        interp.tapscript.as_ref().map(|c| c.codesep_opcode_pos),
+        Some(u32::MAX)
+    );
 }
 
 // ── OP_CHECKSIGADD (tapscript) ──────────────────────────────────────────
 
 #[test]
-fn op_checksigadd_empty_pubkey_pushes_n_unchanged() {
-    // sig=OP_0(empty), n=OP_5, pubkey=OP_0(empty)
-    // Empty pubkey → unknown key type, push n unchanged.
-    // OP_0 OP_5 OP_0 OP_CHECKSIGADD
-    let s = run_tapscript(&[0x00, 0x55, 0x00, 0xba]).expect("ok");
-    assert_eq!(s.len(), 1);
-    assert_eq!(s.peek(0).expect("ok"), &[0x05]);
+fn op_checksigadd_empty_pubkey_fails() {
+    assert_eq!(
+        run_tapscript(&[0x00, 0x55, 0x00, 0xba]).map(|_| ()),
+        Err(ScriptError::TapscriptEmptyPubkey)
+    );
 }
 
 #[test]
@@ -804,45 +896,28 @@ fn op_checksigadd_empty_sig_pushes_n_unchanged() {
 }
 
 #[test]
-fn op_checksigadd_bad_pubkey_size_fails() {
-    // sig=OP_0(empty), n=OP_5, pubkey=1-byte (not 32, not empty)
-    // Non-empty, non-32-byte pubkey → XOnlyPubkeySize error.
-    // OP_0 OP_5 OP_1 OP_CHECKSIGADD
-    let r = run_tapscript(&[0x00, 0x55, 0x51, 0xba]);
-    assert!(matches!(r, Err(ScriptError::XOnlyPubkeySize)));
+fn op_checksigadd_unknown_key_type_with_a_signature_counts() {
+    let r = run_tapscript(&[0x01, 0xff, 0x55, 0x51, 0xba]).expect("unknown key type");
+    assert_eq!(r.peek(0).expect("ok"), &[0x06]);
 }
 
 #[test]
-fn op_checksigadd_bad_sig_nullfail() {
-    // Non-empty sig that fails verification under NULLFAIL → TaprootChecksigAdd error.
-    // Stack order (bottom to top): sig, n, pubkey
-    let mut script = Vec::new();
-    // sig = 1 byte (non-empty)
-    script.push(0x01); // OP_PUSHBYTES_1
-    script.push(0xff);
-    // n = OP_3
-    script.push(0x53);
-    // pubkey = 32-byte key
-    script.push(0x20); // OP_PUSHBYTES_32
+fn op_checksigadd_failed_signature_fails_the_script() {
+    let mut script = vec![0x01, 0xff, 0x53, 0x20];
     script.extend_from_slice(&[0xab; 32]);
-    script.push(0xba); // OP_CHECKSIGADD
-    let r = run_tapscript_flags(&script, ScriptFlags::NULLFAIL);
-    assert!(matches!(r, Err(ScriptError::TaprootChecksigAdd)));
+    script.push(0xba);
+    assert_eq!(
+        run_tapscript(&script).map(|_| ()),
+        Err(ScriptError::SchnorrSig)
+    );
 }
 
 #[test]
-fn op_checksigadd_bad_sig_no_nullfail_pushes_n() {
-    // Non-empty sig fails without NULLFAIL → pushes n unchanged.
-    let mut script = Vec::new();
-    script.push(0x01); // OP_PUSHBYTES_1
-    script.push(0xff);
-    script.push(0x53); // OP_3 (n=3)
-    script.push(0x20); // OP_PUSHBYTES_32
-    script.extend_from_slice(&[0xab; 32]);
-    script.push(0xba); // OP_CHECKSIGADD
-    let s = run_tapscript(&script).expect("no NULLFAIL → clean failure");
+fn op_checksigadd_counts_a_valid_unknown_type_signature_once() {
+    let script = [0x01, 0xff, 0x53, 0x01, 0xab, 0xba];
+    let s = run_tapscript(&script).expect("one-byte key is an unknown type");
     assert_eq!(s.len(), 1);
-    assert_eq!(s.peek(0).expect("ok"), &[0x03]);
+    assert_eq!(s.peek(0).expect("ok"), &[0x04]);
 }
 
 #[test]
@@ -855,24 +930,18 @@ fn op_checksigadd_outside_tapscript_fails() {
 // ── OP_CHECKMULTISIG / OP_CHECKMULTISIGVERIFY in tapscript ─────────────
 
 #[test]
-fn op_checkmultisig_in_tapscript_succeeds_via_op_success() {
-    // In tapscript, OP_CHECKMULTISIG (0xae) is an OP_SUCCESS opcode.
-    // Any script containing it succeeds immediately, even without valid stack.
-    // Note: is_tapscript_success covers byte 0xbb..=0xfe, but OP_CHECKMULTISIG
-    // (0xae) is NOT in that range — it dispatches normally. Let's test that
-    // it executes normally (0-of-0 works).
-    let s = run_tapscript(&[0x00, 0x00, 0x00, 0xae]).expect("0-of-0 multisig ok in tapscript");
-    assert_eq!(s.len(), 1);
-    assert!(s.peek(0).expect("ok").is_truthy());
+fn checkmultisig_fails_when_executed_in_tapscript() {
+    for op in [0xae, 0xaf] {
+        assert_eq!(
+            run_tapscript(&[0x00, 0x00, 0x00, op]).map(|_| ()),
+            Err(ScriptError::TapscriptCheckMultisig)
+        );
+    }
 }
 
 #[test]
-fn op_checkmultisigverify_in_tapscript_works() {
-    // OP_CHECKMULTISIGVERIFY (0xaf) in tapscript: 0-of-0 with verify.
-    // Stack: dummy=OP_0, n_sigs=OP_0, n_pubkeys=OP_0, then OP_CHECKMULTISIGVERIFY
-    // followed by OP_1 so we leave a truthy stack.
-    let s = run_tapscript(&[0x00, 0x00, 0x00, 0xaf, 0x51]).expect("0-of-0 multisigverify ok");
-    assert_eq!(s.len(), 1);
+fn checkmultisig_in_a_dead_tapscript_branch_is_skipped() {
+    let s = run_tapscript(&[0x00, 0x63, 0xae, 0x68, 0x51]).expect("not executed");
     assert!(s.peek(0).expect("ok").is_truthy());
 }
 
@@ -905,24 +974,24 @@ fn op_pushdata4_pushes_data() {
 // ── Disabled opcodes in tapscript ──────────────────────────────────────
 
 #[test]
-fn disabled_opcode_in_tapscript_is_op_success() {
-    // In tapscript, the legacy disabled opcodes (OP_CAT 0x7e, OP_SUBSTR 0x7f,
-    // etc.) are re-assigned as OP_SUCCESSx. Encountering one anywhere in the
-    // script makes the entire script succeed immediately.
-    // OP_CAT (0x7e) is in the 0x7e..=0x81 range of OP_SUCCESSx.
-    let s = run_tapscript(&[0x7e]).expect("OP_SUCCESSx succeeds immediately");
-    // After OP_SUCCESSx, eval returns Ok(()) and the stack may be empty.
-    // The step function returns Ok(()) immediately, so eval finishes.
-    assert_eq!(s.len(), 0);
+fn every_disabled_opcode_is_op_success_in_tapscript() {
+    for byte in 0u8..=0xff {
+        let op = crate::script::opcodes::Opcode::from_byte(byte);
+        if op.is_disabled() {
+            assert!(op.is_tapscript_success(), "0x{byte:02x}");
+        }
+    }
 }
 
 #[test]
-fn disabled_opcode_in_tapscript_skipped_branch_still_succeeds() {
-    // OP_SUCCESSx in an unexecuted OP_IF branch still makes the script succeed.
-    // OP_0 OP_IF OP_CAT(0x7e) OP_ENDIF
-    // Even though OP_CAT is in the "false" branch, it's an OP_SUCCESSx in tapscript.
-    let s = run_tapscript(&[0x00, 0x63, 0x7e, 0x68]).expect("OP_SUCCESSx in dead branch succeeds");
-    assert_eq!(s.len(), 0);
+fn tapscript_if_nesting_has_no_depth_limit() {
+    let mut script = vec![0x51; 1];
+    for _ in 0..500 {
+        script.extend_from_slice(&[0x51, 0x63]);
+    }
+    script.extend(std::iter::repeat_n(0x68, 500));
+    let s = run_tapscript(&script).expect("deep nesting");
+    assert!(s.peek(0).expect("ok").is_truthy());
 }
 
 // ── CLTV / CSV as upgradable NOPs (pre-activation) ────────────────────
@@ -1122,10 +1191,7 @@ fn op_checkmultisigverify_failure_returns_verify() {
     // Since verify=true: Err(Verify).
     //
     // Note: no NULLFAIL flag set — we only set P2SH to keep it simple.
-    let r = run_flags(
-        &[0x00, 0x00, 0x51, 0x00, 0x51, 0xaf],
-        ScriptFlags::NONE,
-    );
+    let r = run_flags(&[0x00, 0x00, 0x51, 0x00, 0x51, 0xaf], ScriptFlags::NONE);
     assert!(
         matches!(r, Err(ScriptError::Verify)),
         "CHECKMULTISIGVERIFY with failing sig (no NULLFAIL) must return Verify, got: {r:?}"

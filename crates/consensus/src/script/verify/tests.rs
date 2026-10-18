@@ -984,15 +984,8 @@ fn checkmultisig_with_codeseparator() {
     let digest = tx.legacy_sighash(0, script_code, SigHashType::ALL);
     let sig = sign(&sk, digest.as_bytes(), SigHashType::ALL);
     let script_sig = multisig_script_sig(&[sig]);
-    verify_script(
-        &script_sig,
-        &spk,
-        &tx,
-        0,
-        Satoshi::ZERO,
-        multisig_flags(),
-    )
-    .expect("CHECKMULTISIG with CODESEPARATOR should verify");
+    verify_script(&script_sig, &spk, &tx, 0, Satoshi::ZERO, multisig_flags())
+        .expect("CHECKMULTISIG with CODESEPARATOR should verify");
 }
 
 #[test]
@@ -1064,14 +1057,7 @@ fn checkmultisig_bad_pubkey_encoding_rejected() {
     let digest = tx.legacy_sighash(0, &spk, SigHashType::ALL);
     let sig = sign(&sk, digest.as_bytes(), SigHashType::ALL);
     let script_sig = multisig_script_sig(&[sig]);
-    let r = verify_script(
-        &script_sig,
-        &spk,
-        &tx,
-        0,
-        Satoshi::ZERO,
-        multisig_flags(),
-    );
+    let r = verify_script(&script_sig, &spk, &tx, 0, Satoshi::ZERO, multisig_flags());
     assert!(
         matches!(r, Err(ScriptError::PubKeyType)),
         "malformed pubkey in multisig must fail with PubKeyType, got: {r:?}"
@@ -1086,15 +1072,8 @@ fn checkmultisigverify_0of0_succeeds() {
     let spk = vec![0x00, 0x00, 0xaf, 0x51]; // OP_0 OP_0 OP_CHECKMULTISIGVERIFY OP_1
     let tx = make_tx();
     let script_sig = multisig_script_sig(&[]); // OP_0 dummy only
-    verify_script(
-        &script_sig,
-        &spk,
-        &tx,
-        0,
-        Satoshi::ZERO,
-        multisig_flags(),
-    )
-    .expect("0-of-0 CHECKMULTISIGVERIFY should succeed");
+    verify_script(&script_sig, &spk, &tx, 0, Satoshi::ZERO, multisig_flags())
+        .expect("0-of-0 CHECKMULTISIGVERIFY should succeed");
 }
 
 // ── try_verify_p2pkh: uncovered branches ─────────────────────────────
@@ -1229,9 +1208,7 @@ fn witness_v1_non_32byte_program_rejected_with_discourage() {
 }
 
 #[test]
-fn p2sh_wrapped_taproot_rejected() {
-    // BIP341: P2SH-wrapped taproot (witness v1, 32-byte program inside P2SH)
-    // is not valid and must be rejected with WitnessMalleatedP2sh.
+fn p2sh_wrapped_v1_program_is_an_unknown_witness_version() {
     let program = [0xdd; 32];
     // Redeem script: OP_1 OP_PUSHBYTES_32 <32 bytes>
     let mut redeem = vec![0x51, 0x20];
@@ -1250,10 +1227,37 @@ fn p2sh_wrapped_taproot_rejected() {
     let tx = make_witness_tx(&[vec![0x01; 64]]); // dummy Schnorr sig
 
     let flags = segwit_flags() | ScriptFlags::TAPROOT;
-    let r = verify_script(&script_sig, &spk, &tx, 0, Satoshi::new(100_000), flags);
-    assert!(
-        matches!(r, Err(ScriptError::WitnessMalleatedP2sh)),
-        "P2SH-wrapped taproot must be rejected, got: {r:?}"
+    assert_eq!(
+        verify_script(&script_sig, &spk, &tx, 0, Satoshi::new(100_000), flags),
+        Ok(())
+    );
+    let discouraged = flags | ScriptFlags::DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM;
+    assert_eq!(
+        verify_script(
+            &script_sig,
+            &spk,
+            &tx,
+            0,
+            Satoshi::new(100_000),
+            discouraged
+        ),
+        Err(ScriptError::DiscourageUpgradableWitnessProgram)
+    );
+}
+
+#[test]
+fn p2sh_wrapped_witness_needs_a_canonical_single_push() {
+    let mut redeem = vec![0x00, 0x14];
+    redeem.extend_from_slice(&[0xcc; 20]);
+    let mut spk = vec![0xa9, 0x14];
+    spk.extend_from_slice(&hash160(&redeem));
+    spk.push(0x87);
+    let mut script_sig = vec![0x4c, u8::try_from(redeem.len()).expect("fits")];
+    script_sig.extend_from_slice(&redeem);
+    let tx = make_witness_tx(&[vec![0x01], vec![0x02]]);
+    assert_eq!(
+        verify_script(&script_sig, &spk, &tx, 0, Satoshi::new(1), segwit_flags()),
+        Err(ScriptError::WitnessMalleatedP2sh)
     );
 }
 
@@ -1334,7 +1338,14 @@ fn native_segwit_v0_non_empty_scriptsig_is_malleated() {
     let pkh = [0xbb; 20];
     let spk = p2wpkh_spk(&pkh);
     let tx = make_witness_tx(&[vec![0x01], vec![0x02; 33]]);
-    let r = verify_script(&[0x01, 0xaa], &spk, &tx, 0, Satoshi::new(100), segwit_flags());
+    let r = verify_script(
+        &[0x01, 0xaa],
+        &spk,
+        &tx,
+        0,
+        Satoshi::new(100),
+        segwit_flags(),
+    );
     assert!(
         matches!(r, Err(ScriptError::WitnessMalleated)),
         "native segwit v0 with non-empty scriptSig must be WitnessMalleated, got: {r:?}"

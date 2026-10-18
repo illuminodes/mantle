@@ -570,6 +570,14 @@ impl TaprootSigHashType {
     pub const fn is_valid(self) -> bool {
         matches!(self.0, 0x00 | 0x01 | 0x02 | 0x03 | 0x81 | 0x82 | 0x83)
     }
+
+    /// `true` if a signature of this type can be made for input `n_in` of a
+    /// transaction with `n_outputs` outputs. `SIGHASH_SINGLE` needs an output
+    /// at the input's own index; BIP341 makes the signature invalid otherwise.
+    #[must_use]
+    pub const fn is_signable(self, n_in: usize, n_outputs: usize) -> bool {
+        !matches!(self.output_mode(), SigHashMode::Single) || n_in < n_outputs
+    }
 }
 
 /// Per-transaction cache for the five BIP341 shared hash fields.
@@ -769,10 +777,9 @@ fn compute_bip341_sighash<T: TxView>(
         preimage.extend_from_slice(&h);
     }
 
-    // sha_single_output: emitted *after* annex hash for SIGHASH_SINGLE only.
-    // BIP341 §"Common signature message extension". When `n_in >= n_outputs`,
-    // nothing is appended (this is not the legacy "SIGHASH_SINGLE 1 bug" —
-    // BIP341 simply omits the field).
+    // sha_single_output, after the annex hash. Callers must reject a
+    // SIGHASH_SINGLE signature without a matching output before hashing
+    // (`TaprootSigHashType::is_signable`).
     if out_mode == SigHashMode::Single && n_in < tx.output_count() {
         let out = tx.output(n_in);
         let mut buf = Vec::new();
@@ -836,11 +843,19 @@ impl TapHasher {
     /// Returns `None` if `internal_key` is not a valid secp256k1 x-only point.
     #[must_use]
     pub fn tweak_output_key(internal_key: &[u8; 32], merkle_root: &[u8]) -> Option<[u8; 32]> {
-        use k256::elliptic_curve::bigint::Encoding;
-        use k256::elliptic_curve::ops::Reduce;
+        Self::tweak(internal_key, merkle_root).map(|key| key.x)
+    }
+
+    /// The tweaked output key with the parity of its y-coordinate, as the
+    /// control block commits to it. `None` if `internal_key` is not on the
+    /// curve, the tweak is not below the group order, or the sum is the
+    /// point at infinity.
+    #[must_use]
+    pub fn tweak(internal_key: &[u8; 32], merkle_root: &[u8]) -> Option<TweakedKey> {
+        use k256::elliptic_curve::PrimeField;
         use k256::elliptic_curve::point::AffineCoordinates;
         use k256::schnorr::VerifyingKey as SchnorrVK;
-        use k256::{ProjectivePoint, Scalar, U256};
+        use k256::{FieldBytes, ProjectivePoint, Scalar};
 
         let internal_vk = SchnorrVK::from_bytes(internal_key.into()).ok()?;
         let internal_point: ProjectivePoint = (*internal_vk.as_affine()).into();
@@ -850,12 +865,26 @@ impl TapHasher {
         tweak_input.extend_from_slice(merkle_root);
         let tweak_hash = Schnorr::tagged_hash(b"TapTweak", &tweak_input);
 
-        let tweak_scalar =
-            <Scalar as Reduce<U256>>::reduce(&U256::from_be_bytes(tweak_hash.into()));
-        let output_point = internal_point + ProjectivePoint::mul_by_generator(&tweak_scalar);
-        let x: [u8; 32] = output_point.to_affine().x().into();
-        Some(x)
+        let tweak_scalar: Scalar = Option::from(Scalar::from_repr(FieldBytes::from(tweak_hash)))?;
+        let output_point =
+            (internal_point + ProjectivePoint::mul_by_generator(&tweak_scalar)).to_affine();
+        if output_point == k256::AffinePoint::IDENTITY {
+            return None;
+        }
+        Some(TweakedKey {
+            x: output_point.x().into(),
+            odd_y: output_point.y_is_odd().into(),
+        })
     }
+}
+
+/// A BIP341 tweaked output key: x-only bytes and y parity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TweakedKey {
+    /// x-coordinate, big-endian.
+    pub x: [u8; 32],
+    /// `true` if the y-coordinate is odd.
+    pub odd_y: bool,
 }
 
 #[cfg(test)]

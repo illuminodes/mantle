@@ -16,12 +16,18 @@ fn a_script_without_separators_is_length_prefixed_unchanged() {
 
 #[test]
 fn separators_are_removed_and_the_length_shrinks() {
-    assert_eq!(encoded(&[0xab, 0x76, 0xab, 0xac, 0xab]), vec![2, 0x76, 0xac]);
+    assert_eq!(
+        encoded(&[0xab, 0x76, 0xab, 0xac, 0xab]),
+        vec![2, 0x76, 0xac]
+    );
 }
 
 #[test]
 fn a_separator_byte_inside_push_data_is_kept() {
-    assert_eq!(encoded(&[0x02, 0xab, 0xab, 0xab]), vec![3, 0x02, 0xab, 0xab]);
+    assert_eq!(
+        encoded(&[0x02, 0xab, 0xab, 0xab]),
+        vec![3, 0x02, 0xab, 0xab]
+    );
 }
 
 #[test]

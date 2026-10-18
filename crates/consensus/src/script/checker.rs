@@ -46,10 +46,11 @@ pub trait SignatureChecker {
     /// `sig` is the raw witness item (64 or 65 bytes, already encoding-checked).
     /// `pubkey32` is the x-only pubkey (32 bytes).
     /// `leaf_hash` is the `TapLeaf` hash for this script-path execution.
-    /// `code_sep_pos` is `0xFFFF_FFFF` if no `OP_CODESEPARATOR` has been seen,
-    /// otherwise the byte offset of the last one.
+    /// `code_sep_pos` is `0xFFFF_FFFF` if no `OP_CODESEPARATOR` has run,
+    /// otherwise the opcode index of the last one.
     /// `spent_amount` and `spent_spk` are the UTXO being spent.
     /// `bip341_cache` carries the per-transaction precomputed hash fields.
+    /// `annex` is the annex body without its `0x50` prefix.
     ///
     /// Returns `true` iff the signature verifies.
     #[allow(clippy::too_many_arguments)]
@@ -62,6 +63,7 @@ pub trait SignatureChecker {
         spent_amount: mantle::primitives::Satoshi,
         spent_spk: &[u8],
         bip341_cache: &Bip341Cache,
+        annex: Option<&[u8]>,
     ) -> bool;
 
     /// `OP_CHECKLOCKTIMEVERIFY` — does this transaction's `nLockTime` permit
@@ -188,8 +190,8 @@ impl<T: TxView> SignatureChecker for TxSigChecker<'_, T> {
         spent_amount: mantle::primitives::Satoshi,
         spent_spk: &[u8],
         bip341_cache: &Bip341Cache,
+        annex: Option<&[u8]>,
     ) -> bool {
-        // Encoding check: 64 or 65 bytes.
         let Ok((sig64, hash_type_byte)) = Schnorr::check_sig_encoding(sig) else {
             return false;
         };
@@ -199,7 +201,7 @@ impl<T: TxView> SignatureChecker for TxSigChecker<'_, T> {
         };
 
         let hash_type = TaprootSigHashType(hash_type_byte);
-        if !hash_type.is_valid() {
+        if !hash_type.is_valid() || !hash_type.is_signable(self.n_in, self.tx.output_count()) {
             return false;
         }
 
@@ -209,7 +211,7 @@ impl<T: TxView> SignatureChecker for TxSigChecker<'_, T> {
             spent_spk,
             hash_type,
             bip341_cache,
-            None, // annex handled by caller before reaching here
+            annex,
             Some((*leaf_hash, code_sep_pos)),
         );
 
@@ -269,6 +271,7 @@ impl SignatureChecker for NopSigChecker {
         _spent_amount: mantle::primitives::Satoshi,
         _spent_spk: &[u8],
         _bip341_cache: &Bip341Cache,
+        _annex: Option<&[u8]>,
     ) -> bool {
         false
     }

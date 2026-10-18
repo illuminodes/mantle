@@ -539,14 +539,13 @@ fn verify_taproot_scriptpath_op1(bencher: divan::Bencher) {
     let leaf_version = 0xc0u8;
     let leaf_script = vec![0x51u8]; // OP_1
     let leaf_hash = TapHasher::leaf(leaf_version, &leaf_script);
-    let output_key = TapHasher::tweak_output_key(&internal_key, &leaf_hash).expect("valid key");
+    let tweaked = TapHasher::tweak(&internal_key, &leaf_hash).expect("valid key");
 
     let amount = Satoshi::new(50_000);
     let mut spk = vec![0x51u8, 0x20];
-    spk.extend_from_slice(&output_key);
+    spk.extend_from_slice(&tweaked.x);
 
-    // control_block = (leaf_version | parity=0) || internal_key  (no merkle path)
-    let mut control_block = vec![leaf_version]; // parity bit 0
+    let mut control_block = vec![leaf_version | u8::from(tweaked.odd_y)];
     control_block.extend_from_slice(&internal_key);
 
     let tx = Transaction {

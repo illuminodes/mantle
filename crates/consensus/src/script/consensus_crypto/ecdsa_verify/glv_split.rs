@@ -4,7 +4,10 @@ use k256::elliptic_curve::ff::PrimeField;
 use k256::elliptic_curve::scalar::IsHigh;
 use k256::{FieldBytes, Scalar};
 
-#[expect(clippy::struct_field_names, reason = "each field holds the negated constant")]
+#[expect(
+    clippy::struct_field_names,
+    reason = "each field holds the negated constant"
+)]
 struct GlvLattice {
     neg_lambda: Scalar,
     neg_b1: Scalar,
@@ -58,7 +61,10 @@ impl GlvLattice {
         })
     }
 
-    #[expect(clippy::cast_possible_truncation, reason = "low limb of a 128-bit product")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "low limb of a 128-bit product"
+    )]
     fn rounded_shift_384(k: &[u64; 4], g: &[u64; 4]) -> u128 {
         let mut wide = [0u64; 8];
         for (i, &ki) in k.iter().enumerate() {

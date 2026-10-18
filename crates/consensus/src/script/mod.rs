@@ -30,6 +30,4 @@ pub use num::ScriptNum;
 pub use opcodes::Opcode;
 pub use sig_version::SigVersion;
 pub use stack::{Stack, StackElement};
-pub use verify::{
-    ScriptVerifier, SpentOutputs, verify_script, verify_script_with_spent_outputs,
-};
+pub use verify::{ScriptVerifier, SpentOutputs, verify_script, verify_script_with_spent_outputs};

@@ -10,8 +10,8 @@
 //!  - BIP341 script-path: `OP_1` leaf, wrong output key, bad control block,
 //!    wrong committed script
 //!  - BIP342 tapscript CHECKSIG: valid sign + corrupted sig
-//!  - Structural: empty witness, non-empty scriptSig, P2SH-wrapped taproot,
-//!    TAPROOT flag disabled (unknown witness version tolerance)
+//!  - Structural: empty witness, non-empty scriptSig, P2SH-wrapped v1
+//!    program (unknown witness version), TAPROOT flag disabled
 //!  - Annex: key-path spend with a valid annex item
 
 use mantle::primitives::{
@@ -216,12 +216,10 @@ fn bip340_key_path_empty_witness_fails() {
 fn script_path_single_leaf(internal_key: &[u8; 32], script: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
     let leaf_version: u8 = 0xc0;
     let leaf_hash = TapHasher::leaf(leaf_version, script);
-    let output_key =
-        TapHasher::tweak_output_key(internal_key, &leaf_hash).expect("valid internal key");
-    let spk = taproot_spk(&output_key);
+    let tweaked = TapHasher::tweak(internal_key, &leaf_hash).expect("valid internal key");
+    let spk = taproot_spk(&tweaked.x);
 
-    // Control block: (leaf_version | parity=0) || internal_key  (no merkle path)
-    let mut control_block = vec![leaf_version];
+    let mut control_block = vec![leaf_version | u8::from(tweaked.odd_y)];
     control_block.extend_from_slice(internal_key);
 
     // Witness: [script, control_block]  — no stack inputs for OP_1
@@ -308,11 +306,10 @@ fn bip342_tapscript_checksig_succeeds() {
     let script = checksig_tapscript(&pubkey32);
     let leaf_version: u8 = 0xc0;
     let leaf_hash = TapHasher::leaf(leaf_version, &script);
-    let output_key =
-        TapHasher::tweak_output_key(&internal_key, &leaf_hash).expect("valid internal key");
-    let spk = taproot_spk(&output_key);
+    let tweaked = TapHasher::tweak(&internal_key, &leaf_hash).expect("valid internal key");
+    let spk = taproot_spk(&tweaked.x);
 
-    let mut control_block = vec![leaf_version];
+    let mut control_block = vec![leaf_version | u8::from(tweaked.odd_y)];
     control_block.extend_from_slice(&internal_key);
 
     let amount = Satoshi::new(300_000);
@@ -344,11 +341,10 @@ fn bip342_tapscript_checksig_wrong_sig_fails() {
     let script = checksig_tapscript(&pubkey32);
     let leaf_version: u8 = 0xc0;
     let leaf_hash = TapHasher::leaf(leaf_version, &script);
-    let output_key =
-        TapHasher::tweak_output_key(&internal_key, &leaf_hash).expect("valid internal key");
-    let spk = taproot_spk(&output_key);
+    let tweaked = TapHasher::tweak(&internal_key, &leaf_hash).expect("valid internal key");
+    let spk = taproot_spk(&tweaked.x);
 
-    let mut control_block = vec![leaf_version];
+    let mut control_block = vec![leaf_version | u8::from(tweaked.odd_y)];
     control_block.extend_from_slice(&internal_key);
 
     let amount = Satoshi::new(300_000);
@@ -408,8 +404,7 @@ fn taproot_nonempty_scriptsig_is_malleated() {
 }
 
 #[test]
-fn p2sh_wrapped_taproot_is_rejected() {
-    // BIP341: taproot MAY NOT be wrapped in P2SH.
+fn p2sh_wrapped_v1_program_is_an_unknown_witness_version() {
     let internal_key = schnorr_pubkey(&[0x42u8; 32]);
     let output_key = key_path_output_key(&internal_key);
     let taproot_spk_bytes = taproot_spk(&output_key);
@@ -449,8 +444,8 @@ fn p2sh_wrapped_taproot_is_rejected() {
             Satoshi::new(100_000),
             taproot_flags()
         )
-        .is_err(),
-        "P2SH-wrapped taproot must be rejected"
+        .is_ok(),
+        "BIP341 applies only to native v1 outputs; wrapped ones are an unknown version"
     );
 }
 

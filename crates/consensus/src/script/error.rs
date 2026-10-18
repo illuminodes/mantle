@@ -97,6 +97,15 @@ pub enum ScriptError {
     SchnorrSigHashType,
     /// Schnorr signature failed verification.
     SchnorrSigInvalidFormat,
+    /// A non-empty Schnorr signature did not verify (BIP340).
+    SchnorrSig,
+    /// Tapscript signature checks used more than the input's validation
+    /// weight budget (BIP342).
+    TapscriptValidationWeight,
+    /// `OP_CHECKMULTISIG` / `OP_CHECKMULTISIGVERIFY` executed in tapscript.
+    TapscriptCheckMultisig,
+    /// A tapscript signature opcode was given an empty public key.
+    TapscriptEmptyPubkey,
     /// x-only public key is not exactly 32 bytes.
     XOnlyPubkeySize,
     /// x-only public key does not correspond to a valid secp256k1 point.

@@ -15,7 +15,17 @@
 //!    - P2WSH (`OP_0 <32 bytes>`): hash-check the witness script, then eval it.
 //! 7. Optional `CLEANSTACK` check — exactly one item must remain.
 
+mod redeem_push;
+mod tapscript_scan;
+mod witness_size;
+
 use mantle::primitives::{Hash256, Satoshi};
+
+use redeem_push::RedeemPush;
+use tapscript_scan::TapscriptScan;
+use witness_size::WitnessSize;
+
+const TAPSCRIPT_LEAF_VERSION: u8 = 0xc0;
 
 use super::cache::ScriptExecutionCache;
 use super::checker::{SignatureChecker, TxSigChecker};
@@ -594,23 +604,26 @@ fn verify_script_inner<T: TxView>(
 
     if flags.contains(ScriptFlags::WITNESS) {
         if let Some((version, program)) = witness_program {
-            // Native segwit: scriptSig must be empty (otherwise it's malleable).
-            // For P2SH-wrapped witness the outer scriptSig is allowed, but must
-            // be exactly `<push of redeem>` — already checked above by is_push_only.
+            // Native segwit needs an empty scriptSig. P2SH-wrapped segwit needs
+            // a scriptSig that is exactly one canonical push of the redeem
+            // script.
             let is_p2sh_wrapped = is_p2sh(script_pubkey);
-            if !is_p2sh_wrapped && !script_sig.is_empty() {
+            if is_p2sh_wrapped {
+                if !RedeemPush::is_sole_canonical_push(script_sig) {
+                    return Err(ScriptError::WitnessMalleatedP2sh);
+                }
+            } else if !script_sig.is_empty() {
                 return Err(ScriptError::WitnessMalleated);
             }
             let witness_items = tx.input(n_in).witness().to_vec();
 
             if version == 0 {
                 run_witness_v0(&program, &witness_items, tx, n_in, amount, flags, bufs)?;
-            } else if version == 1 && program.len() == 32 && flags.contains(ScriptFlags::TAPROOT) {
-                // BIP341 taproot (witness v1, 32-byte program).
-                // P2SH-wrapped taproot is not valid — BIP341 §"Script validation rules".
-                if is_p2sh(script_pubkey) {
-                    return Err(ScriptError::WitnessMalleatedP2sh);
-                }
+            } else if version == 1
+                && program.len() == 32
+                && !is_p2sh_wrapped
+                && flags.contains(ScriptFlags::TAPROOT)
+            {
                 run_taproot(
                     program.as_slice().try_into().expect("len==32"),
                     &witness_items,
@@ -718,6 +731,9 @@ fn run_taproot<T: TxView>(
             if !hash_type.is_valid() {
                 return Err(ScriptError::SchnorrSigHashType);
             }
+            if !hash_type.is_signable(n_in, tx.output_count()) {
+                return Err(ScriptError::SchnorrSigHashType);
+            }
 
             // Annex is included in sighash for key-path too.
             let annex_body = annex.map(|a| &a[1..]); // strip 0x50 prefix byte
@@ -755,17 +771,10 @@ fn run_taproot<T: TxView>(
                 return Err(ScriptError::TaprootWrongControlSize);
             }
 
-            let leaf_version_parity = control_block[0];
-            let leaf_version = leaf_version_parity & 0xfe; // strip parity bit
+            let leaf_version = control_block[0] & 0xfe;
+            let odd_y = control_block[0] & 0x01 == 0x01;
             let internal_key: &[u8; 32] = control_block[1..33].try_into().expect("slice is 32");
 
-            if leaf_version != 0xc0
-                && flags.contains(ScriptFlags::DISCOURAGE_UPGRADABLE_TAPROOT_VERSION)
-            {
-                return Err(ScriptError::DiscourageUpgradableTaprootVersion);
-            }
-
-            // Compute leaf hash.
             let leaf_hash = TapHasher::leaf(leaf_version, script_item);
 
             // Compute merkle root by walking the path.
@@ -785,48 +794,51 @@ fn run_taproot<T: TxView>(
                 current
             };
 
-            // Verify the tweaked output key commits to (internal_key, merkle_root).
-            let expected_output_key = TapHasher::tweak_output_key(internal_key, &merkle_root)
-                .ok_or(ScriptError::XOnlyPubkeyTweak)?;
-            if &expected_output_key != program32 {
+            let tweaked = TapHasher::tweak(internal_key, &merkle_root)
+                .ok_or(ScriptError::WitnessProgramMismatchTaproot)?;
+            if &tweaked.x != program32 || tweaked.odd_y != odd_y {
                 return Err(ScriptError::WitnessProgramMismatchTaproot);
             }
 
-            // Execute the tapscript.
-            run_tapscript(
-                script_item,
-                stack_items,
+            if leaf_version != TAPSCRIPT_LEAF_VERSION {
+                if flags.contains(ScriptFlags::DISCOURAGE_UPGRADABLE_TAPROOT_VERSION) {
+                    return Err(ScriptError::DiscourageUpgradableTaprootVersion);
+                }
+                return Ok(());
+            }
+
+            if TapscriptScan::of(script_item)? == TapscriptScan::HasOpSuccess {
+                return Ok(());
+            }
+
+            let ctx = TapscriptCtx {
                 leaf_hash,
-                tx,
-                n_in,
-                amount,
-                spent_spk,
-                flags,
+                spent_amount: amount,
+                spent_spk: spent_spk.to_vec(),
                 bip341_cache,
-                bufs,
-            )
+                annex: annex.map(|a| a[1..].to_vec()),
+                weight_left: TapscriptCtx::BUDGET_OFFSET
+                    + i64::try_from(WitnessSize::of(witness_items)).unwrap_or(i64::MAX),
+                codesep_opcode_pos: u32::MAX,
+            };
+            run_tapscript(script_item, stack_items, ctx, tx, n_in, amount, flags, bufs)
         }
 
         _ => Err(ScriptError::WitnessProgramMismatch),
     }
 }
 
-/// Execute a tapscript (BIP342).
-///
-/// `stack_items` are the witness items that become the initial stack.
-/// `leaf_hash` is the `TapLeaf` hash for this leaf. The script runs under
-/// `SigVersion::Tapscript` rules.
+/// Execute a tapscript (BIP342) that has already been checked for
+/// `OP_SUCCESSx`. `stack_items` become the initial stack.
 #[allow(clippy::too_many_arguments)]
 fn run_tapscript<T: TxView>(
     script: &[u8],
     stack_items: &[Vec<u8>],
-    leaf_hash: [u8; 32],
+    ctx: TapscriptCtx,
     tx: &T,
     n_in: usize,
     amount: Satoshi,
-    spent_spk: &[u8],
     flags: ScriptFlags,
-    bip341_cache: Bip341Cache,
     bufs: &mut (Vec<InterpStackElement>, Vec<InterpStackElement>),
 ) -> Result<(), ScriptError> {
     let checker = TxSigChecker::new(tx, n_in, amount, flags);
@@ -839,15 +851,12 @@ fn run_tapscript<T: TxView>(
         stack_buf,
         altstack_buf,
     );
-    interp.tapscript = Some(TapscriptCtx {
-        leaf_hash,
-        spent_amount: amount,
-        spent_spk: spent_spk.to_vec(),
-        bip341_cache,
-    });
+    interp.tapscript = Some(ctx);
 
     let result = (|| {
-        // Push the initial stack items bottom-to-top.
+        if stack_items.len() > crate::script::stack::MAX_STACK_SIZE {
+            return Err(ScriptError::StackSize);
+        }
         for item in stack_items {
             interp.stack_mut().push_checked(item, 0)?;
         }

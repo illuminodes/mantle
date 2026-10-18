@@ -49,6 +49,21 @@ pub(super) struct TapscriptCtx {
     pub spent_spk: Vec<u8>,
     /// Per-transaction BIP341 cache (shared across inputs).
     pub bip341_cache: Bip341Cache,
+    /// Annex body without its `0x50` prefix, if the witness carried one.
+    pub annex: Option<Vec<u8>>,
+    /// Signature-check budget left (BIP342 validation weight).
+    pub weight_left: i64,
+    /// Opcode index of the last executed `OP_CODESEPARATOR`, or
+    /// `0xFFFF_FFFF` when none has run.
+    pub codesep_opcode_pos: u32,
+}
+
+impl TapscriptCtx {
+    /// Weight charged for each signature check with a non-empty signature.
+    pub const SIGOPS_COST: i64 = 50;
+    /// Fixed addition to the serialized witness size when computing the
+    /// initial budget.
+    pub const BUDGET_OFFSET: i64 = 50;
 }
 
 /// Dispatch loop and execution state for a single script invocation.
@@ -154,8 +169,20 @@ impl<'a, C: SignatureChecker> Interpreter<'a, C> {
         self.op_count = 0;
         self.conditions.clear();
 
+        if let Some(ctx) = &mut self.tapscript {
+            ctx.codesep_opcode_pos = u32::MAX;
+        }
+        let mut opcode_pos: u32 = 0;
         let mut reader = ScriptReader::new(script);
         while let Some(step) = reader.next_step()? {
+            let this_opcode = opcode_pos;
+            opcode_pos = opcode_pos.wrapping_add(1);
+            if step.opcode == Opcode::CodeSeparator
+                && self.conditions.executing()
+                && let Some(ctx) = &mut self.tapscript
+            {
+                ctx.codesep_opcode_pos = this_opcode;
+            }
             // Snapshot the cursor *after* the opcode body has been consumed.
             // For OP_CODESEPARATOR this is the offset of the next byte —
             // exactly what BIP / Core record. For CHECKSIG it's the offset
@@ -185,26 +212,15 @@ impl<'a, C: SignatureChecker> Interpreter<'a, C> {
         pos_after_step: usize,
         step: Step<'_>,
     ) -> Result<(), ScriptError> {
-        // Always-fail opcodes: rejected even when reached only inside an
-        // unexecuted `OP_IF` branch. Inlined here so we don't pay for a
-        // separate pre-scan walk of the script.
-        // - VERIF / VERNOTIF: rejected in every script version.
-        // - The legacy disabled set (CAT/SUBSTR/LEFT/RIGHT/INVERT/AND/OR/XOR/
-        //   2MUL/2DIV/MUL/DIV/MOD/LSHIFT/RSHIFT): rejected unconditionally
-        //   under SigVersion::Base. Under Tapscript they only fail when
-        //   executed (not in unexecuted branches) — handled in dispatch.
-        // - OP_SUCCESSx (BIP342): if any such opcode appears *anywhere* in a
-        //   tapscript (even in an unexecuted branch), the whole script
-        //   succeeds immediately.
+        // VERIF / VERNOTIF and, outside tapscript, the disabled opcodes fail
+        // even in an unexecuted branch. A tapscript that reaches here has
+        // already been scanned for OP_SUCCESSx, which covers every disabled
+        // opcode.
         if step.flags.is_verif_class() {
             return Err(ScriptError::BadOpcodeReserved);
         }
 
-        if self.sig_version == SigVersion::Tapscript {
-            if step.opcode.is_tapscript_success() {
-                return Ok(());
-            }
-        } else {
+        if self.sig_version != SigVersion::Tapscript {
             if step.opcode.is_disabled() {
                 return Err(ScriptError::DisabledOpcode);
             }
@@ -379,7 +395,7 @@ impl<'a, C: SignatureChecker> Interpreter<'a, C> {
             // ── Tapscript (M3) ───────────────────────────────────────────────
             Opcode::CheckSigAdd => {
                 if self.sig_version == SigVersion::Tapscript {
-                    self.op_check_sig_add(script)
+                    self.op_check_sig_add()
                 } else {
                     // Outside tapscript this byte is OP_INVALIDOPCODE.
                     Err(ScriptError::BadOpcode)

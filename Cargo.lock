@@ -767,6 +767,7 @@ dependencies = [
  "mantle-consensus",
  "proptest",
  "ripemd",
+ "serde_json",
  "sha2",
 ]
 

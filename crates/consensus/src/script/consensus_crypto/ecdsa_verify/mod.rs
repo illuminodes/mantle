@@ -48,8 +48,16 @@ impl EcdsaVerifier {
         let q_table = OddMultiples::<8>::of(q);
         let q_lambda_table = q_table.endomorphism();
         let digits = [
-            WnafDigits::new(g_split.halves[0], g_split.negative[0], GeneratorTables::WINDOW),
-            WnafDigits::new(g_split.halves[1], g_split.negative[1], GeneratorTables::WINDOW),
+            WnafDigits::new(
+                g_split.halves[0],
+                g_split.negative[0],
+                GeneratorTables::WINDOW,
+            ),
+            WnafDigits::new(
+                g_split.halves[1],
+                g_split.negative[1],
+                GeneratorTables::WINDOW,
+            ),
             WnafDigits::new(q_split.halves[0], q_split.negative[0], Self::KEY_WINDOW),
             WnafDigits::new(q_split.halves[1], q_split.negative[1], Self::KEY_WINDOW),
         ];

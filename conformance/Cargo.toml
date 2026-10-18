@@ -20,6 +20,9 @@ k256 = { workspace = true, features = ["ecdsa", "schnorr", "arithmetic"] }
 sha2 = { workspace = true }
 ripemd = { workspace = true }
 
+[dev-dependencies]
+serde_json = "1"
+
 [[test]]
 name = "bip_vectors"
 path = "tests/bip_vectors/mod.rs"
@@ -27,3 +30,7 @@ path = "tests/bip_vectors/mod.rs"
 [[test]]
 name = "proptest"
 path = "tests/proptest.rs"
+
+[[test]]
+name = "script_assets"
+path = "tests/script_assets/main.rs"

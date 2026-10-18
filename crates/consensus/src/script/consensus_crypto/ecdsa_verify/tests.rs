@@ -25,7 +25,8 @@ impl Case {
     }
 
     fn signed(i: u32) -> Self {
-        let sk = SigningKey::from_bytes(&FieldBytes::from(Self::hashed("key", i))).expect("valid key");
+        let sk =
+            SigningKey::from_bytes(&FieldBytes::from(Self::hashed("key", i))).expect("valid key");
         let digest = Self::hashed("msg", i);
         let sig: Signature = sk.sign_prehash(&digest).expect("sign");
         Self {
@@ -53,14 +54,24 @@ fn double_scalar_mul_matches_naive_sum() {
         let u2 = Case::scalar("u2", i);
         let q = ProjectivePoint::GENERATOR * Case::scalar("q", i);
         let expected = ProjectivePoint::GENERATOR * u1 + q * u2;
-        assert_eq!(EcdsaVerifier::double_scalar_mul(&u1, &u2, &q), expected, "case {i}");
+        assert_eq!(
+            EcdsaVerifier::double_scalar_mul(&u1, &u2, &q),
+            expected,
+            "case {i}"
+        );
     }
 }
 
 #[test]
 fn double_scalar_mul_handles_edge_scalars() {
     let q = ProjectivePoint::GENERATOR * Case::scalar("q", 0);
-    let edges = [Scalar::ZERO, Scalar::ONE, -Scalar::ONE, Scalar::from(2u64), -Scalar::from(2u64)];
+    let edges = [
+        Scalar::ZERO,
+        Scalar::ONE,
+        -Scalar::ONE,
+        Scalar::from(2u64),
+        -Scalar::from(2u64),
+    ];
     for u1 in edges {
         for u2 in edges {
             let expected = ProjectivePoint::GENERATOR * u1 + q * u2;
@@ -112,6 +123,16 @@ fn rejects_what_k256_rejects() {
 fn rejects_zero_scalars() {
     let case = Case::signed(0);
     let (r, s) = case.sig.split_scalars();
-    assert!(!EcdsaVerifier::verify(&case.q, &case.digest, &Scalar::ZERO, &s));
-    assert!(!EcdsaVerifier::verify(&case.q, &case.digest, &r, &Scalar::ZERO));
+    assert!(!EcdsaVerifier::verify(
+        &case.q,
+        &case.digest,
+        &Scalar::ZERO,
+        &s
+    ));
+    assert!(!EcdsaVerifier::verify(
+        &case.q,
+        &case.digest,
+        &r,
+        &Scalar::ZERO
+    ));
 }

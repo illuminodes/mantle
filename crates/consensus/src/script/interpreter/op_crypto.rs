@@ -17,6 +17,7 @@ use crate::script::consensus_crypto::Ecdsa;
 use crate::script::error::ScriptError;
 use crate::script::flags::ScriptFlags;
 use crate::script::sig_version::SigVersion;
+
 use crate::script::sighash::{FindAndDelete, script_code_after_codeseparator};
 
 use super::Interpreter;
@@ -80,16 +81,55 @@ impl<C: SignatureChecker> Interpreter<'_, C> {
         Ok(())
     }
 
+    /// BIP342 signature check shared by `OP_CHECKSIG`, `OP_CHECKSIGVERIFY`
+    /// and `OP_CHECKSIGADD`. Returns whether a signature was supplied.
+    ///
+    /// - A non-empty signature costs [`TapscriptCtx::SIGOPS_COST`] from the
+    ///   validation weight budget; overspending fails the script.
+    /// - An empty pubkey fails the script.
+    /// - A 32-byte pubkey with a non-empty signature must verify, or the
+    ///   script fails.
+    /// - Any other pubkey size is an unknown key type: the check succeeds.
+    ///
+    /// [`TapscriptCtx::SIGOPS_COST`]: super::TapscriptCtx::SIGOPS_COST
+    fn check_tapscript_sig(&mut self, sig: &[u8], pubkey: &[u8]) -> Result<bool, ScriptError> {
+        let Some(ctx) = &mut self.tapscript else {
+            return Err(ScriptError::BadOpcode);
+        };
+        let signed = !sig.is_empty();
+        if signed {
+            ctx.weight_left -= super::TapscriptCtx::SIGOPS_COST;
+            if ctx.weight_left < 0 {
+                return Err(ScriptError::TapscriptValidationWeight);
+            }
+        }
+        match pubkey.len() {
+            0 => Err(ScriptError::TapscriptEmptyPubkey),
+            32 if signed => {
+                let ok = self.checker.check_schnorr_sig(
+                    sig,
+                    pubkey,
+                    &ctx.leaf_hash,
+                    ctx.codesep_opcode_pos,
+                    ctx.spent_amount,
+                    &ctx.spent_spk,
+                    &ctx.bip341_cache,
+                    ctx.annex.as_deref(),
+                );
+                if ok {
+                    Ok(true)
+                } else {
+                    Err(ScriptError::SchnorrSig)
+                }
+            }
+            _ => Ok(signed),
+        }
+    }
+
     /// `OP_CHECKSIG` (and `OP_CHECKSIGVERIFY` when `verify` is `true`).
     ///
-    /// In legacy and segwit-v0 regimes: pops `pubkey`, then `sig`, computes
-    /// the scriptCode from `last_codeseparator`, and calls
-    /// `SignatureChecker::check_ecdsa_sig`.
-    ///
-    /// In tapscript (BIP342): uses Schnorr verification via
-    /// `SignatureChecker::check_schnorr_sig`. An empty sig is a clean failure
-    /// (pushes false); unknown pubkey type (not 32 bytes) is a NOP (push false,
-    /// no error). Under `NULLFAIL`, a non-empty sig that fails is an error.
+    /// Legacy and segwit-v0: ECDSA over the scriptCode sliced from
+    /// `last_codeseparator`. Tapscript: see [`Self::check_tapscript_sig`].
     pub(super) fn op_check_sig(&mut self, script: &[u8], verify: bool) -> Result<(), ScriptError> {
         use crate::script::sig_version::SigVersion;
 
@@ -97,38 +137,7 @@ impl<C: SignatureChecker> Interpreter<'_, C> {
         let sig = self.stack.pop()?;
 
         let ok = if self.sig_version == SigVersion::Tapscript {
-            // BIP342: OP_CHECKSIG uses Schnorr over x-only pubkeys.
-            // Unknown pubkey type (not 32 bytes) → NOP (push false, no error).
-            if pubkey.as_slice().len() != 32 {
-                self.stack.push_bool(false, self.altstack.len())?;
-                return Ok(());
-            }
-            // Empty sig → clean failure (not a NULLFAIL error).
-            if sig.is_empty() {
-                self.stack.push_bool(false, self.altstack.len())?;
-                return Ok(());
-            }
-            let Some(ctx) = &self.tapscript else {
-                return Err(ScriptError::BadOpcode);
-            };
-            let leaf_hash = ctx.leaf_hash;
-            let code_sep_pos = u32::try_from(self.last_codeseparator).unwrap_or(0xffff_ffff);
-            let spent_amount = ctx.spent_amount;
-            let spent_spk = ctx.spent_spk.clone();
-            let bip341_cache = ctx.bip341_cache.clone();
-            let ok = self.checker.check_schnorr_sig(
-                sig.as_slice(),
-                pubkey.as_slice(),
-                &leaf_hash,
-                code_sep_pos,
-                spent_amount,
-                &spent_spk,
-                &bip341_cache,
-            );
-            if !ok && self.flags.contains(ScriptFlags::NULLFAIL) {
-                return Err(ScriptError::SigNullFail);
-            }
-            ok
+            self.check_tapscript_sig(sig.as_slice(), pubkey.as_slice())?
         } else {
             // Legacy / segwit-v0: ECDSA path.
             Ecdsa::check_sig_encoding(sig.as_slice(), self.flags)?;
@@ -162,12 +171,10 @@ impl<C: SignatureChecker> Interpreter<'_, C> {
 
     /// `OP_CHECKSIGADD` — BIP342 tapscript only.
     ///
-    /// Stack on entry (top to bottom): `pubkey`, `n`, `sig`.
-    /// - If `pubkey` is empty, push `n` unchanged (unknown pubkey type = NOP).
-    /// - If `sig` is empty, push `n` unchanged (no signature = count stays).
-    /// - Otherwise verify the Schnorr signature and push `n + 1` on success,
-    ///   `n` on failure. Under `NULLFAIL`, a non-empty sig that fails is an error.
-    pub(super) fn op_check_sig_add(&mut self, _script: &[u8]) -> Result<(), ScriptError> {
+    /// Stack on entry (top to bottom): `pubkey`, `n`, `sig`. Pushes `n + 1`
+    /// when a signature was supplied and accepted, `n` for an empty
+    /// signature. Failures follow [`Self::check_tapscript_sig`].
+    pub(super) fn op_check_sig_add(&mut self) -> Result<(), ScriptError> {
         use crate::script::num::ScriptNum;
 
         let pubkey = self.stack.pop()?;
@@ -181,48 +188,9 @@ impl<C: SignatureChecker> Interpreter<'_, C> {
         )?
         .to_i64();
 
-        // Unknown pubkey type (empty) — push n unchanged. BIP342 §"Rules".
-        if pubkey.is_empty() {
-            return self.stack.push_num(n, self.altstack.len());
-        }
-
-        // Pubkey must be 32 bytes (x-only).
-        if pubkey.as_slice().len() != 32 {
-            return Err(ScriptError::XOnlyPubkeySize);
-        }
-
-        // Empty sig → no contribution, push n unchanged.
-        if sig.is_empty() {
-            return self.stack.push_num(n, self.altstack.len());
-        }
-
-        // Verify the Schnorr signature using the tapscript context.
-        let Some(ctx) = &self.tapscript else {
-            // Should not be reachable — tapscript context must be set.
-            return Err(ScriptError::BadOpcode);
-        };
-        let leaf_hash = ctx.leaf_hash;
-        let code_sep_pos = u32::try_from(self.last_codeseparator).unwrap_or(0xffff_ffff);
-        let spent_amount = ctx.spent_amount;
-        let spent_spk = ctx.spent_spk.clone();
-        let bip341_cache = ctx.bip341_cache.clone();
-
-        let ok = self.checker.check_schnorr_sig(
-            sig.as_slice(),
-            pubkey.as_slice(),
-            &leaf_hash,
-            code_sep_pos,
-            spent_amount,
-            &spent_spk,
-            &bip341_cache,
-        );
-
-        if !ok && self.flags.contains(ScriptFlags::NULLFAIL) {
-            return Err(ScriptError::TaprootChecksigAdd);
-        }
-
-        let new_n = if ok { n.saturating_add(1) } else { n };
-        self.stack.push_num(new_n, self.altstack.len())
+        let signed = self.check_tapscript_sig(sig.as_slice(), pubkey.as_slice())?;
+        self.stack
+            .push_num(n + i64::from(signed), self.altstack.len())
     }
 
     /// `OP_CHECKMULTISIG` (and `OP_CHECKMULTISIGVERIFY` when `verify`).
@@ -241,6 +209,9 @@ impl<C: SignatureChecker> Interpreter<'_, C> {
         script: &[u8],
         verify: bool,
     ) -> Result<(), ScriptError> {
+        if self.sig_version == SigVersion::Tapscript {
+            return Err(ScriptError::TapscriptCheckMultisig);
+        }
         let n_pubkeys_i = self
             .stack
             .pop_num(4, self.flags.contains(ScriptFlags::MINIMALDATA))?;

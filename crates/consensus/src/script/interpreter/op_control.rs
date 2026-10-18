@@ -8,6 +8,7 @@
 use crate::script::checker::SignatureChecker;
 use crate::script::error::ScriptError;
 use crate::script::flags::ScriptFlags;
+use crate::script::sig_version::SigVersion;
 
 use super::Interpreter;
 
@@ -17,12 +18,11 @@ impl<C: SignatureChecker> Interpreter<'_, C> {
     pub(super) fn op_if(&mut self, negated: bool) -> Result<(), ScriptError> {
         let executing_branch = if self.conditions.executing() {
             let top = self.stack.peek(0)?;
-            if self.flags.contains(ScriptFlags::MINIMALIF) {
-                // MINIMALIF: the operand must be exactly the empty push or [0x01].
-                let ok = top.is_empty() || (top.len() == 1 && top[0] == 0x01);
-                if !ok {
-                    return Err(ScriptError::MinimalIf);
-                }
+            let minimal_required = self.sig_version == SigVersion::Tapscript
+                || (self.sig_version == SigVersion::WitnessV0
+                    && self.flags.contains(ScriptFlags::MINIMALIF));
+            if minimal_required && !(top.is_empty() || (top.len() == 1 && top[0] == 0x01)) {
+                return Err(ScriptError::MinimalIf);
             }
             let cond = top.is_truthy();
             self.stack.pop()?; // discard the operand
@@ -32,9 +32,7 @@ impl<C: SignatureChecker> Interpreter<'_, C> {
             // so the body remains skipped regardless.
             false
         };
-        if !self.conditions.push(executing_branch) {
-            return Err(ScriptError::UnbalancedConditional);
-        }
+        self.conditions.push(executing_branch);
         Ok(())
     }
 
@@ -49,7 +47,6 @@ impl<C: SignatureChecker> Interpreter<'_, C> {
     pub(super) fn op_endif(&mut self) -> Result<(), ScriptError> {
         self.conditions
             .pop()
-            .map(|_| ())
             .ok_or(ScriptError::UnbalancedConditional)
     }
 

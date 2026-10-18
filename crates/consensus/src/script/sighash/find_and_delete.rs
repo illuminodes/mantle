@@ -58,7 +58,10 @@ impl FindAndDelete {
         let (header, payload) = match op {
             0x00..=0x4b => (0, usize::from(op)),
             0x4c => (1, usize::from(*tail.first()?)),
-            0x4d => (2, usize::from(u16::from_le_bytes(tail.get(..2)?.try_into().ok()?))),
+            0x4d => (
+                2,
+                usize::from(u16::from_le_bytes(tail.get(..2)?.try_into().ok()?)),
+            ),
             0x4e => (
                 4,
                 usize::try_from(u32::from_le_bytes(tail.get(..4)?.try_into().ok()?)).ok()?,
