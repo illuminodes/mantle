@@ -688,6 +688,8 @@ impl Bip341Cache {
 ///
 /// # Panics
 /// Panics if `n_in >= tx.inputs.len()`.
+const TAPSCRIPT_KEY_VERSION: u8 = 0x00;
+
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 fn compute_bip341_sighash<T: TxView>(
@@ -785,6 +787,7 @@ fn compute_bip341_sighash<T: TxView>(
     // Script-path extension.
     if let Some((leaf_hash, code_sep_pos)) = leaf_hash_code_sep {
         preimage.extend_from_slice(&leaf_hash);
+        preimage.push(TAPSCRIPT_KEY_VERSION);
         preimage.extend_from_slice(&code_sep_pos.to_le_bytes());
     }
 

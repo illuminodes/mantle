@@ -20,10 +20,11 @@ pub const MAX_SCRIPT_SIZE: usize = 10_000;
 /// Run pre-execution checks. O(1).
 ///
 /// # Errors
-/// `ScriptSize` if the script exceeds 10000 bytes.
+/// `ScriptSize` if a legacy or segwit-v0 script exceeds 10000 bytes.
+/// Tapscript has no size limit (BIP342).
 #[inline]
-pub fn pre_scan(script: &[u8], _sig_version: SigVersion) -> Result<(), ScriptError> {
-    if script.len() > MAX_SCRIPT_SIZE {
+pub fn pre_scan(script: &[u8], sig_version: SigVersion) -> Result<(), ScriptError> {
+    if sig_version != SigVersion::Tapscript && script.len() > MAX_SCRIPT_SIZE {
         return Err(ScriptError::ScriptSize);
     }
     Ok(())
@@ -47,6 +48,16 @@ mod tests {
         ));
         let ok = vec![0x00u8; MAX_SCRIPT_SIZE];
         assert!(pre_scan(&ok, SigVersion::Base).is_ok());
+    }
+
+    #[test]
+    fn tapscript_has_no_size_cap() {
+        let long = vec![0x61u8; MAX_SCRIPT_SIZE * 13];
+        assert!(pre_scan(&long, SigVersion::Tapscript).is_ok());
+        assert!(matches!(
+            pre_scan(&long, SigVersion::WitnessV0),
+            Err(ScriptError::ScriptSize)
+        ));
     }
 
     #[test]
