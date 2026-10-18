@@ -15,7 +15,9 @@
 //! curve work and add the consensus-encoding rules `k256` does not enforce
 //! on its own.
 
-use k256::ecdsa::signature::hazmat::PrehashVerifier;
+mod ecdsa_verify;
+
+use k256::ProjectivePoint;
 use k256::ecdsa::{Signature as EcdsaSig, VerifyingKey};
 use k256::schnorr::signature::hazmat::PrehashVerifier as SchnorrPrehashVerifier;
 use k256::schnorr::{Signature as SchnorrSig, VerifyingKey as SchnorrVerifyingKey};
@@ -24,6 +26,7 @@ use sha2::{Digest, Sha256};
 use super::error::ScriptError;
 use super::flags::ScriptFlags;
 use super::lax_der::LaxDer;
+use ecdsa_verify::EcdsaVerifier;
 
 /// Half the curve order, in big-endian. `s` values strictly above this are
 /// rejected under `SCRIPT_VERIFY_LOW_S`. Source: BIP146 (the constant is the
@@ -125,8 +128,9 @@ impl Ecdsa {
         let Ok(vk) = VerifyingKey::from_sec1_bytes(pubkey_bytes) else {
             return false;
         };
-        let normalised = sig.normalize_s();
-        vk.verify_prehash(sighash, &normalised).is_ok()
+        let (r, s) = sig.split_scalars();
+        let q = ProjectivePoint::from(*vk.as_affine());
+        EcdsaVerifier::verify(&q, sighash, &r, &s)
     }
 
     /// Hand-rolled BIP66 strict-DER validator.

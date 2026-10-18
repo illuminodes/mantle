@@ -29,6 +29,10 @@ name = "script"
 harness = false
 
 [[bench]]
+name = "crypto"
+harness = false
+
+[[bench]]
 name = "storage"
 harness = false
 
