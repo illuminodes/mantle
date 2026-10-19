@@ -48,7 +48,7 @@ full-chain-verify:
       --progress-secs "$VERIFY_PROGRESS_SECS"
       $STOP_ARGS
       2>&1 | tee "$VERIFY_DIR/replay.log"
-      | grep --line-buffered -E 'replaying|got [0-9]+ headers|at tip|treating as tip|CONSENSUS FAILURE|^ *\[ *[0-9]+/|fatal|complete|consensus failures|^  (structure|context|connect) |removed ephemeral|saved failing block|^  window |fetch retry'
+      | grep --line-buffered -E 'replaying|got [0-9]+ headers|at tip|treating as tip|CONSENSUS FAILURE|^ *\[ *[0-9]+/|fatal|complete|consensus failures|^  (structure|context|connect) |removed ephemeral|saved failing block|^  window |fetch retry|panicked|[Ee]rror|Killed|out of memory'
   after_script:
     - pkill -f "$CI_PROJECT_DIR/target/.*/mantle-replay" || true
     - rm -rf "$CI_PROJECT_DIR/verify-run/chain"
