@@ -11,7 +11,12 @@ use crate::validation::{Clock, HeaderContextExt, HeaderValidationExt};
 /// the retarget rules require, passes the timestamp and version rules, and
 /// agrees with the network checkpoint. A branch replaces held headers only
 /// when it carries more work than they do.
+///
+/// The chain may hold only a tail: `headers[0]` sits at `base`, and its
+/// work entry is the total work from genesis through it. Headers below the
+/// base are not held, so a branch must attach above it.
 pub struct HeaderChain {
+    base: BlockHeight,
     headers: Vec<BlockHeader>,
     work: Vec<ChainWork>,
     heights: PrehashedMap<Hash256, BlockHeight>,
@@ -36,16 +41,90 @@ impl HeaderChain {
 
     #[must_use]
     pub fn from_genesis(genesis: BlockHeader, allow_min_difficulty: bool) -> Self {
+        Self::single(BlockHeight::ZERO, ChainWork::of_header(&genesis), genesis, allow_min_difficulty)
+    }
+
+    fn single(base: BlockHeight, work: ChainWork, header: BlockHeader, allow_min_difficulty: bool) -> Self {
         let mut heights = PrehashedMap::default();
-        heights.insert(genesis.hash(), BlockHeight::ZERO);
+        heights.insert(header.hash(), base);
         Self {
-            work: vec![ChainWork::of_header(&genesis)],
-            headers: vec![genesis],
+            base,
+            headers: vec![header],
+            work: vec![work],
             heights,
             checkpoint: None,
             minimum_work: ChainWork::ZERO,
             allow_min_difficulty,
         }
+    }
+
+    /// A chain holding `headers` from `base` up, taken as they are, whose
+    /// first header carries `work` in total from genesis. `None` when
+    /// `headers` is empty or does not link header to header.
+    #[must_use]
+    pub fn from_tail(
+        base: BlockHeight,
+        work: ChainWork,
+        headers: &[BlockHeader],
+        allow_min_difficulty: bool,
+    ) -> Option<Self> {
+        let (first, rest) = headers.split_first()?;
+        let mut chain = Self::single(base, work, *first, allow_min_difficulty);
+        for header in rest {
+            if header.prev_block() != chain.tip().hash {
+                return None;
+            }
+            chain.push(*header);
+        }
+        Some(chain)
+    }
+
+    /// The height of the oldest header held.
+    #[must_use]
+    pub const fn base(&self) -> BlockHeight {
+        self.base
+    }
+
+    /// The total work from genesis through the header at `height`.
+    #[must_use]
+    pub fn work_at(&self, height: BlockHeight) -> Option<ChainWork> {
+        self.work.get(self.index_of(height)?).copied()
+    }
+
+    /// The held headers from `height` up, oldest first.
+    #[must_use]
+    pub fn headers_from(&self, height: BlockHeight) -> &[BlockHeader] {
+        let start = self.index_of(height.max(self.base)).unwrap_or(self.headers.len());
+        &self.headers[start..]
+    }
+
+    /// Drop the headers below `height`, keeping what the next header's
+    /// checks read: the eleven headers behind the tip for its median time,
+    /// and the header at the start of the current retarget period.
+    pub fn forget_below(&mut self, height: BlockHeight) {
+        let tip = self.tip_height().to_u32();
+        let period = tip - tip % Self::RETARGET_INTERVAL;
+        let floor = height
+            .to_u32()
+            .min(period)
+            .min(tip.saturating_sub(Self::MEDIAN_SPAN - 1))
+            .max(self.base.to_u32());
+        let Some(drop) = self.index_of(BlockHeight::new(floor)) else {
+            return;
+        };
+        for header in self.headers.drain(..drop) {
+            self.heights.remove(&header.hash());
+        }
+        self.work.drain(..drop);
+        self.base = BlockHeight::new(floor);
+    }
+
+    const RETARGET_INTERVAL: u32 = 2_016;
+    const MEDIAN_SPAN: u32 = 11;
+
+    fn index_of(&self, height: BlockHeight) -> Option<usize> {
+        let offset = usize::try_from(height.to_u32().checked_sub(self.base.to_u32())?).ok()?;
+        (offset < self.headers.len()).then_some(offset)
     }
 
     #[must_use]
@@ -102,7 +181,8 @@ impl HeaderChain {
     /// was.
     ///
     /// # Errors
-    /// `UnknownParent` when `first` is genesis or above the next height,
+    /// `UnknownParent` when `first` is at or below the base, or above the
+    /// next height,
     /// the first rule a header breaks, with that header's index, or
     /// `InsufficientChainWork` (index of the last header) when the branch
     /// replaces headers without carrying more work than they do.
@@ -112,11 +192,15 @@ impl HeaderChain {
         headers: &[BlockHeader],
         clock: &impl Clock,
     ) -> Result<(), (usize, ValidationError)> {
-        let base = match first.to_u32().checked_sub(1) {
-            Some(base) if base <= self.tip_height().to_u32() => BlockHeight::new(base),
-            _ => return Err((0, ValidationError::UnknownParent)),
+        let Some(keep) = first
+            .to_u32()
+            .checked_sub(1)
+            .and_then(|parent| self.index_of(BlockHeight::new(parent)))
+            .map(|index| index + 1)
+        else {
+            return Err((0, ValidationError::UnknownParent));
         };
-        let keep = usize::try_from(base.to_u32()).map_or(self.headers.len(), |index| index + 1);
+        let base = BlockHeight::new(first.to_u32() - 1);
         let replaced_work = ChainWork::of_headers(&self.headers[keep..]);
         let replaced = self.headers.split_off(keep);
         self.work.truncate(keep);
@@ -126,11 +210,17 @@ impl HeaderChain {
         let outcome = headers
             .iter()
             .enumerate()
-            .try_for_each(|(index, header)| self.extend(*header, clock).map(|_| ()).map_err(|error| (index, error)))
+            .try_for_each(|(index, header)| {
+                self.extend(*header, clock)
+                    .map(|_| ())
+                    .map_err(|error| (index, error))
+            })
             .and_then(|()| {
                 let more = replaced.is_empty() || ChainWork::of_headers(headers) > replaced_work;
-                more.then_some(())
-                    .ok_or((headers.len().saturating_sub(1), ValidationError::InsufficientChainWork))
+                more.then_some(()).ok_or((
+                    headers.len().saturating_sub(1),
+                    ValidationError::InsufficientChainWork,
+                ))
             });
         if outcome.is_err() {
             self.truncate(base);
@@ -142,7 +232,7 @@ impl HeaderChain {
     }
 
     fn push(&mut self, header: BlockHeader) {
-        let height = BlockHeight::new(u32::try_from(self.headers.len()).unwrap_or(u32::MAX));
+        let height = BlockHeight::new(self.tip_height().to_u32() + 1);
         self.heights.insert(header.hash(), height);
         let total = self.tip_work() + ChainWork::of_header(&header);
         self.work.push(total);
@@ -157,8 +247,10 @@ impl HeaderChain {
 
     /// Drop every header above `height`.
     pub fn truncate(&mut self, height: BlockHeight) {
-        let keep = usize::try_from(height.to_u32())
-            .map_or(self.headers.len(), |index| index.saturating_add(1));
+        let keep = self.index_of(height).map_or(
+            if height < self.base { 1 } else { self.headers.len() },
+            |index| index + 1,
+        );
         for header in self.headers.iter().skip(keep) {
             self.heights.remove(&header.hash());
         }
@@ -168,12 +260,13 @@ impl HeaderChain {
 
     #[must_use]
     pub fn header_at(&self, height: BlockHeight) -> Option<&BlockHeader> {
-        self.headers.get(usize::try_from(height.to_u32()).ok()?)
+        self.headers.get(self.index_of(height)?)
     }
 
     #[must_use]
     pub fn tip_height(&self) -> BlockHeight {
-        BlockHeight::new(u32::try_from(self.headers.len() - 1).unwrap_or(u32::MAX))
+        let above = u32::try_from(self.headers.len() - 1).unwrap_or(u32::MAX);
+        BlockHeight::new(self.base.to_u32() + above)
     }
 
     /// Whether the chain is long enough to have passed the checkpoint.
@@ -215,7 +308,11 @@ impl ChainView for HeaderChain {
             .heights
             .get(&header.prev_block())
             .ok_or(ChainViewError::NotFound)?;
-        let end = usize::try_from(parent.to_u32()).map_err(|_| ChainViewError::NotFound)? + 1;
+        let end = self.index_of(*parent).ok_or(ChainViewError::NotFound)? + 1;
+        let needed = usize::try_from(parent.to_u32().saturating_add(1).min(Self::MEDIAN_SPAN)).unwrap_or(11);
+        if end < needed {
+            return Err(ChainViewError::NotFound);
+        }
         let mut times: Vec<BlockTime> = self.headers[end.saturating_sub(11)..end]
             .iter()
             .map(BlockHeader::time)
@@ -234,7 +331,9 @@ impl ChainView for HeaderChain {
 #[cfg(test)]
 mod tests {
     use mantle::network::Network;
-    use mantle::primitives::{BlockHeader, BlockHeight, BlockTime, BlockVersion, ChainWork, CompactBits, Hash256, Nonce};
+    use mantle::primitives::{
+        BlockHeader, BlockHeight, BlockTime, BlockVersion, ChainWork, CompactBits, Hash256, Nonce,
+    };
 
     use super::HeaderChain;
     use crate::chain_view::ChainView;
@@ -263,8 +362,12 @@ mod tests {
 
         fn easy_genesis() -> BlockHeader {
             BlockHeader::new(
-                BlockVersion::new(1), Hash256::ZERO, Hash256::ZERO,
-                BlockTime::new(1_231_006_505), CompactBits::new(0x207f_ffff), Nonce::new(0),
+                BlockVersion::new(1),
+                Hash256::ZERO,
+                Hash256::ZERO,
+                BlockTime::new(1_231_006_505),
+                CompactBits::new(0x207f_ffff),
+                Nonce::new(0),
             )
         }
 
@@ -273,8 +376,12 @@ mod tests {
             (1..=length)
                 .map(|step| {
                     let header = Self::mined(BlockHeader::new(
-                        BlockVersion::new(1), prev.hash(), Hash256::from_bytes([salt; 32]),
-                        prev.time() + step, prev.bits(), Nonce::new(0),
+                        BlockVersion::new(1),
+                        prev.hash(),
+                        Hash256::from_bytes([salt; 32]),
+                        prev.time() + step,
+                        prev.bits(),
+                        Nonce::new(0),
                     ));
                     prev = header;
                     header
@@ -298,7 +405,10 @@ mod tests {
         let mut chain = MainnetFixture::chain();
         for height in 1..=3 {
             let admitted = chain.extend(MainnetFixture::header(height), &CLOCK);
-            assert_eq!(admitted, Ok(BlockHeight::new(u32::try_from(height).expect("small"))));
+            assert_eq!(
+                admitted,
+                Ok(BlockHeight::new(u32::try_from(height).expect("small")))
+            );
         }
         assert_eq!(chain.tip().hash, MainnetFixture::header(3).hash());
     }
@@ -309,7 +419,10 @@ mod tests {
         let mut forged = MainnetFixture::header(1);
         forged.set_nonce(Nonce::new(forged.nonce().to_u32().wrapping_add(1)));
 
-        assert_eq!(chain.extend(forged, &CLOCK), Err(ValidationError::InsufficientProofOfWork));
+        assert_eq!(
+            chain.extend(forged, &CLOCK),
+            Err(ValidationError::InsufficientProofOfWork)
+        );
         assert_eq!(chain.tip_height(), BlockHeight::ZERO);
     }
 
@@ -350,13 +463,21 @@ mod tests {
     fn a_header_no_later_than_the_median_time_past_is_refused() {
         let bits = CompactBits::new(0x207f_ffff);
         let genesis = BlockHeader::new(
-            BlockVersion::new(1), Hash256::ZERO, Hash256::ZERO,
-            BlockTime::new(1_231_006_505), bits, Nonce::new(0),
+            BlockVersion::new(1),
+            Hash256::ZERO,
+            Hash256::ZERO,
+            BlockTime::new(1_231_006_505),
+            bits,
+            Nonce::new(0),
         );
         let mut chain = HeaderChain::from_genesis(genesis, false);
         let stale = BlockHeader::new(
-            BlockVersion::new(1), genesis.hash(), Hash256::ZERO,
-            genesis.time(), bits, Nonce::new(0),
+            BlockVersion::new(1),
+            genesis.hash(),
+            Hash256::ZERO,
+            genesis.time(),
+            bits,
+            Nonce::new(0),
         );
 
         assert_eq!(
@@ -368,11 +489,14 @@ mod tests {
     #[test]
     fn the_checkpoint_admits_only_its_own_hash() {
         let real = MainnetFixture::header(2).hash();
-        let mut agreeing = MainnetFixture::chain().with_checkpoint(Some((BlockHeight::new(2), real)));
+        let mut agreeing =
+            MainnetFixture::chain().with_checkpoint(Some((BlockHeight::new(2), real)));
         let mut disagreeing = MainnetFixture::chain()
             .with_checkpoint(Some((BlockHeight::new(2), Hash256::from_bytes([7; 32]))));
         for chain in [&mut agreeing, &mut disagreeing] {
-            chain.extend(MainnetFixture::header(1), &CLOCK).expect("block 1");
+            chain
+                .extend(MainnetFixture::header(1), &CLOCK)
+                .expect("block 1");
             assert!(!chain.reached_checkpoint());
         }
 
@@ -387,7 +511,9 @@ mod tests {
     #[test]
     fn a_valid_branch_replaces_the_headers_above_its_parent() {
         let mut chain = MainnetFixture::chain();
-        chain.extend(MainnetFixture::header(1), &CLOCK).expect("block 1");
+        chain
+            .extend(MainnetFixture::header(1), &CLOCK)
+            .expect("block 1");
         let mut stale = MainnetFixture::header(1);
         stale.set_prev_block(MainnetFixture::header(1).hash());
         chain.push(stale);
@@ -407,7 +533,9 @@ mod tests {
     fn an_invalid_branch_leaves_the_chain_as_it_was() {
         let mut chain = MainnetFixture::chain();
         for height in 1..=2 {
-            chain.extend(MainnetFixture::header(height), &CLOCK).expect("valid");
+            chain
+                .extend(MainnetFixture::header(height), &CLOCK)
+                .expect("valid");
         }
         let mut forged = MainnetFixture::header(2);
         forged.set_nonce(Nonce::new(forged.nonce().to_u32().wrapping_add(1)));
@@ -417,7 +545,9 @@ mod tests {
         assert_eq!(replaced, Err((0, ValidationError::InsufficientProofOfWork)));
         assert_eq!(chain.tip().hash, MainnetFixture::header(2).hash());
         assert_eq!(
-            chain.height_of(&MainnetFixture::header(2).hash()).expect("view"),
+            chain
+                .height_of(&MainnetFixture::header(2).hash())
+                .expect("view"),
             Some(BlockHeight::new(2))
         );
         assert!(chain.extend(MainnetFixture::header(3), &CLOCK).is_ok());
@@ -452,7 +582,10 @@ mod tests {
         }
         let rival = MainnetFixture::easy_branch(&held[0], 2, 2);
 
-        assert_eq!(chain.replace_from(BlockHeight::new(2), &rival, &CLOCK), Ok(()));
+        assert_eq!(
+            chain.replace_from(BlockHeight::new(2), &rival, &CLOCK),
+            Ok(())
+        );
         assert_eq!(chain.tip().hash, rival[1].hash());
         assert_eq!(chain.tip_work().to_u128(), 4 * 2);
     }
@@ -461,7 +594,9 @@ mod tests {
     fn the_tip_work_sums_every_header_from_genesis() {
         let mut chain = MainnetFixture::chain();
         for height in 1..=3 {
-            chain.extend(MainnetFixture::header(height), &CLOCK).expect("valid");
+            chain
+                .extend(MainnetFixture::header(height), &CLOCK)
+                .expect("valid");
         }
 
         assert_eq!(chain.tip_work().to_u128(), 4 * 0x1_0001_0001);
@@ -471,11 +606,16 @@ mod tests {
 
     #[test]
     fn the_minimum_work_is_met_once_the_tip_work_reaches_it() {
-        let mut chain = MainnetFixture::chain().with_minimum_work(ChainWork::new(3 * 0x1_0001_0001));
-        chain.extend(MainnetFixture::header(1), &CLOCK).expect("block 1");
+        let mut chain =
+            MainnetFixture::chain().with_minimum_work(ChainWork::new(3 * 0x1_0001_0001));
+        chain
+            .extend(MainnetFixture::header(1), &CLOCK)
+            .expect("block 1");
 
         assert!(!chain.has_minimum_work());
-        chain.extend(MainnetFixture::header(2), &CLOCK).expect("block 2");
+        chain
+            .extend(MainnetFixture::header(2), &CLOCK)
+            .expect("block 2");
         assert!(chain.has_minimum_work());
     }
 
@@ -502,16 +642,118 @@ mod tests {
     }
 
     #[test]
+    fn a_tail_extends_like_the_whole_chain_and_reports_its_heights() {
+        let genesis = MainnetFixture::easy_genesis();
+        let branch = MainnetFixture::easy_branch(&genesis, 30, 1);
+        let mut whole = HeaderChain::from_genesis(genesis, false);
+        for header in &branch[..29] {
+            whole.extend(*header, &CLOCK).expect("whole");
+        }
+        let base = BlockHeight::new(10);
+        let mut tail = HeaderChain::from_tail(
+            base,
+            whole.work_at(base).expect("held"),
+            whole.headers_from(base),
+            false,
+        )
+        .expect("linked");
+
+        assert_eq!(tail.base(), base);
+        assert_eq!(tail.tip_height(), BlockHeight::new(29));
+        assert_eq!(tail.tip_work(), whole.tip_work());
+        assert_eq!(tail.header_at(BlockHeight::new(9)), None);
+        assert_eq!(tail.header_at(BlockHeight::new(12)), whole.header_at(BlockHeight::new(12)));
+        assert_eq!(tail.extend(branch[29], &CLOCK), Ok(BlockHeight::new(30)));
+        assert_eq!(tail.height_of(&branch[29].hash()).expect("view"), Some(BlockHeight::new(30)));
+    }
+
+    #[test]
+    fn a_tail_refuses_a_branch_below_its_base_and_one_too_short_for_its_median() {
+        let genesis = MainnetFixture::easy_genesis();
+        let held = MainnetFixture::easy_branch(&genesis, 30, 1);
+        let mut whole = HeaderChain::from_genesis(genesis, false);
+        for header in &held {
+            whole.extend(*header, &CLOCK).expect("whole");
+        }
+        let base = BlockHeight::new(20);
+        let mut tail =
+            HeaderChain::from_tail(base, whole.work_at(base).expect("held"), whole.headers_from(base), false)
+                .expect("linked");
+        let below = MainnetFixture::easy_branch(&held[14], 20, 2);
+        let mut short = HeaderChain::from_tail(base, ChainWork::ZERO, &held[19..25], false).expect("linked");
+
+        assert_eq!(
+            tail.replace_from(BlockHeight::new(16), &below, &CLOCK),
+            Err((0, ValidationError::UnknownParent))
+        );
+        assert_eq!(tail.tip().hash, held[29].hash());
+        assert_eq!(
+            short.extend(held[25], &CLOCK).map_err(|error| matches!(error, ValidationError::ChainView(_))),
+            Err(true)
+        );
+    }
+
+    #[test]
+    fn a_broken_tail_is_refused() {
+        let genesis = MainnetFixture::easy_genesis();
+        let mut branch = MainnetFixture::easy_branch(&genesis, 3, 1);
+        branch.swap(1, 2);
+
+        assert!(HeaderChain::from_tail(BlockHeight::new(1), ChainWork::ZERO, &branch, false).is_none());
+        assert!(HeaderChain::from_tail(BlockHeight::new(1), ChainWork::ZERO, &[], false).is_none());
+    }
+
+    #[test]
+    fn forgetting_keeps_the_start_of_the_retarget_period() {
+        let genesis = MainnetFixture::easy_genesis();
+        let branch = MainnetFixture::easy_branch(&genesis, 40, 1);
+        let mut chain = HeaderChain::from_genesis(genesis, false);
+        for header in &branch[..39] {
+            chain.extend(*header, &CLOCK).expect("held");
+        }
+        let work = chain.tip_work();
+
+        chain.forget_below(BlockHeight::new(35));
+
+        assert_eq!(chain.base(), BlockHeight::ZERO);
+        assert_eq!(chain.tip_work(), work);
+        assert_eq!(chain.extend(branch[39], &CLOCK), Ok(BlockHeight::new(40)));
+    }
+
+    #[test]
+    fn forgetting_past_a_retarget_keeps_its_first_header_and_eleven_behind_the_tip() {
+        let genesis = MainnetFixture::easy_genesis();
+        let branch = MainnetFixture::easy_branch(&genesis, 61, 1);
+        let mut chain =
+            HeaderChain::from_tail(BlockHeight::new(2_000), ChainWork::ZERO, &branch[..60], false).expect("linked");
+
+        chain.forget_below(BlockHeight::new(2_059));
+
+        assert_eq!(chain.base(), BlockHeight::new(2_016));
+        assert_eq!(chain.tip_height(), BlockHeight::new(2_059));
+        chain.forget_below(BlockHeight::new(2_059));
+        assert_eq!(chain.base(), BlockHeight::new(2_016));
+        assert_eq!(chain.extend(branch[60], &CLOCK), Ok(BlockHeight::new(2_060)));
+    }
+
+    #[test]
     fn truncating_forgets_the_dropped_headers() {
         let mut chain = MainnetFixture::chain();
         for height in 1..=3 {
-            chain.extend(MainnetFixture::header(height), &CLOCK).expect("valid");
+            chain
+                .extend(MainnetFixture::header(height), &CLOCK)
+                .expect("valid");
         }
 
         chain.truncate(BlockHeight::new(1));
 
         assert_eq!(chain.tip_height(), BlockHeight::new(1));
-        assert!(chain.height_of(&MainnetFixture::header(3).hash()).expect("view").is_none());
+        assert!(
+            chain
+                .height_of(&MainnetFixture::header(3).hash())
+                .expect("view")
+                .is_none()
+        );
         assert!(chain.extend(MainnetFixture::header(2), &CLOCK).is_ok());
     }
 }
