@@ -9,7 +9,7 @@ use mantle::primitives::{BlockHeader, BlockHeight};
 use quetzalcoatl::spsc;
 
 use crate::feed_item::{FedBlock, FeedItem};
-use crate::feed_request::{BlocksRequest, FeedRequest, HeaderRequest};
+use crate::feed_request::{BlocksRequest, FeedRequest, HeaderRequest, SurveyRequest};
 use crate::{Fetcher, HeaderAdmission};
 
 /// Where a [`crate::BlockFeed`]'s fetcher connects and caches.
@@ -52,6 +52,7 @@ impl<A: HeaderAdmission> FeedWorker<A> {
         while let Some(request) = self.requests.pop_block() {
             let outcome = match request {
                 FeedRequest::Headers(request) => self.headers(&mut fetcher, request),
+                FeedRequest::Survey(request) => self.survey(&mut fetcher, &request),
                 FeedRequest::Blocks(request) => self.blocks(&mut fetcher, &request),
                 FeedRequest::Discard => self.discard(&mut fetcher),
             };
@@ -82,6 +83,13 @@ impl<A: HeaderAdmission> FeedWorker<A> {
             .sync_headers_admitted(start, stop, locator, &mut admission)
             .map_err(|error| FeedStop::Failed(format!("sync headers: {error}")))?;
         self.send(FeedItem::Headers(headers, admission))
+    }
+
+    fn survey(&self, fetcher: &mut Fetcher, request: &SurveyRequest) -> Result<(), FeedStop> {
+        let pages = fetcher
+            .survey_headers(request.start, request.base, &request.held)
+            .map_err(|error| FeedStop::Failed(format!("survey headers: {error}")))?;
+        self.send(FeedItem::Survey(pages))
     }
 
     fn discard(&self, fetcher: &mut Fetcher) -> Result<(), FeedStop> {

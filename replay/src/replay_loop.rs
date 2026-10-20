@@ -114,7 +114,7 @@ impl ReplayLoop {
                         elapsed.as_secs_f64()
                     ),
                     Some(FeedItem::Failed(e)) => return Err(e),
-                    Some(FeedItem::Headers(..) | FeedItem::Done) | None => {
+                    Some(FeedItem::Headers(..) | FeedItem::Survey(_) | FeedItem::Done) | None => {
                         return Err(format!("block feed ended before height {}", height.to_u32()));
                     }
                 }

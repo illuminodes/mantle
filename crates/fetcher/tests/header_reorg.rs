@@ -187,6 +187,33 @@ fn a_sync_whose_cached_tip_was_orphaned_follows_the_longer_branch() {
 }
 
 #[test]
+fn a_survey_reports_each_peers_page_from_the_locator_without_admitting_any() {
+    let fixture = ReorgFixture::new("survey");
+    let genesis = Network::Regtest.genesis_hash();
+    let shared = ReorgFixture::branch(genesis, 2, 0);
+    let mut agreeing = shared.clone();
+    agreeing.extend(ReorgFixture::branch(shared[1].hash(), 2, 0));
+    let mut forked = shared.clone();
+    forked.extend(ReorgFixture::branch(shared[1].hash(), 3, 9));
+    let (first, first_node) = FakeNode::spawn(Arc::new(Mutex::new(agreeing.clone())));
+    let (second, second_node) = FakeNode::spawn(Arc::new(Mutex::new(forked.clone())));
+    let held: Vec<(BlockHeight, BlockHeader)> = (1..).map(BlockHeight::new).zip(shared).collect();
+
+    let mut fetcher = fixture.fetcher(&[first, second]);
+    let pages = fetcher.survey_headers(BlockHeight::new(1), genesis, &held).expect("survey");
+    drop(fetcher);
+    first_node.join().expect("first node");
+    second_node.join().expect("second node");
+
+    assert_eq!(pages.len(), 2);
+    assert_eq!(pages[0].first, BlockHeight::new(3));
+    assert_eq!(pages[0].headers, forked[2..].to_vec());
+    assert_eq!(pages[0].senders, vec![second]);
+    assert_eq!(pages[1].headers, agreeing[2..].to_vec());
+    assert_eq!(pages[1].senders, vec![first]);
+}
+
+#[test]
 fn the_branch_with_the_most_work_wins_even_when_it_answers_last() {
     let fixture = ReorgFixture::new("most-work");
     let genesis = Network::Regtest.genesis_hash();

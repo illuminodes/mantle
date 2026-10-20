@@ -22,8 +22,17 @@ pub struct BlocksRequest {
     pub deliver: bool,
 }
 
+/// Ask the peers which headers follow `held`, the chain from `start` whose
+/// parent is `base`, without admitting any of them.
+pub struct SurveyRequest {
+    pub start: BlockHeight,
+    pub base: Hash256,
+    pub held: Vec<(BlockHeight, BlockHeader)>,
+}
+
 pub(crate) enum FeedRequest<A> {
     Headers(HeaderRequest<A>),
+    Survey(SurveyRequest),
     Blocks(BlocksRequest),
     Discard,
 }

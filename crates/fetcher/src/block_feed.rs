@@ -6,9 +6,9 @@ use mantle::primitives::{BlockHeader, BlockHeight};
 use quetzalcoatl::capacity::Capacity;
 use quetzalcoatl::spsc;
 
-use crate::HeaderAdmission;
 use crate::feed_item::FeedItem;
-use crate::feed_request::{BlocksRequest, FeedRequest, HeaderRequest};
+use crate::feed_request::{BlocksRequest, FeedRequest, HeaderRequest, SurveyRequest};
+use crate::{HeaderAdmission, SurveyedPage};
 use crate::feed_worker::{FeedSpec, FeedWorker};
 
 /// A [`crate::Fetcher`] on a thread of its own, serving header syncs and
@@ -64,6 +64,21 @@ impl<A: HeaderAdmission + Send + 'static> BlockFeed<A> {
             Some(FeedItem::Headers(headers, admission)) => Ok((headers, admission)),
             Some(FeedItem::Failed(message)) => Err(message),
             Some(_) => Err("block feed answered a header request out of turn".to_string()),
+            None => Err("block feed thread has gone".to_string()),
+        }
+    }
+
+    /// Ask the peers which headers follow `request.held`, and return every
+    /// distinct answer with the peers that gave it.
+    ///
+    /// # Errors
+    /// A message when the survey fails or the feed thread has gone.
+    pub fn survey(&mut self, request: SurveyRequest) -> Result<Vec<SurveyedPage>, String> {
+        self.push(FeedRequest::Survey(request))?;
+        match self.next_item() {
+            Some(FeedItem::Survey(pages)) => Ok(pages),
+            Some(FeedItem::Failed(message)) => Err(message),
+            Some(_) => Err("block feed answered a survey out of turn".to_string()),
             None => Err("block feed thread has gone".to_string()),
         }
     }

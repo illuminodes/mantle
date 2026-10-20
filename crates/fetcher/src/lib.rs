@@ -23,6 +23,7 @@ mod peer_liveness;
 mod peer_score;
 mod routable;
 mod header_round;
+mod surveyed_page;
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -49,9 +50,10 @@ use ququmatz::types::{AddressFamily, SockAddrIn, SocketFlags, SocketType, Timesp
 
 pub use crate::block_feed::BlockFeed;
 pub use crate::feed_item::{FedBlock, FeedItem};
-pub use crate::feed_request::{BlocksRequest, HeaderRequest};
+pub use crate::feed_request::{BlocksRequest, HeaderRequest, SurveyRequest};
 pub use crate::feed_worker::FeedSpec;
 pub use crate::header_admission::{AdmitAll, HeaderAdmission};
+pub use crate::surveyed_page::SurveyedPage;
 
 use crate::ewma_latency::EwmaLatency;
 use crate::header_admission::HeaderPage;
@@ -579,18 +581,55 @@ where
         None
     }
 
-    /// Ask every ready peer for the headers after `request` and collect the
-    /// replies in a [`HeaderRound`]. Once the round is over, the page that
-    /// adds the most work and passes `admission` is returned; peers whose
+    /// Ask every ready peer for the headers after `request`; the page that
+    /// adds the most work and passes `admission` is returned, and peers whose
     /// page was refused are banned. `None` when no peer offered a page that
     /// outworks the held headers, or every offered page was refused.
-    #[allow(clippy::too_many_lines)]
     fn run_getheaders_session(
         &mut self,
         request: &HeaderLocator,
         end: BlockHeight,
         admission: &mut impl HeaderAdmission,
     ) -> Result<Option<(Attachment, Vec<BlockHeader>)>, FetchError> {
+        let round = self.collect_round(request, end, Duration::from_secs(HEADERS_PAGE_WINDOW_SECS))?;
+        Ok(self.settle_round(round, admission))
+    }
+
+    /// Ask every ready peer which headers follow `held`, the chain from
+    /// `start` whose parent is `base`, and return every distinct page with
+    /// the peers that sent it, most work first. Nothing is admitted or
+    /// stored, and no peer is banned: the caller weighs the answers.
+    ///
+    /// # Errors
+    /// As [`Self::sync_headers`].
+    pub fn survey_headers(
+        &mut self,
+        start: BlockHeight,
+        base: Hash256,
+        held: &[(BlockHeight, BlockHeader)],
+    ) -> Result<Vec<SurveyedPage>, FetchError> {
+        if self.peer_book.is_empty() {
+            return Err(FetchError::NoPeers);
+        }
+        let request = HeaderLocator::new(start, base, held);
+        let round = self.collect_round(
+            &request,
+            BlockHeight::new(u32::MAX),
+            Duration::from_secs(HEADERS_TIP_WINDOW_SECS),
+        )?;
+        Ok(round.into_ranked().into_iter().map(SurveyedPage::from).collect())
+    }
+
+    /// Send `request` to every ready peer and collect the replies in a
+    /// [`HeaderRound`] until it is over; `page_window` is how long the round
+    /// waits for the rest once one peer has offered a page.
+    #[allow(clippy::too_many_lines)]
+    fn collect_round(
+        &mut self,
+        request: &HeaderLocator,
+        end: BlockHeight,
+        page_window: Duration,
+    ) -> Result<HeaderRound, FetchError> {
         let locator = request.tip();
         self.ensure_peers()?;
         if self.peers.is_empty() {
@@ -628,10 +667,7 @@ where
         let mut version_payload = Vec::new();
         encode_version("/mantle-replay-iouring:0.1.0/", &mut version_payload);
         let mut last_status = Instant::now();
-        let mut round = HeaderRound::new(
-            Duration::from_secs(HEADERS_PAGE_WINDOW_SECS),
-            Duration::from_secs(HEADERS_TIP_WINDOW_SECS),
-        );
+        let mut round = HeaderRound::new(page_window, Duration::from_secs(HEADERS_TIP_WINDOW_SECS));
 
         loop {
             self.ring.push_tick(Duration::from_secs(1))?;
@@ -758,7 +794,7 @@ where
                 if answered < ready_peers {
                     eprintln!("  headers: round closed with {answered} of {ready_peers} ready peers answered");
                 }
-                return Ok(self.settle_round(round, admission));
+                return Ok(round);
             }
             if deadline_passed {
                 return Err(FetchError::Timeout("headers"));
