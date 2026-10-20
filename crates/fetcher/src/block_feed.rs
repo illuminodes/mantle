@@ -147,7 +147,7 @@ mod tests {
     use mantle::primitives::BlockHeight;
 
     use super::BlockFeed;
-    use crate::{AdmitAll, BlocksRequest, FeedItem, FeedSpec, HeaderRequest};
+    use crate::{AdmitAll, BlockStaging, BlocksRequest, FeedItem, FeedSpec, HeaderRequest};
 
     struct FeedFixture {
         dir: PathBuf,
@@ -202,6 +202,7 @@ mod tests {
             window: 10,
             discard_each_window: false,
             deliver: true,
+            staging: BlockStaging::Disk,
         })
         .expect("request");
 

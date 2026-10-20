@@ -36,7 +36,7 @@ use mantle_validator::{
     PrepPool, ScriptPool,
 };
 
-use mantle_fetcher::{AdmitAll, BlockFeed, BlocksRequest, FeedItem, FeedSpec, HeaderRequest};
+use mantle_fetcher::{AdmitAll, BlockFeed, BlockStaging, BlocksRequest, FeedItem, FeedSpec, HeaderRequest};
 use crate::failures::FailureLog;
 use crate::replay_loop::ReplayLoop;
 use crate::report::Reporter;
@@ -694,6 +694,7 @@ fn run(args: &Args) -> Result<u64, String> {
         window: if args.download_only { header_pairs.len() } else { args.verify.window },
         discard_each_window: args.verify.discard_blocks,
         deliver: !args.download_only,
+        staging: BlockStaging::Disk,
     })?;
     if args.download_only {
         eprintln!("  downloading blocks…");

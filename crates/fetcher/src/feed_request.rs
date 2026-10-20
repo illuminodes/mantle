@@ -14,12 +14,23 @@ pub struct HeaderRequest<A> {
 /// the next window downloads while the caller works on the one before it.
 /// With `discard_each_window` the cached block files are dropped once a
 /// window has been handed over. Without `deliver` the blocks are only
-/// cached and nothing but the end of the request comes back.
+/// cached and nothing but the end of the request comes back. `staging`
+/// says where a window waits before it is handed over.
 pub struct BlocksRequest {
     pub wanted: Vec<(BlockHeight, BlockHeader)>,
     pub window: usize,
     pub discard_each_window: bool,
     pub deliver: bool,
+    pub staging: BlockStaging,
+}
+
+/// Where a downloading window waits: in the block cache on disk, which a
+/// later run can read again, or in memory, which never touches the disk
+/// and holds at most one window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockStaging {
+    Disk,
+    Memory,
 }
 
 /// Ask the peers which headers follow `held`, the chain from `start` whose

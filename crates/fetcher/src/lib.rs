@@ -23,6 +23,7 @@ mod peer_liveness;
 mod peer_score;
 mod routable;
 mod header_round;
+mod memory_blocks;
 mod surveyed_page;
 
 use std::collections::{HashMap, VecDeque};
@@ -50,9 +51,10 @@ use ququmatz::types::{AddressFamily, SockAddrIn, SocketFlags, SocketType, Timesp
 
 pub use crate::block_feed::BlockFeed;
 pub use crate::feed_item::{FedBlock, FeedItem};
-pub use crate::feed_request::{BlocksRequest, HeaderRequest, SurveyRequest};
+pub use crate::feed_request::{BlockStaging, BlocksRequest, HeaderRequest, SurveyRequest};
 pub use crate::feed_worker::FeedSpec;
 pub use crate::header_admission::{AdmitAll, HeaderAdmission};
+pub use crate::memory_blocks::MemoryBlocks;
 pub use crate::surveyed_page::SurveyedPage;
 
 use crate::ewma_latency::EwmaLatency;
@@ -220,6 +222,7 @@ pub struct Fetcher<
     send_arena: SendArena,
     peers: FPool,
     file_io: FileIoHandle<RReq, RResp>,
+    memory: Option<MemoryBlocks>,
 }
 
 impl Fetcher {
@@ -270,6 +273,7 @@ where
             send_arena: SendArena::new(),
             peers: FPool::new(),
             file_io,
+            memory: None,
         })
     }
 
@@ -516,6 +520,34 @@ where
         self.run_block_download_session(&needed)?;
         self.file_io.flush_block_index()?;
         Ok(())
+    }
+
+    /// Download the blocks of `window` that `into` does not hold yet, into
+    /// memory instead of the block cache. Blocks that arrived before an
+    /// error stay in `into`, so a retry asks only for the rest.
+    ///
+    /// # Errors
+    /// As [`Self::fetch_blocks_by_hash`].
+    pub fn fetch_blocks_in_memory(
+        &mut self,
+        window: &[(BlockHeight, BlockHeader)],
+        into: &mut MemoryBlocks,
+    ) -> Result<(), FetchError> {
+        if self.peer_book.is_empty() {
+            return Err(FetchError::NoPeers);
+        }
+        let needed: Vec<(BlockHeight, Hash256)> = window
+            .iter()
+            .filter(|(height, _)| !into.has(*height))
+            .map(|(height, header)| (*height, header.hash()))
+            .collect();
+        if needed.is_empty() {
+            return Ok(());
+        }
+        self.memory = Some(std::mem::take(into));
+        let outcome = self.run_block_download_session(&needed);
+        *into = self.memory.take().unwrap_or_default();
+        outcome
     }
 
     /// Drop every cached block and truncate the block file, keeping headers.
@@ -1022,6 +1054,7 @@ where
                     &mut saved,
                     &mut arrivals,
                     &mut self.file_io,
+                    &mut self.memory,
                 )?;
             }
 
@@ -1398,6 +1431,7 @@ fn consume_block_frames<RReq, RResp>(
     saved: &mut usize,
     arrived: &mut Vec<(Hash256, u16)>,
     file_io: &mut FileIoHandle<RReq, RResp>,
+    memory: &mut Option<MemoryBlocks>,
 ) -> Result<(), FetchError>
 where
     RReq: Deref<Target = MpscRing<FileReq>>,
@@ -1459,7 +1493,10 @@ where
                 let hash = block.header.hash();
                 peer.app.record_arrival(&hash);
                 if let Some(height) = pending.remove(&hash) {
-                    file_io.write_block_async(height, payload_slice.to_vec())?;
+                    match memory {
+                        Some(held) => held.put(height, payload_slice.to_vec()),
+                        None => file_io.write_block_async(height, payload_slice.to_vec())?,
+                    }
                     *saved += 1;
                     peer.app.record_delivery();
                     arrived.push((hash, slot));

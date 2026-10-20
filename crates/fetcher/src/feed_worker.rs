@@ -9,8 +9,8 @@ use mantle::primitives::{BlockHeader, BlockHeight};
 use quetzalcoatl::spsc;
 
 use crate::feed_item::{FedBlock, FeedItem};
-use crate::feed_request::{BlocksRequest, FeedRequest, HeaderRequest, SurveyRequest};
-use crate::{Fetcher, HeaderAdmission};
+use crate::feed_request::{BlockStaging, BlocksRequest, FeedRequest, HeaderRequest, SurveyRequest};
+use crate::{Fetcher, HeaderAdmission, MemoryBlocks};
 
 /// Where a [`crate::BlockFeed`]'s fetcher connects and caches.
 #[derive(Debug, Clone)]
@@ -105,6 +105,11 @@ impl<A: HeaderAdmission> FeedWorker<A> {
                 break;
             }
             let started = Instant::now();
+            if request.staging == BlockStaging::Memory {
+                self.deliver_from_memory(fetcher, window)?;
+                self.send(Self::window_done(window, started))?;
+                continue;
+            }
             Self::fetch_window(fetcher, window)?;
             if request.deliver {
                 for (height, header) in window {
@@ -123,13 +128,45 @@ impl<A: HeaderAdmission> FeedWorker<A> {
                     .discard_cached_blocks()
                     .map_err(|error| FeedStop::Failed(format!("discard blocks: {error}")))?;
             }
-            self.send(FeedItem::WindowDone {
-                first: window[0].0,
-                last: window[window.len() - 1].0,
-                elapsed: started.elapsed(),
-            })?;
+            self.send(Self::window_done(window, started))?;
         }
         self.send(FeedItem::Done)
+    }
+
+    fn window_done(window: &[(BlockHeight, BlockHeader)], started: Instant) -> FeedItem<A> {
+        FeedItem::WindowDone {
+            first: window[0].0,
+            last: window[window.len() - 1].0,
+            elapsed: started.elapsed(),
+        }
+    }
+
+    fn deliver_from_memory(&self, fetcher: &mut Fetcher, window: &[(BlockHeight, BlockHeader)]) -> Result<(), FeedStop> {
+        let mut held = MemoryBlocks::default();
+        let mut attempt = 1;
+        while let Err(error) = fetcher.fetch_blocks_in_memory(window, &mut held) {
+            if attempt >= Self::FETCH_ATTEMPTS {
+                return Err(FeedStop::Failed(format!("fetch blocks: {error} after {attempt} attempts")));
+            }
+            eprintln!(
+                "  fetch retry {attempt}/{} for {}..={}: {error}",
+                Self::FETCH_ATTEMPTS,
+                window[0].0.to_u32(),
+                window[window.len() - 1].0.to_u32()
+            );
+            attempt += 1;
+        }
+        for (height, header) in window {
+            let bytes = held
+                .take(*height)
+                .ok_or_else(|| FeedStop::Failed(format!("block {} missing after download", height.to_u32())))?;
+            self.send(FeedItem::Block(FedBlock {
+                height: *height,
+                hash: header.hash(),
+                bytes,
+            }))?;
+        }
+        Ok(())
     }
 
     fn fetch_window(fetcher: &mut Fetcher, window: &[(BlockHeight, BlockHeader)]) -> Result<(), FeedStop> {
