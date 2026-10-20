@@ -31,12 +31,29 @@ impl HeaderChain {
     #[must_use]
     pub fn for_network(network: Network) -> Option<Self> {
         let genesis = network.genesis_header()?;
-        let allow_min_difficulty = matches!(network, Network::Testnet3 | Network::Testnet4);
-        Some(
-            Self::from_genesis(genesis, allow_min_difficulty)
-                .with_checkpoint(network.checkpoint())
-                .with_minimum_work(network.minimum_chain_work()),
-        )
+        Some(Self::from_genesis(genesis, Self::allows_min_difficulty(network)).under_rules_of(network))
+    }
+
+    /// [`Self::from_tail`] under `network`'s difficulty rules, checkpoint and
+    /// minimum work.
+    #[must_use]
+    pub fn tail_for_network(
+        network: Network,
+        base: BlockHeight,
+        work: ChainWork,
+        headers: &[BlockHeader],
+    ) -> Option<Self> {
+        Self::from_tail(base, work, headers, Self::allows_min_difficulty(network))
+            .map(|chain| chain.under_rules_of(network))
+    }
+
+    const fn allows_min_difficulty(network: Network) -> bool {
+        matches!(network, Network::Testnet3 | Network::Testnet4)
+    }
+
+    fn under_rules_of(self, network: Network) -> Self {
+        self.with_checkpoint(network.checkpoint())
+            .with_minimum_work(network.minimum_chain_work())
     }
 
     #[must_use]
@@ -98,17 +115,15 @@ impl HeaderChain {
         &self.headers[start..]
     }
 
-    /// Drop the headers below `height`, keeping what the next header's
-    /// checks read: the eleven headers behind the tip for its median time,
-    /// and the header at the start of the current retarget period.
+    /// Drop the headers below the start of the retarget period holding
+    /// `height`, keeping at least the eleven headers behind the tip that
+    /// the next header's median time reads. The base lands on a period
+    /// start, so it moves once a period however often this is called, and
+    /// the next retarget still finds the first header of its period.
     pub fn forget_below(&mut self, height: BlockHeight) {
         let tip = self.tip_height().to_u32();
-        let period = tip - tip % Self::RETARGET_INTERVAL;
-        let floor = height
-            .to_u32()
-            .min(period)
-            .min(tip.saturating_sub(Self::MEDIAN_SPAN - 1))
-            .max(self.base.to_u32());
+        let wanted = height.to_u32().min(tip.saturating_sub(Self::MEDIAN_SPAN - 1));
+        let floor = (wanted - wanted % Self::RETARGET_INTERVAL).max(self.base.to_u32());
         let Some(drop) = self.index_of(BlockHeight::new(floor)) else {
             return;
         };
