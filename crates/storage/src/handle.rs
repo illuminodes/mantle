@@ -21,6 +21,22 @@ pub struct StorageHandle<
     resp_rx: quetzalcoatl::spsc::Consumer<StorageResp, RResp>,
     tip: TipInfo,
     next_token: u64,
+    shut_down: bool,
+}
+
+/// The storage thread also takes requests from the engine's background
+/// threads, so it cannot notice the handle going away by itself: a handle
+/// dropped without [`StorageHandle::shutdown`] asks it to stop.
+impl<'a, RReq, RResp> Drop for StorageHandle<'a, RReq, RResp>
+where
+    RReq: Deref<Target = quetzalcoatl::mpsc::RingBuffer<StorageReq<'a>>>,
+    RResp: Deref<Target = quetzalcoatl::spsc::RingBuffer<StorageResp>>,
+{
+    fn drop(&mut self) {
+        if !self.shut_down {
+            let _ = self.req_tx.push_block(StorageReq::Shutdown);
+        }
+    }
 }
 
 impl<'a, RReq, RResp> StorageHandle<'a, RReq, RResp>
@@ -38,6 +54,7 @@ where
             resp_rx,
             tip,
             next_token: 1,
+            shut_down: false,
         }
     }
 
@@ -206,6 +223,7 @@ where
     /// # Errors
     /// Returns `StorageError` if the shutdown request cannot be sent.
     pub fn shutdown(mut self) -> Result<(), StorageError> {
+        self.shut_down = true;
         self.send(StorageReq::Shutdown)?;
         match self.recv()? {
             StorageResp::Shutdown => Ok(()),
@@ -546,15 +564,16 @@ mod tests {
 }
 
 fn open_arc(
-    engine: impl crate::engine::Engine + Send + 'static,
+    mut engine: impl crate::engine::Engine + Send + 'static,
 ) -> Result<StorageHandle<'static>, StorageError> {
-    use crate::thread::StorageWorker;
+    use crate::thread::{BackgroundSpawn, StorageWorker};
     use quetzalcoatl::capacity::Capacity;
     use quetzalcoatl::mpsc::RingBuffer as MpscRing;
     use quetzalcoatl::spsc::RingBuffer as SpscRing;
 
     const RING_CAP: usize = 1024;
     let initial_tip = engine.tip();
+    let tasks = engine.background_tasks().map_err(StorageError::from)?;
 
     // `.split()` wraps the ring in an Arc internally; the resulting
     // Producer/Consumer use Arc<RingBuffer<T>> as their ring accessor,
@@ -562,11 +581,8 @@ fn open_arc(
     let (req_tx, req_rx) = MpscRing::new(Capacity::exact(RING_CAP)).split();
     let (resp_tx, resp_rx) = SpscRing::new(Capacity::exact(RING_CAP)).split();
 
-    let worker = StorageWorker {
-        req_rx,
-        resp_tx,
-        engine: Box::new(engine),
-    };
+    BackgroundSpawn::detached(tasks, &req_tx).map_err(|e| StorageError::Io(e.kind()))?;
+    let worker = StorageWorker::new(req_rx, resp_tx, Box::new(engine));
 
     std::thread::Builder::new()
         .name("storage".into())

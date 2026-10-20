@@ -10,22 +10,35 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use mantle::collections::{BuildPrehashedHasher, PrehashedMap};
 use mantle::primitives::{
     BlockHeader, BlockHeight, Hash256, OutPoint, Satoshi, ScriptPubKey,
 };
 use mantle_consensus::chain_view::{Coin, TipInfo};
 
 use super::{Engine, EngineError};
+use crate::background::{BackgroundEvent, BackgroundTask};
 use crate::types::{CommitBlockReq, Durability, LookupResult};
 
+mod buffer_layers;
 mod chunk_cache;
+mod chunk_sink;
 mod completions;
+mod extent_writer;
+mod flush_link;
 mod flush_pass;
+mod forward_sink;
 mod growth;
 mod placement_stream;
 mod slot_window;
+mod table_flusher;
+mod uring_batch;
+mod write_buffer;
+mod write_out;
 
+use buffer_layers::{BufferLayers, Layered};
+use chunk_sink::{ChunkSink, DirectSink};
+use extent_writer::ExtentWriter;
+use flush_link::{FlushGoal, FlushLink};
 use flush_pass::FlushPass;
 use growth::TableGrowth;
 
@@ -269,7 +282,7 @@ impl RobinHoodTable {
         })
     }
 
-    fn open_existing(path: &Path) -> io::Result<Self> {
+    pub(super) fn open_existing(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let mut buf = [0u8; BUCKET_SIZE];
         pread_exact(&file, &mut buf, 0)?;
@@ -315,14 +328,46 @@ impl RobinHoodTable {
         self.live_count * LOAD_FACTOR_DEN > self.slot_count * LOAD_FACTOR_NUM
     }
 
-    fn flush_header(&self) -> io::Result<()> {
-        let header = TableHeader {
+    fn header(&self) -> TableHeader {
+        TableHeader {
             slot_count: self.slot_count,
             live_count: self.live_count,
-        };
+        }
+    }
+
+    fn flush_header(&self) -> io::Result<()> {
         let mut buf = [0u8; BUCKET_SIZE];
-        header.encode(&mut buf);
+        self.header().encode(&mut buf);
         pwrite_all(&self.file, &buf, 0)
+    }
+
+    /// A second handle on the same files and state, for another thread.
+    fn twin(&self) -> io::Result<Self> {
+        Ok(Self {
+            file: OpenOptions::new().read(true).write(true).open(&self.path)?,
+            path: self.path.clone(),
+            overflow: open_overflow_file(&overflow_path(&self.path))?,
+            slot_count: self.slot_count,
+            mask: self.mask,
+            live_count: self.live_count,
+            fixed_fd: None,
+        })
+    }
+
+    /// Reopen the file at this table's path after another handle replaced
+    /// it with a grown copy of `slot_count` slots.
+    fn reopen(&mut self, slot_count: u64) -> io::Result<()> {
+        self.file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        self.slot_count = slot_count;
+        self.mask = slot_count - 1;
+        self.fixed_fd = None;
+        Ok(())
+    }
+
+    /// Make every write so far durable, header included.
+    fn sync_files(&self) -> io::Result<()> {
+        self.overflow.sync_data()?;
+        self.file.sync_data()
     }
 
     #[cfg(unix)]
@@ -504,21 +549,26 @@ impl RobinHoodTable {
     ///
     /// # Panics
     /// Panics if the table fills despite the load-factor check.
-    pub fn apply_flush(
+    fn apply_flush<'c, S: ChunkSink>(
         &mut self,
         ring: &mut ququmatz::IoUring,
+        sink: &mut S,
         deletes: &[OutPoint],
-        pairs: &[(OutPoint, Coin)],
+        pairs: impl ExactSizeIterator<Item = (&'c OutPoint, &'c Coin)>,
     ) -> io::Result<()> {
         let incoming = u64::try_from(pairs.len()).expect("batch fits u64");
+        let mut grew = false;
         while (self.live_count + incoming) * LOAD_FACTOR_DEN > self.slot_count * LOAD_FACTOR_NUM {
             self.resize()?;
+            grew = true;
+        }
+        if grew {
+            sink.replaced(self, ring)?;
         }
         let inserts = pairs
-            .iter()
             .map(|(op, coin)| Bucket::from_outpoint_and_coin(op, coin, 1, &mut self.overflow))
             .collect::<io::Result<Vec<_>>>()?;
-        FlushPass::new(self).apply(ring, deletes, inserts)
+        FlushPass::new(self, ring, sink).apply(deletes, inserts)
     }
 
     #[must_use]
@@ -666,13 +716,9 @@ const STORAGE_RING_ENTRIES: u32 = 32768;
 /// a shallower ring costs throughput but never correctness.
 const STORAGE_RING_ENTRIES_MIN: u32 = 256;
 
-const WRITE_BUFFER_FLUSH_THRESHOLD: usize = 500_000;
+const WRITE_BUFFER_CAPACITY: usize = 500_000;
 
 // ── Write buffer ─────────────────────────────────────────────────────────────
-
-enum BufferEntry {
-    Live(Coin),
-}
 
 // SAFETY: RobinHoodEngine is only accessed from the single storage thread
 // after being moved there via spawn(). The IoUring raw pointers inside are
@@ -683,8 +729,7 @@ pub struct RobinHoodEngine {
     data_dir: PathBuf,
     table: RobinHoodTable,
     ring: ququmatz::IoUring,
-    write_buffer: PrehashedMap<OutPoint, BufferEntry>,
-    pending_disk_deletes: Vec<OutPoint>,
+    layers: BufferLayers,
     read_arena: Vec<u8>,
     // Scratch buffers reused across read_coins / get_batch_uring calls.
     rc_results: Vec<Option<Coin>>,
@@ -694,9 +739,11 @@ pub struct RobinHoodEngine {
     uring_slots: Vec<u64>,
     uring_dists: Vec<u16>,
     uring_resolved: Vec<bool>,
-    // Scratch buffers reused across flush_write_buffer calls.
-    wb_pairs: Vec<(OutPoint, Coin)>,
     headers: HeaderStore,
+    background: Option<FlushLink>,
+    /// A flush asked for while another was running; the commit that asked
+    /// waits until it starts.
+    deferred: Option<FlushGoal>,
 }
 
 impl RobinHoodEngine {
@@ -726,11 +773,7 @@ impl RobinHoodEngine {
             data_dir: data_dir.to_owned(),
             table,
             ring,
-            write_buffer: PrehashedMap::with_capacity_and_hasher(
-                WRITE_BUFFER_FLUSH_THRESHOLD,
-                BuildPrehashedHasher,
-            ),
-            pending_disk_deletes: Vec::with_capacity(WRITE_BUFFER_FLUSH_THRESHOLD),
+            layers: BufferLayers::with_capacity(WRITE_BUFFER_CAPACITY),
             read_arena: Vec::new(),
             rc_results: Vec::new(),
             rc_disk_indices: Vec::new(),
@@ -739,8 +782,9 @@ impl RobinHoodEngine {
             uring_slots: Vec::new(),
             uring_dists: Vec::new(),
             uring_resolved: Vec::new(),
-            wb_pairs: Vec::new(),
             headers,
+            background: None,
+            deferred: None,
         };
         engine.recover()?;
         Ok(engine)
@@ -756,28 +800,102 @@ impl RobinHoodEngine {
         Ok(())
     }
 
-    fn flush_write_buffer(&mut self) -> Result<(), EngineError> {
-        self.wb_pairs.clear();
-        for (op, entry) in self.write_buffer.drain() {
-            let BufferEntry::Live(coin) = entry;
-            self.wb_pairs.push((op, coin));
-        }
-
+    /// Flush on the storage thread, finishing before returning. Used until
+    /// [`Engine::background_tasks`] hands the work to other threads.
+    fn flush_inline(&mut self, goal: FlushGoal) -> Result<(), EngineError> {
+        let frozen = self.layers.take();
+        let deletes = frozen.deletes();
         self.table
-            .apply_flush(&mut self.ring, &self.pending_disk_deletes, &self.wb_pairs)?;
-        self.wb_pairs.clear();
-        self.pending_disk_deletes.clear();
-        self.refresh_registered_fd()
+            .apply_flush(&mut self.ring, &mut DirectSink, &deletes, frozen.inserts())?;
+        self.refresh_registered_fd()?;
+        if let FlushGoal::Checkpoint(height) = goal {
+            self.table.sync_files()?;
+            self.headers.sync_checkpoint_at(height)?;
+        }
+        Ok(())
+    }
+
+    fn request_flush(&mut self, goal: FlushGoal) -> Result<(), EngineError> {
+        let Some(link) = &mut self.background else {
+            return self.flush_inline(goal);
+        };
+        if let Some(reason) = link.failure() {
+            return Err(Self::background_error(reason));
+        }
+        if link.is_busy() {
+            self.deferred = Some(goal);
+            return Ok(());
+        }
+        let frozen = self.layers.freeze();
+        link.start(frozen, goal)?;
+        Ok(())
+    }
+
+    fn background_error(reason: &str) -> EngineError {
+        EngineError::Io(io::Error::other(format!("background flush failed: {reason}")))
+    }
+
+    fn handle_background(&mut self, event: BackgroundEvent) -> Result<(), EngineError> {
+        let Some(link) = &self.background else {
+            return Ok(());
+        };
+        match event {
+            BackgroundEvent::WriteBack(extents) => {
+                let result = ExtentWriter::write(&self.table, &mut self.ring, &extents);
+                link.written(&extents, result)?;
+            }
+            BackgroundEvent::TableReplaced { slot_count } => {
+                let result = self.reopen_table(slot_count);
+                let link = self.background.as_ref().expect("link checked above");
+                link.acknowledge(result)?;
+            }
+            BackgroundEvent::FlushEnded { epoch, outcome } => {
+                if let Ok(live) = outcome {
+                    self.table.live_count = live;
+                    self.layers.release_frozen();
+                }
+                link.ended(epoch, outcome)?;
+            }
+            BackgroundEvent::Settled { epoch, outcome } => {
+                let goal = self
+                    .background
+                    .as_mut()
+                    .expect("link checked above")
+                    .settled(epoch);
+                outcome.map_err(|reason| Self::background_error(&reason))?;
+                if let Some(FlushGoal::Checkpoint(height)) = goal {
+                    self.headers.sync_checkpoint_at(height)?;
+                }
+                if let Some(next) = self.deferred.take() {
+                    self.request_flush(next)?;
+                }
+            }
+            BackgroundEvent::Failed(reason) => return Err(Self::background_error(&reason)),
+        }
+        Ok(())
+    }
+
+    fn reopen_table(&mut self, slot_count: u64) -> io::Result<()> {
+        self.table.reopen(slot_count)?;
+        self.refresh_registered_fd().map_err(|e| match e {
+            EngineError::Io(e) => e,
+            other => io::Error::other(other.to_string()),
+        })?;
+        match &self.background {
+            Some(link) => link.share_files(&self.table),
+            None => Ok(()),
+        }
     }
 }
 
 impl Engine for RobinHoodEngine {
     fn read_coin(&mut self, op: &OutPoint) -> Result<Option<Coin>, EngineError> {
-        match self.write_buffer.get(op) {
-            Some(BufferEntry::Live(coin)) => return Ok(Some(coin.clone())),
-            None => {}
+        self.background_health()?;
+        match self.layers.get(op) {
+            Layered::Live(coin) => Ok(Some(coin)),
+            Layered::Spent => Ok(None),
+            Layered::Below => self.table.get(op).map_err(EngineError::from),
         }
-        self.table.get(op).map_err(EngineError::from)
     }
 
     fn read_coins(
@@ -785,6 +903,7 @@ impl Engine for RobinHoodEngine {
         ops: &[OutPoint],
         out: &mut Vec<LookupResult>,
     ) -> Result<(), EngineError> {
+        self.background_health()?;
         let results = &mut self.rc_results;
         let disk_indices = &mut self.rc_disk_indices;
         let disk_outpoints = &mut self.rc_disk_outpoints;
@@ -798,9 +917,10 @@ impl Engine for RobinHoodEngine {
         results.resize(ops.len(), None);
 
         for (i, &op) in ops.iter().enumerate() {
-            match self.write_buffer.get(&op) {
-                Some(BufferEntry::Live(coin)) => results[i] = Some(coin.clone()),
-                None => {
+            match self.layers.get(&op) {
+                Layered::Live(coin) => results[i] = Some(coin),
+                Layered::Spent => {}
+                Layered::Below => {
                     disk_indices.push(i);
                     disk_outpoints.push(op);
                 }
@@ -842,30 +962,10 @@ impl Engine for RobinHoodEngine {
                 height: nc.height,
                 coinbase: nc.coinbase,
             };
-            self.write_buffer
-                .insert(nc.outpoint, BufferEntry::Live(coin));
+            self.layers.create(nc.outpoint, coin);
         }
         for op in req.spent {
-            match self.write_buffer.remove(op) {
-                Some(BufferEntry::Live(_)) => {
-                    // Created and spent within the buffer window — elided.
-                }
-                None => {
-                    // Coin is on disk — schedule deletion for next flush.
-                    self.pending_disk_deletes.push(*op);
-                }
-            }
-        }
-
-        // Only flush when durability requires persistence. With Memory
-        // durability (bench / test paths) the buffer is never written to disk,
-        // so flushing here would be O(N) synchronous pread/pwrite for no
-        // benefit — just let the buffer grow.
-        if req.durability != Durability::Memory
-            && self.write_buffer.len() + self.pending_disk_deletes.len()
-                > WRITE_BUFFER_FLUSH_THRESHOLD
-        {
-            self.flush_write_buffer()?;
+            self.layers.spend(*op);
         }
 
         debug_assert_eq!(
@@ -901,15 +1001,12 @@ impl Engine for RobinHoodEngine {
 
     fn flush(&mut self, d: Durability) -> Result<(), EngineError> {
         match d {
-            Durability::Memory => {}
-            Durability::Flushed => self.flush_write_buffer()?,
+            Durability::Memory => Ok(()),
+            Durability::Flushed => self.request_flush(FlushGoal::Written),
             Durability::Synced => {
-                self.flush_write_buffer()?;
-                self.table.sync()?;
-                self.headers.sync_checkpoint()?;
+                self.request_flush(FlushGoal::Checkpoint(self.headers.tip.height))
             }
         }
-        Ok(())
     }
 
     fn recover(&mut self) -> Result<TipInfo, EngineError> {
@@ -927,6 +1024,43 @@ impl Engine for RobinHoodEngine {
 
     fn tip(&self) -> TipInfo {
         self.headers.tip.clone()
+    }
+
+    fn background_tasks(&mut self) -> Result<Vec<BackgroundTask>, EngineError> {
+        if self.background.is_some() {
+            return Ok(Vec::new());
+        }
+        let (link, tasks) = FlushLink::open(&self.table)?;
+        self.background = Some(link);
+        Ok(tasks)
+    }
+
+    fn on_background(&mut self, event: BackgroundEvent) {
+        if let Err(e) = self.handle_background(event) {
+            if let Some(link) = &mut self.background {
+                link.fail(e.to_string());
+            }
+            self.deferred = None;
+        }
+    }
+
+    fn awaits_background(&self) -> bool {
+        self.deferred.is_some()
+    }
+
+    fn background_idle(&self) -> bool {
+        self.deferred.is_none()
+            && self
+                .background
+                .as_ref()
+                .is_none_or(|link| link.failure().is_some() || !link.is_busy())
+    }
+
+    fn background_health(&self) -> Result<(), EngineError> {
+        match self.background.as_ref().and_then(FlushLink::failure) {
+            Some(reason) => Err(Self::background_error(reason)),
+            None => Ok(()),
+        }
     }
 }
 
@@ -1071,7 +1205,7 @@ mod tests {
             _write_arena: &mut Vec<u8>,
             _states: &mut Vec<u8>,
         ) -> io::Result<()> {
-            self.apply_flush(ring, &[], pairs)
+            self.apply_flush(ring, &mut DirectSink, &[], pairs.iter().map(|(op, coin)| (op, coin)))
         }
 
         fn remove_batch_uring(
@@ -1083,7 +1217,7 @@ mod tests {
             _dists: &mut Vec<u16>,
             _resolved: &mut Vec<bool>,
         ) -> io::Result<()> {
-            self.apply_flush(ring, ops, &[])
+            self.apply_flush(ring, &mut DirectSink, ops, std::iter::empty())
         }
     }
 
@@ -1462,7 +1596,7 @@ mod tests {
         // Coin should be gone from buffer and disk.
         assert!(eng.read_coin(&op).unwrap().is_none());
         assert_eq!(eng.table.len(), 0);
-        assert!(eng.pending_disk_deletes.is_empty());
+        assert_eq!(eng.layers.get(&op), Layered::Below);
     }
 
     #[test]
@@ -1502,7 +1636,7 @@ mod tests {
 
         // Now on disk.
         assert_eq!(eng.table.len(), 1);
-        assert!(eng.write_buffer.is_empty());
+        assert_eq!(eng.layers.get(&op), Layered::Below);
     }
 
     // ── Engine integration tests ─────────────────────────────────────────
@@ -2022,10 +2156,10 @@ mod tests {
             durability: Durability::Synced,
         })
         .unwrap();
-        assert_eq!(eng.pending_disk_deletes.len(), 1);
+        assert_eq!(eng.layers.get(&op), Layered::Spent);
         eng.flush(Durability::Synced).unwrap();
 
-        assert!(eng.pending_disk_deletes.is_empty());
+        assert_eq!(eng.layers.get(&op), Layered::Below);
         assert!(eng.table.is_empty());
     }
 
@@ -2056,7 +2190,7 @@ mod tests {
         .unwrap();
         eng.flush(Durability::Flushed).unwrap();
 
-        assert!(eng.write_buffer.is_empty());
+        assert_eq!(eng.layers.get(&op), Layered::Below);
         assert_eq!(eng.table.len(), 1);
         assert_eq!(eng.read_coin(&op).unwrap().map(|c| c.value), Some(Satoshi::new(5)));
         let checkpoint = std::fs::read(dir.path().join("checkpoint.bin")).unwrap_or_default();
@@ -2123,11 +2257,7 @@ mod tests {
             prev_hash = block_hash;
         }
 
-        // Write buffer should be empty after Synced flush at 2016.
-        assert!(
-            eng.write_buffer.is_empty(),
-            "write buffer should be flushed"
-        );
+
         assert!(!eng.table.is_empty(), "table should have entries");
 
         // Look up block 1965 coinbase via read_coin (synchronous pread).

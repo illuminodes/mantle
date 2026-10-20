@@ -6,6 +6,7 @@ pub mod robin_hood;
 use mantle::primitives::{BlockHeader, BlockHeight, Hash256, OutPoint};
 use mantle_consensus::chain_view::{Coin, TipInfo};
 
+use crate::background::{BackgroundEvent, BackgroundTask};
 use crate::types::{CommitBlockReq, Durability, LookupResult};
 
 /// All failure modes from the storage engine.
@@ -90,6 +91,35 @@ pub trait Engine {
     fn recover(&mut self) -> Result<TipInfo, EngineError>;
 
     fn tip(&self) -> TipInfo;
+
+    /// Thread bodies to run beside the storage thread. Called once, before
+    /// the storage thread starts; their events arrive through
+    /// [`on_background`](Self::on_background).
+    ///
+    /// # Errors
+    /// Returns `EngineError` if the threads' resources cannot be set up.
+    fn background_tasks(&mut self) -> Result<Vec<BackgroundTask>, EngineError> {
+        Ok(Vec::new())
+    }
+
+    fn on_background(&mut self, _event: BackgroundEvent) {}
+
+    /// Whether the last commit must wait for background work before it can
+    /// be answered.
+    fn awaits_background(&self) -> bool {
+        false
+    }
+
+    /// Whether no background work is running or waiting to run.
+    fn background_idle(&self) -> bool {
+        true
+    }
+
+    /// # Errors
+    /// Returns the reason background work failed, if it did.
+    fn background_health(&self) -> Result<(), EngineError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

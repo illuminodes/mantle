@@ -3,6 +3,7 @@ use std::io;
 use mantle::primitives::{BlockHeader, BlockHeight, Hash256, OutPoint};
 use mantle_consensus::chain_view::{Coin, NewCoin, TipInfo};
 
+use crate::background::BackgroundEvent;
 use crate::engine::EngineError;
 
 // ── Tokens ────────────────────────────────────────────────────────────────────
@@ -25,8 +26,10 @@ pub enum Durability {
     /// like `Synced` but survives only a process exit, not a crash or power
     /// loss; for runs whose data is thrown away afterwards.
     Flushed,
-    /// `fsync` to disk before returning. Used every 2016 blocks (difficulty
-    /// epoch boundary) by the replay loop.
+    /// Durable on disk, with the checkpoint at this block. Used every 2016
+    /// blocks (difficulty epoch boundary) by the replay loop. An engine that
+    /// flushes in the background answers before the data is on disk and
+    /// moves the checkpoint once it is.
     Synced,
 }
 
@@ -84,6 +87,8 @@ pub enum StorageReq<'a> {
     LookupCoins(LookupCoinsReq<'a>),
     CommitBlock(CommitBlockReq<'a>),
     ReadHeader(ReadHeaderReq),
+    /// From an engine's own background thread; never answered.
+    Background(BackgroundEvent),
     Shutdown,
 }
 

@@ -1,7 +1,10 @@
 use std::io;
 
+use crate::background::Extent;
+
 use super::chunk_cache::ChunkCache;
-use super::{Bucket, OutPoint, RobinHoodTable};
+use super::chunk_sink::ChunkSink;
+use super::{Bucket, OutPoint, RobinHoodTable, BUCKET_SIZE};
 
 enum FlushOp {
     Delete(OutPoint),
@@ -21,31 +24,45 @@ impl FlushOp {
 
 /// Applies one write-buffer flush in a single sweep over the table.
 ///
-/// Operations run in ascending ideal-slot order. Every probe, insert and
+/// Operations run in ascending ideal-slot order, in batches of
+/// [`READ_AHEAD_OPS`](Self::READ_AHEAD_OPS). Every probe, insert and
 /// backshift only moves forward from its ideal slot, so once the sweep
-/// passes a chunk it is final and can be written back. Chunks are read ahead
-/// in batches and retired behind the sweep, which bounds memory to about
-/// [`READ_AHEAD_OPS`](Self::READ_AHEAD_OPS) chunks however large the table
-/// is. A chain that wraps past the last slot reloads the first chunks from
-/// disk after they were written back.
-pub(super) struct FlushPass<'t> {
+/// passes a chunk it is final. After each batch every chunk it changed goes
+/// to the [`ChunkSink`] as one step, so the file only ever holds the table
+/// as it was between two batches. Chunks behind the sweep are evicted, which
+/// bounds memory however large the table is. A chain that wraps past the
+/// last slot reads the first chunks back once their writes have settled.
+pub(super) struct FlushPass<'t, S: ChunkSink> {
     table: &'t mut RobinHoodTable,
+    ring: &'t mut ququmatz::IoUring,
+    sink: &'t mut S,
     cache: ChunkCache,
     read_ahead_ops: usize,
 }
 
-impl<'t> FlushPass<'t> {
-    const READ_AHEAD_OPS: usize = 1 << 16;
+impl<'t, S: ChunkSink> FlushPass<'t, S> {
+    const READ_AHEAD_OPS: usize = 1 << 15;
     const SPILL_CHUNKS: u64 = 1;
 
-    pub(super) fn new(table: &'t mut RobinHoodTable) -> Self {
-        Self::with_read_ahead(table, Self::READ_AHEAD_OPS)
+    pub(super) fn new(
+        table: &'t mut RobinHoodTable,
+        ring: &'t mut ququmatz::IoUring,
+        sink: &'t mut S,
+    ) -> Self {
+        Self::with_read_ahead(table, ring, sink, Self::READ_AHEAD_OPS)
     }
 
-    pub(super) fn with_read_ahead(table: &'t mut RobinHoodTable, read_ahead_ops: usize) -> Self {
+    pub(super) fn with_read_ahead(
+        table: &'t mut RobinHoodTable,
+        ring: &'t mut ququmatz::IoUring,
+        sink: &'t mut S,
+        read_ahead_ops: usize,
+    ) -> Self {
         let cache = ChunkCache::new(table.slot_count);
         Self {
             table,
+            ring,
+            sink,
             cache,
             read_ahead_ops: read_ahead_ops.max(1),
         }
@@ -53,12 +70,7 @@ impl<'t> FlushPass<'t> {
 
     /// # Errors
     /// Returns an error on I/O failure.
-    pub(super) fn apply(
-        mut self,
-        ring: &mut ququmatz::IoUring,
-        deletes: &[OutPoint],
-        inserts: Vec<Bucket>,
-    ) -> io::Result<()> {
+    pub(super) fn apply(mut self, deletes: &[OutPoint], inserts: Vec<Bucket>) -> io::Result<()> {
         let mut ops: Vec<(u64, FlushOp)> = deletes
             .iter()
             .map(|op| (self.table.ideal_slot(op), FlushOp::Delete(*op)))
@@ -74,9 +86,12 @@ impl<'t> FlushPass<'t> {
             let ideal = ops[index].0;
             if index == read_up_to {
                 let end = (index + self.read_ahead_ops).min(ops.len());
-                self.cache.retire_below(self.table, ring, self.cache.chunk_of(ideal))?;
+                self.publish_below(self.cache.chunk_of(ideal))?;
                 let ids = self.chunks_for(&ops[index..end], chunk_count);
-                self.cache.prefetch(self.table, ring, ids)?;
+                if ids.iter().any(|&id| self.cache.is_stale(id)) {
+                    self.settle()?;
+                }
+                self.cache.prefetch(self.table, self.ring, ids)?;
                 read_up_to = end;
             }
             match &ops[index].1 {
@@ -84,7 +99,32 @@ impl<'t> FlushPass<'t> {
                 FlushOp::Insert(bucket) => self.place(bucket.clone())?,
             }
         }
-        self.cache.retire_below(self.table, ring, u64::MAX)
+        let mut extents = self.cache.take_changes(u64::MAX);
+        extents.push(self.header_extent());
+        self.sink.publish(self.table, self.ring, extents)?;
+        self.settle()
+    }
+
+    fn publish_below(&mut self, id: u64) -> io::Result<()> {
+        let extents = self.cache.take_changes(id);
+        if extents.is_empty() {
+            return Ok(());
+        }
+        self.sink.publish(self.table, self.ring, extents)
+    }
+
+    fn settle(&mut self) -> io::Result<()> {
+        self.sink.settle(self.ring)?;
+        self.cache.settled();
+        Ok(())
+    }
+
+    fn header_extent(&self) -> Extent {
+        let mut bytes = vec![0u8; BUCKET_SIZE];
+        self.table
+            .header()
+            .encode((&mut bytes[..]).try_into().expect("header-sized buffer"));
+        Extent { offset: 0, bytes }
     }
 
     fn chunks_for(&self, ops: &[(u64, FlushOp)], chunk_count: u64) -> Vec<u64> {
@@ -98,12 +138,26 @@ impl<'t> FlushPass<'t> {
         ids
     }
 
+    fn bucket(&mut self, slot: u64) -> io::Result<Bucket> {
+        if self.cache.is_stale(self.cache.chunk_of(slot)) {
+            self.settle()?;
+        }
+        self.cache.bucket(self.table, slot)
+    }
+
+    fn set(&mut self, slot: u64, bucket: Option<&Bucket>) -> io::Result<()> {
+        if self.cache.is_stale(self.cache.chunk_of(slot)) {
+            self.settle()?;
+        }
+        self.cache.set(self.table, slot, bucket)
+    }
+
     fn remove(&mut self, op: &OutPoint) -> io::Result<()> {
         let ideal = self.table.ideal_slot(op);
         let mut dist: u16 = 1;
         let mut slot = ideal;
         loop {
-            let bucket = self.cache.bucket(self.table, slot)?;
+            let bucket = self.bucket(slot)?;
             if bucket.is_empty() || bucket.probe_distance < dist {
                 return Ok(());
             }
@@ -124,12 +178,12 @@ impl<'t> FlushPass<'t> {
         let mut prev = removed;
         let mut slot = (removed + 1) & self.table.mask;
         loop {
-            let mut bucket = self.cache.bucket(self.table, slot)?;
+            let mut bucket = self.bucket(slot)?;
             if bucket.is_empty() || bucket.probe_distance == 1 {
-                return self.cache.set(self.table, prev, None);
+                return self.set(prev, None);
             }
             bucket.probe_distance -= 1;
-            self.cache.set(self.table, prev, Some(&bucket))?;
+            self.set(prev, Some(&bucket))?;
             prev = slot;
             slot = (slot + 1) & self.table.mask;
         }
@@ -140,18 +194,18 @@ impl<'t> FlushPass<'t> {
         let ideal = self.table.ideal_slot(&current.outpoint());
         let mut slot = ideal;
         loop {
-            let existing = self.cache.bucket(self.table, slot)?;
+            let existing = self.bucket(slot)?;
             if existing.is_empty() {
-                self.cache.set(self.table, slot, Some(&current))?;
+                self.set(slot, Some(&current))?;
                 self.table.live_count += 1;
                 return Ok(());
             }
             if existing.matches(&current.outpoint()) {
                 current.probe_distance = existing.probe_distance;
-                return self.cache.set(self.table, slot, Some(&current));
+                return self.set(slot, Some(&current));
             }
             if existing.probe_distance < current.probe_distance {
-                self.cache.set(self.table, slot, Some(&current))?;
+                self.set(slot, Some(&current))?;
                 current = existing;
             }
             current.probe_distance += 1;

@@ -1,10 +1,15 @@
 use std::collections::HashMap;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use mantle::primitives::{BlockHeight, Hash256, OutPoint, Satoshi, ScriptPubKey};
 use mantle_consensus::chain_view::Coin;
 
+use crate::background::Extent;
+
 use super::super::chunk_cache::CHUNK_SLOTS;
+use super::super::chunk_sink::{ChunkSink, DirectSink};
+use super::super::extent_writer::ExtentWriter;
 use super::super::{overflow_path, Bucket, RobinHoodTable};
 use super::FlushPass;
 
@@ -65,10 +70,60 @@ impl Entry {
     }
 }
 
+/// Writes each step like [`DirectSink`], then checks that every coin the
+/// flush leaves alone is still found in the file, as a lookup between two
+/// steps would see it.
+struct CheckingSink<'m> {
+    before: &'m HashMap<OutPoint, Coin>,
+    after: &'m HashMap<OutPoint, Coin>,
+    steps: usize,
+}
+
+impl CheckingSink<'_> {
+    fn check(&self, table: &RobinHoodTable) {
+        for (op, coin) in self.after {
+            if self.before.get(op) == Some(coin) {
+                assert_eq!(
+                    table.get(op).unwrap().as_ref(),
+                    Some(coin),
+                    "step {} lost {op:?}",
+                    self.steps
+                );
+            }
+        }
+    }
+}
+
+impl ChunkSink for CheckingSink<'_> {
+    fn publish(
+        &mut self,
+        table: &RobinHoodTable,
+        ring: &mut ququmatz::IoUring,
+        extents: Vec<Extent>,
+    ) -> io::Result<()> {
+        ExtentWriter::write(table, ring, &extents)?;
+        self.steps += 1;
+        self.check(table);
+        Ok(())
+    }
+
+    fn settle(&mut self, _ring: &mut ququmatz::IoUring) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn replaced(
+        &mut self,
+        _table: &RobinHoodTable,
+        _ring: &mut ququmatz::IoUring,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// A table plus the map of what it must contain, flushed through
 /// [`FlushPass`] with a chosen read-ahead.
 struct Harness {
-    _scratch: Scratch,
+    scratch: Scratch,
     table: RobinHoodTable,
     ring: ququmatz::IoUring,
     model: HashMap<OutPoint, Coin>,
@@ -80,7 +135,7 @@ impl Harness {
         let table = RobinHoodTable::open_with_capacity(scratch.path(), slots).unwrap();
         let ring = crate::engine::ring_budget::RingBudget::new(64, 16).build().unwrap();
         Self {
-            _scratch: scratch,
+            scratch,
             table,
             ring,
             model: HashMap::new(),
@@ -88,21 +143,44 @@ impl Harness {
     }
 
     fn flush(&mut self, deletes: &[OutPoint], inserts: &[(OutPoint, Coin)], read_ahead: usize) {
+        let before = self.model.clone();
         for op in deletes {
             self.model.remove(op);
         }
         for (op, coin) in inserts {
             self.model.insert(*op, coin.clone());
         }
-        let buckets = inserts
+        let buckets = self.buckets(inserts);
+        let mut sink = CheckingSink {
+            before: &before,
+            after: &self.model,
+            steps: 0,
+        };
+        FlushPass::with_read_ahead(&mut self.table, &mut self.ring, &mut sink, read_ahead)
+            .apply(deletes, buckets)
+            .unwrap();
+    }
+
+    fn flush_direct(&mut self, deletes: &[OutPoint], inserts: &[(OutPoint, Coin)], read_ahead: usize) {
+        for op in deletes {
+            self.model.remove(op);
+        }
+        for (op, coin) in inserts {
+            self.model.insert(*op, coin.clone());
+        }
+        let buckets = self.buckets(inserts);
+        FlushPass::with_read_ahead(&mut self.table, &mut self.ring, &mut DirectSink, read_ahead)
+            .apply(deletes, buckets)
+            .unwrap();
+    }
+
+    fn buckets(&mut self, inserts: &[(OutPoint, Coin)]) -> Vec<Bucket> {
+        inserts
             .iter()
             .map(|(op, coin)| {
                 Bucket::from_outpoint_and_coin(op, coin, 1, &mut self.table.overflow).unwrap()
             })
-            .collect();
-        FlushPass::with_read_ahead(&mut self.table, read_ahead)
-            .apply(&mut self.ring, deletes, buckets)
-            .unwrap();
+            .collect()
     }
 
     fn check(&self) {
@@ -201,6 +279,34 @@ fn many_random_flushes_stay_consistent() {
         next += 90;
         live.extend(inserts.iter().map(|(op, _)| *op));
         harness.flush(&deletes, &inserts, 1 + (round as usize % 7) * 13);
+        harness.check();
+    }
+}
+
+#[test]
+fn the_header_records_the_live_count_after_a_flush() {
+    let mut harness = Harness::new("header", 512);
+    let inserts: Vec<_> = (0..120).map(|i| (Entry::hashed(i), Entry::coin(i))).collect();
+    harness.flush_direct(&[], &inserts, 16);
+    let reopened = RobinHoodTable::open_existing(harness.scratch.path()).unwrap();
+    assert_eq!(reopened.len(), 120);
+}
+
+#[test]
+fn every_step_of_a_dense_flush_keeps_untouched_coins_findable() {
+    let mut harness = Harness::new("dense-steps", 4 * CHUNK_SLOTS);
+    let first: Vec<_> = (0..180).map(|i| (Entry::hashed(i), Entry::coin(i))).collect();
+    harness.flush(&[], &first, 5);
+    for round in 0..6u32 {
+        let deletes: Vec<_> = (0..180)
+            .filter(|i| (i + round) % 5 == 0)
+            .map(Entry::hashed)
+            .filter(|op| harness.model.contains_key(op))
+            .collect();
+        let inserts: Vec<_> = (1000 + round * 40..1040 + round * 40)
+            .map(|i| (Entry::hashed(i), Entry::coin(i)))
+            .collect();
+        harness.flush(&deletes, &inserts, 3);
         harness.check();
     }
 }

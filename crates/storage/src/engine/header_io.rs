@@ -200,12 +200,21 @@ impl HeaderStore {
     /// # Errors
     /// Returns `EngineError::Io` on flush, seek, write or sync failure.
     pub fn sync_checkpoint(&mut self) -> Result<(), EngineError> {
+        self.sync_checkpoint_at(self.tip.height)
+    }
+
+    /// Flush and sync the header file, then record `height` as the last
+    /// height whose UTXO state is durable.
+    ///
+    /// # Errors
+    /// Returns `EngineError::Io` on flush, seek, write or sync failure.
+    pub fn sync_checkpoint_at(&mut self, height: BlockHeight) -> Result<(), EngineError> {
         self.header_file.flush()?;
         self.header_file.sync_all()?;
         self.checkpoint_file
             .seek(SeekFrom::Start(0))
             ?;
-        let h = self.tip.height.to_u32().to_le_bytes();
+        let h = height.to_u32().to_le_bytes();
         self.checkpoint_file.write_all(&h)?;
         self.checkpoint_file.sync_all()?;
         Ok(())

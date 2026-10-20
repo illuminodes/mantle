@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 use std::io;
 
-use super::completions::OwedCompletions;
-use super::{pread_exact, uring_err, Bucket, RobinHoodTable, BUCKET_SIZE};
+use crate::background::Extent;
+
+use super::uring_batch::UringBatch;
+use super::{pread_exact, Bucket, RobinHoodTable, BUCKET_SIZE};
 
 pub(super) const CHUNK_SLOTS: u64 = 64;
 
@@ -14,11 +16,16 @@ struct Chunk {
 /// Contiguous runs of table slots held in memory while a flush rewrites them.
 ///
 /// Chunks named up front are read in one `io_uring` batch; a slot outside
-/// them is read with one `pread` of its chunk. Dirty chunks go back to disk
-/// in one batch of writes.
+/// them is read with one `pread` of its chunk. Changed chunks leave as
+/// [`Extent`]s for the caller to write. A chunk evicted since the caller
+/// last confirmed its writes landed is stale, because reading it back from
+/// the file before then could see the old bytes. Eviction only moves
+/// forward, so the stale chunks are one range of ids.
 pub(super) struct ChunkCache {
     chunk_slots: u64,
     chunks: BTreeMap<u64, Chunk>,
+    evicted_below: u64,
+    settled_below: u64,
 }
 
 impl ChunkCache {
@@ -26,6 +33,8 @@ impl ChunkCache {
         Self {
             chunk_slots: CHUNK_SLOTS.min(slot_count),
             chunks: BTreeMap::new(),
+            evicted_below: 0,
+            settled_below: 0,
         }
     }
 
@@ -46,6 +55,22 @@ impl ChunkCache {
         (self.chunk_of(slot), index * BUCKET_SIZE)
     }
 
+    fn offset_of(&self, id: u64) -> u64 {
+        RobinHoodTable::slot_offset(id * self.chunk_slots)
+    }
+
+    /// Whether reading chunk `id` from the file now could miss a write
+    /// still on its way.
+    pub(super) fn is_stale(&self, id: u64) -> bool {
+        !self.chunks.contains_key(&id) && (self.settled_below..self.evicted_below).contains(&id)
+    }
+
+    /// The caller has confirmed that every extent handed out so far is in
+    /// the file.
+    pub(super) fn settled(&mut self) {
+        self.settled_below = self.evicted_below;
+    }
+
     /// Read every listed chunk that is not already held, in one batch.
     pub(super) fn prefetch(
         &mut self,
@@ -56,7 +81,8 @@ impl ChunkCache {
         let fd = table.uring_fd();
         let len = self.chunk_len_u32();
         let bytes = self.chunk_bytes();
-        let mut batch = UringBatch::new(len);
+        let chunk_slots = self.chunk_slots;
+        let mut batch = UringBatch::new();
         for id in ids {
             if self.chunks.contains_key(&id) {
                 continue;
@@ -72,22 +98,19 @@ impl ChunkCache {
                     fd,
                     chunk.bytes.as_mut_ptr(),
                     len,
-                    RobinHoodTable::slot_offset(id * self.chunk_slots),
+                    RobinHoodTable::slot_offset(id * chunk_slots),
                 )
             };
-            batch.push(table, ring, sqe)?;
+            batch.push(table, ring, sqe, len)?;
         }
         batch.drain(ring)
     }
 
     fn load(&mut self, table: &RobinHoodTable, id: u64) -> io::Result<&mut Chunk> {
+        debug_assert!(!self.is_stale(id), "chunk {id} read before its write settled");
         if !self.chunks.contains_key(&id) {
             let mut bytes = vec![0; self.chunk_bytes()];
-            pread_exact(
-                &table.file,
-                &mut bytes,
-                RobinHoodTable::slot_offset(id * self.chunk_slots),
-            )?;
+            pread_exact(&table.file, &mut bytes, self.offset_of(id))?;
             self.chunks.insert(id, Chunk { bytes, dirty: false });
         }
         Ok(self.chunks.get_mut(&id).expect("chunk just loaded"))
@@ -122,83 +145,29 @@ impl ChunkCache {
         Ok(())
     }
 
-    /// Write every dirty chunk below `id` in one batch, then forget every
-    /// chunk below `id`.
-    pub(super) fn retire_below(
-        &mut self,
-        table: &RobinHoodTable,
-        ring: &mut ququmatz::IoUring,
-        id: u64,
-    ) -> io::Result<()> {
+    /// Hand out every changed chunk: chunks below `id` are evicted and
+    /// leave without a copy, the rest are copied and stay held.
+    pub(super) fn take_changes(&mut self, id: u64) -> Vec<Extent> {
         let kept = self.chunks.split_off(&id);
-        let retired = std::mem::replace(&mut self.chunks, kept);
-        let fd = table.uring_fd();
-        let mut batch = UringBatch::new(self.chunk_len_u32());
-        for (&id, chunk) in retired.iter().filter(|(_, c)| c.dirty) {
-            // SAFETY: the chunks stay alive until the batch is drained below.
-            let sqe = unsafe {
-                ququmatz::Sqe::write_ptr(
-                    fd,
-                    chunk.bytes.as_ptr(),
-                    batch.len,
-                    RobinHoodTable::slot_offset(id * self.chunk_slots),
-                )
-            };
-            batch.push(table, ring, sqe)?;
+        let evicted = std::mem::replace(&mut self.chunks, kept);
+        if let Some((&last, _)) = evicted.last_key_value() {
+            self.evicted_below = self.evicted_below.max(last + 1);
         }
-        batch.drain(ring)
-    }
-}
-
-/// Fixed-length reads or writes pushed onto a ring, submitted when the queue
-/// fills and when drained, every completion checked for a full transfer.
-struct UringBatch {
-    len: u32,
-    owed: OwedCompletions,
-}
-
-impl UringBatch {
-    fn new(len: u32) -> Self {
-        Self {
-            len,
-            owed: OwedCompletions::default(),
+        let mut extents: Vec<Extent> = evicted
+            .into_iter()
+            .filter(|(_, chunk)| chunk.dirty)
+            .map(|(id, chunk)| Extent {
+                offset: self.offset_of(id),
+                bytes: chunk.bytes,
+            })
+            .collect();
+        for (&id, chunk) in self.chunks.iter_mut().filter(|(_, c)| c.dirty) {
+            chunk.dirty = false;
+            extents.push(Extent {
+                offset: RobinHoodTable::slot_offset(id * self.chunk_slots),
+                bytes: chunk.bytes.clone(),
+            });
         }
-    }
-
-    fn push(
-        &mut self,
-        table: &RobinHoodTable,
-        ring: &mut ququmatz::IoUring,
-        sqe: ququmatz::Sqe,
-    ) -> io::Result<()> {
-        loop {
-            match ring.push(table.apply_fd_flags(sqe)) {
-                Ok(()) => {
-                    self.owed.pushed();
-                    return Ok(());
-                }
-                Err(ququmatz::Error::Submit(ququmatz::SubmitError::QueueFull)) => {
-                    self.drain(ring)?;
-                }
-                Err(e) => return Err(uring_err(e)),
-            }
-        }
-    }
-
-    fn drain(&mut self, ring: &mut ququmatz::IoUring) -> io::Result<()> {
-        let len = self.len;
-        self.owed.drain(ring, |cqe| {
-            let res = cqe.raw_result();
-            if res < 0 {
-                Err(io::Error::from_raw_os_error(-res))
-            } else if u32::try_from(res).ok() == Some(len) {
-                Ok(())
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!("table chunk transfer of {res} bytes, expected {len}"),
-                ))
-            }
-        })
+        extents
     }
 }
