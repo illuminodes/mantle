@@ -1,6 +1,6 @@
 # Validation Architecture
 
-Status: **implemented, not yet cross-checked against Core.** Stages 1, 2 and 3 exist in `crates/consensus/src/validation/`, including script verification, the witness commitment, lock-time finality, BIP68 sequence locks and BIP141 sigop cost. Remaining gaps are listed in §"Known gaps". Subject to revision as implementation continues.
+Status: **implemented; accepts every mainnet block to height 972,245.** Stages 1, 2 and 3 exist in `crates/consensus/src/validation/`, including script verification, the witness commitment, lock-time finality, BIP68 sequence locks and BIP141 sigop cost. Remaining gaps are listed in §"Known gaps". Subject to revision as implementation continues.
 
 This document covers the consensus-validation subsystem: how blocks and transactions are validated, how the validator interacts with the storage layer via `ChainView`, the script-verification strategy, and the cryptographic concerns specific to using `k256` instead of `libsecp256k1`. It does *not* cover mempool *policy* (relay rules, fee filters) — those are a separate layer above consensus.
 
@@ -353,7 +353,7 @@ Things this document does *not* commit to:
 
 ## Known gaps
 
-Rules that differ from Core or are unverified. `mantle-replay --utxo-hash-file` can compare the UTXO set against Core's MuHash on real chain data, but no such run has been recorded yet; see `conformance.md` §"Current coverage".
+Rules that differ from Core or are unverified. A full mainnet replay to 972,245 accepted every block, so no rule rejects a block Core accepted. Rejection of invalid blocks is compared against Core only for taproot and tapscript (`script_assets`). `mantle-replay --utxo-hash-file` can compare the UTXO set against Core's MuHash, but no such run has been recorded yet; see `conformance.md` §"Current coverage".
 
 - **Block weight**: Stage 1 computes weight from the owned `Block`; the zero-copy `validate_block_wire` path counts base size only.
 - **Network parameters**: soft-fork activation heights (`ScriptFlags::for_height`, BIP34/65/66 in `pow.rs`) are mainnet values. `mantle-replay` refuses to validate testnet and signet until per-network parameters exist.

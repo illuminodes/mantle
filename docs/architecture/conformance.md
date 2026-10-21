@@ -33,10 +33,12 @@ What is checked against Bitcoin Core today, and what is not.
 | Script flag activation heights (mainnet) | Yes | proptest vs `bitcoinconsensus::height_to_flags` |
 | CSV edge cases | Yes | `fuzz/tests/csv_oracle_probe.rs` matrix |
 | Known fuzzer crashes | Yes, replayed | `fuzz/tests/regression.rs` over `fuzz/tests/regression/` |
+| Taproot and tapscript verification | Yes, all 2,244 cases agree | `conformance/tests/script_assets/` over Core's `script_assets_test.json` (qa-assets `bd0ccbd`), run in CI before the replay |
+| Every mainnet block, genesis to 972,245 | Accepted, as Core did; 0 failures | `mantle-replay` from genesis with all scripts, CI job `full-chain-verify` on commit `d66dadd` |
 | BIP vectors | Against BIP-published expectations, not Core | `conformance/tests/bip_vectors/` |
 | MuHash3072 algorithm | Yes | Core's `crypto_tests` vectors in `crates/utxo-hash` |
 | UTXO set after replay | When reference values are supplied | `mantle-replay --utxo-hash-file`, against `gettxoutsetinfo muhash <height>` |
-| Block structure, context, connect | Only through the UTXO hash | — |
+| Block structure, context, connect | Valid mainnet blocks only (full replay); rejection of invalid blocks is not compared | — |
 | Error kinds | No | — |
 
 Limits of the current reference: `libbitcoinconsensus` was removed from Core in v28, so the `bitcoinconsensus` crate is frozen at v26 and covers only script verification. The UTXO-set hash covers the result of every block rule, but only for blocks Core accepted: it cannot show that Mantle rejects an invalid block. `libbitcoinkernel` would cover that.
@@ -181,7 +183,7 @@ impl BlockDirReader {
 
 ### `mantle-replay`
 
-**Status: implemented differently.** `replay/` is a binary, not a library harness. It fetches blocks from P2P peers, runs Stage 1, Stage 2 and `connect_block`, and commits to `RobinHoodEngine` storage. It has no stage selection, no snapshot diffing, and no comparison against Core; `--assume-valid` is parsed but ignored. The sketch below is the original design.
+**Status: implemented differently.** `replay/` is a binary, not a library harness. It fetches blocks from P2P peers, runs Stage 1, Stage 2 and `connect_block`, and commits to `RobinHoodEngine` storage. It has no stage selection and no snapshot diffing; the only comparison against Core is the optional UTXO-set MuHash (`--utxo-hash-file`). `--assume-valid` is refused. A full run from genesis to 972,245 with every script checked completed with no failures. The sketch below is the original design.
 
 The harness that drives the historical-replay pipeline. Consumes `mantle-blkdat`'s block iterator, drives Mantle's validator through each stage, optionally compares against Core via `mantle-conformance` and via UTXO snapshots.
 
