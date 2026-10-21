@@ -1,14 +1,14 @@
 //! Script verify flags and per-height activation table.
 //!
 //! `ScriptFlags` is a `u32` newtype with associated `const` named bits.
-//! Bit positions match `bitcoinconsensus`'s public C ABI so the differential
-//! fuzzer can pass the same value to both sides without translation.
+//! Bit positions match Bitcoin Core's `SCRIPT_VERIFY_*` constants, so a value
+//! can be compared with Core's without translation.
 
 use std::ops::{BitAnd, BitOr, BitOrAssign, Not, Sub};
 
 use mantle::primitives::BlockHeight;
 
-/// Script verification flags. Bit positions match `bitcoinconsensus`.
+/// Script verification flags. Bit positions match Core's `SCRIPT_VERIFY_*`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ScriptFlags(u32);
 
@@ -102,7 +102,7 @@ impl ScriptFlags {
         Self(bits)
     }
 
-    /// Raw bit representation, matching `bitcoinconsensus`'s `u32`.
+    /// Raw bit representation, matching Core's `SCRIPT_VERIFY_*` bits.
     #[inline]
     #[must_use]
     pub const fn bits(self) -> u32 {
@@ -125,7 +125,7 @@ impl ScriptFlags {
 
     /// Mainnet flag set active at `height`, matching Core's behaviour.
     ///
-    /// The conformance tests compare this against `bitcoinconsensus::height_to_flags`.
+    /// `conformance/tests/proptest.rs` compares this against Core's table.
     #[must_use]
     pub fn for_height(height: BlockHeight) -> Self {
         let h = height.to_u32();

@@ -23,6 +23,7 @@ use mantle_consensus::script::verify::{ScriptVerifier, verify_script};
 use mantle_consensus::script::{
     InterpStackElement, Interpreter, NopSigChecker, ScriptFlags, SigVersion,
 };
+use mantle_conformance::conformance;
 use ripemd::Ripemd160;
 use sha2::{Digest, Sha256};
 use std::hint::black_box;
@@ -672,14 +673,22 @@ fn nested_if_script_btccore(bencher: divan::Bencher) {
     bencher.bench(|| eval_legacy(black_box(&script)));
 }
 
-// ── bitcoinconsensus (libbitcoinconsensus via FFI) ────────────────────────────
+// ── libbitcoinconsensus via mantle-conformance ────────────────────────────────
 // These benches call the same libbitcoinconsensus that ships with Bitcoin Core
-// v26.0, linked into this process via the `bitcoinconsensus` crate.  Run them
+// v26.0, linked into this process through the `mantle-conformance` oracle.  Run them
 // alongside the mantle equivalents to get a same-hardware, same-process
 // comparison — no need to build bench_bitcoin separately.
 //
 // Setup is identical to the mantle benches above: same keys, same sighash,
 // same wire encoding.  The only difference is the verifier.
+
+/// The flags `bitcoinconsensus::verify` applies when given no flags.
+const PRE_TAPROOT: u32 = conformance::VERIFY_P2SH
+    | conformance::VERIFY_DERSIG
+    | conformance::VERIFY_NULLDUMMY
+    | conformance::VERIFY_CHECKLOCKTIMEVERIFY
+    | conformance::VERIFY_CHECKSEQUENCEVERIFY
+    | conformance::VERIFY_WITNESS;
 
 fn encode_tx(tx: &Transaction) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -711,12 +720,13 @@ fn btccore_verify_p2wpkh(bencher: divan::Bencher) {
     let tx_wire = encode_tx(&tx);
 
     bencher.bench(|| {
-        bitcoinconsensus::verify(
+        conformance::verify_script(
             black_box(&spk),
             black_box(amount.to_u64()),
             black_box(&tx_wire),
             None,
             0,
+            PRE_TAPROOT,
         )
         .expect("p2wpkh must verify");
     });
@@ -791,7 +801,7 @@ fn btccore_verify_p2tr_keypath(bencher: divan::Bencher) {
     };
     let tx_wire = encode_tx(&tx);
 
-    let utxo = bitcoinconsensus::Utxo {
+    let utxo = conformance::Utxo {
         script_pubkey: spk.as_ptr(),
         script_pubkey_len: u32::try_from(spk.len()).expect("spk fits u32"),
         value: i64::try_from(amount.to_u64()).expect("amount fits i64"),
@@ -799,12 +809,13 @@ fn btccore_verify_p2tr_keypath(bencher: divan::Bencher) {
 
     // bench_local: Utxo holds a raw pointer so it is !Sync; FnMut suffices here.
     bencher.bench_local(|| {
-        bitcoinconsensus::verify(
+        conformance::verify_script(
             black_box(&spk),
             black_box(amount.to_u64()),
             black_box(&tx_wire),
             Some(black_box(std::slice::from_ref(&utxo))),
             0,
+            PRE_TAPROOT | conformance::VERIFY_TAPROOT,
         )
         .expect("p2tr key-path must verify");
     });

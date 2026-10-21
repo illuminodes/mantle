@@ -8,11 +8,12 @@ publish = false
 [lints]
 workspace = true
 
-# This crate is test-infrastructure only. It must never appear as a
-# [dependency] of mantle-node or mantle — only as a [dev-dependency]
-# of test/fuzz crates.
+# Test infrastructure only, and the only crate that links Bitcoin Core's
+# libbitcoinconsensus, as an oracle to compare against. It must never be a
+# [dependency] of a node crate — only a [dev-dependency] of bench, or a
+# dependency of the out-of-workspace fuzz crate.
 [dependencies]
-bitcoinconsensus = { workspace = true }
+bitcoinconsensus = "0.106.0"
 mantle = { path = "../crates/mantle" }
 mantle-consensus = { path = "../crates/consensus" }
 proptest = "1"

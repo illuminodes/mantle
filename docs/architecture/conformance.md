@@ -112,7 +112,7 @@ Three new crates, each with a tightly scoped responsibility. All three are dev-o
 
 **Status: implemented** at `conformance/`.
 
-The differential-test glue. Uses the `bitcoinconsensus = "0.106.0"` crate, which bundles the Bitcoin Core v26 C++ source and builds it as part of `cargo build` — no system library dependency, pinned to a specific Core version, reproducible on any machine.
+The differential-test glue, and the only crate that depends on `bitcoinconsensus`. `bench` reaches Core through it as a dev-dependency; no node crate depends on either. Uses the `bitcoinconsensus = "0.106.0"` crate, which bundles the Bitcoin Core v26 C++ source and builds it as part of `cargo build` — no system library dependency, pinned to a specific Core version, reproducible on any machine.
 
 **Public surface (actual):**
 

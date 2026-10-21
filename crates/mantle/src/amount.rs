@@ -32,7 +32,7 @@ impl Satoshi {
     /// Extract the underlying `u64` count of satoshis.
     ///
     /// Prefer Satoshi's own arithmetic ops where possible. Use this only
-    /// at FFI boundaries (e.g. `bitcoinconsensus`) or for cache keys.
+    /// at serialization or FFI boundaries, or for cache keys.
     #[inline]
     #[must_use]
     pub const fn to_u64(self) -> u64 {

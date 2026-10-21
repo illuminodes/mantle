@@ -280,7 +280,8 @@ impl<'a, T: TxView> ScriptVerifier<'a, T> {
 ///
 /// Returns `Ok(())` iff the input authorises spending under those rules.
 ///
-/// Mirrors the `bitcoinconsensus` C API for fuzzer differential parity — prefer
+/// Mirrors the shape of Core's per-input script check, for the differential
+/// fuzzer — prefer
 /// [`ScriptVerifier`] for new callers.
 ///
 /// # Errors

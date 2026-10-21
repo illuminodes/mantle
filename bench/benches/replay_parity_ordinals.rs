@@ -27,7 +27,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use bitcoinconsensus::Utxo;
+use mantle_conformance::conformance::{self, Utxo};
 use mantle::codec::{Decode, Encode};
 use mantle::primitives::{Block, Hash256, OutPoint, Satoshi, Transaction, TxHash, TxOut};
 use mantle_consensus::script::{ScriptFlags, SpentOutputs, verify_script_with_spent_outputs};
@@ -134,7 +134,7 @@ fn build_corpus() -> Corpus {
             eprintln!("replay_parity_ordinals: missing block {h}, stopping");
             break;
         };
-        let flags = bitcoinconsensus::height_to_flags(h);
+        let flags = conformance::flags_for_height(h);
 
         for tx in &block.transactions {
             let txid = tx.txid().expect("txid");
@@ -277,7 +277,7 @@ fn bitcoinconsensus_oracle(bencher: divan::Bencher) {
             }
             let n_in = job.n_in as usize;
             let prev = &rec.spent_outputs[n_in];
-            bitcoinconsensus::verify_with_flags(
+            conformance::verify_script(
                 black_box(prev.script_pubkey.as_slice()),
                 black_box(prev.value.to_u64()),
                 black_box(&rec.tx_wire),

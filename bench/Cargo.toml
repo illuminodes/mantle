@@ -129,4 +129,4 @@ ripemd = { workspace = true }
 
 [dev-dependencies]
 divan = "0.1"
-bitcoinconsensus = { workspace = true }
+mantle-conformance = { path = "../conformance" }

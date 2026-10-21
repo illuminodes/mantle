@@ -39,6 +39,8 @@ use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
+use mantle_conformance::conformance;
+
 use mantle::codec::{Decode, Encode};
 use mantle::primitives::{Block, Hash256, OutPoint, Transaction, TxHash, TxOut};
 use mantle_consensus::script::{ScriptFlags, verify_script};
@@ -98,7 +100,7 @@ fn build_jobs() -> Vec<Job> {
             eprintln!("replay_parity: missing block {h}, stopping at the prefix already loaded");
             break;
         };
-        let flags = bitcoinconsensus::height_to_flags(h);
+        let flags = conformance::flags_for_height(h);
 
         for tx in &block.transactions {
             let txid = tx.txid().expect("txid");
@@ -193,7 +195,7 @@ fn bitcoinconsensus_oracle(bencher: divan::Bencher) {
             // Pre-segwit corpus → spent_outputs is irrelevant (TAPROOT bit
             // is never set). Pass `None` to match how the replay binary
             // would use it.
-            let res = bitcoinconsensus::verify_with_flags(
+            let res = conformance::verify_script(
                 black_box(&job.spk),
                 black_box(job.amount),
                 black_box(&job.tx_wire),
