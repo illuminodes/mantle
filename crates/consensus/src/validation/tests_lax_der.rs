@@ -35,7 +35,10 @@ impl PaddedDerSpend {
 #[test]
 fn a_signature_with_padded_der_integers_is_valid_before_bip66() {
     assert!(!PaddedDerSpend::flags_at_its_height().contains(ScriptFlags::DERSIG));
-    assert_eq!(PaddedDerSpend::verify(PaddedDerSpend::flags_at_its_height()), Ok(()));
+    assert_eq!(
+        PaddedDerSpend::verify(PaddedDerSpend::flags_at_its_height()),
+        Ok(())
+    );
 }
 
 #[test]

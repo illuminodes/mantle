@@ -45,8 +45,13 @@ impl HeaderContextExt for BlockHeader {
             .ok_or(ValidationError::UnknownParent)?;
         let height = parent_height + 1;
 
-        let expected_bits =
-            expected_nbits(parent_height, parent, view, self.time(), allow_min_difficulty)?;
+        let expected_bits = expected_nbits(
+            parent_height,
+            parent,
+            view,
+            self.time(),
+            allow_min_difficulty,
+        )?;
         if self.bits() != expected_bits {
             return Err(ValidationError::UnexpectedDifficulty);
         }

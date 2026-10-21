@@ -1,8 +1,8 @@
 use mantle::collections::{PrehashedMap, PrehashedSet};
 use mantle::primitives::{BlockHeight, OutPoint, Satoshi};
 
-use crate::chain_view::{Coin, NewCoin};
 use super::tx_script_context::Prevout;
+use crate::chain_view::{Coin, NewCoin};
 
 /// The output an input spends, whether it came from the UTXO set or from an
 /// earlier transaction in the same block.

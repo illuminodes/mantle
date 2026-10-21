@@ -524,9 +524,7 @@ mod tests {
         // vout = 0xFFFFFFFF
         buf.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
         // VarInt(scriptSig.len())
-        VarInt::from(script_sig.len())
-            .encode(&mut buf)
-            .unwrap();
+        VarInt::from(script_sig.len()).encode(&mut buf).unwrap();
         buf.extend_from_slice(script_sig);
         // sequence
         buf.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
@@ -538,9 +536,7 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(txid);
         buf.extend_from_slice(&vout.to_le_bytes());
-        VarInt::from(script_sig.len())
-            .encode(&mut buf)
-            .unwrap();
+        VarInt::from(script_sig.len()).encode(&mut buf).unwrap();
         buf.extend_from_slice(script_sig);
         buf.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
         buf
@@ -550,9 +546,7 @@ mod tests {
     fn encode_output(value: u64, script_pubkey: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&value.to_le_bytes());
-        VarInt::from(script_pubkey.len())
-            .encode(&mut buf)
-            .unwrap();
+        VarInt::from(script_pubkey.len()).encode(&mut buf).unwrap();
         buf.extend_from_slice(script_pubkey);
         buf
     }
@@ -600,10 +594,7 @@ mod tests {
         let mut seen = HashSet::new();
         let r = scan_tx_wire(&wire, 0, &mut seen);
         assert!(
-            matches!(
-                r,
-                Err(ValidationError::CoinbaseScriptSigLength { len: 1 })
-            ),
+            matches!(r, Err(ValidationError::CoinbaseScriptSigLength { len: 1 })),
             "1-byte coinbase scriptSig must fail, got: {r:?}"
         );
     }
@@ -615,10 +606,7 @@ mod tests {
         let mut seen = HashSet::new();
         let r = scan_tx_wire(&wire, 0, &mut seen);
         assert!(
-            matches!(
-                r,
-                Err(ValidationError::CoinbaseScriptSigLength { len: 0 })
-            ),
+            matches!(r, Err(ValidationError::CoinbaseScriptSigLength { len: 0 })),
             "0-byte coinbase scriptSig must fail, got: {r:?}"
         );
     }
@@ -648,7 +636,10 @@ mod tests {
         let wire = build_coinbase_tx(&script_sig, &[(50_0000_0000, &[0xac])]);
         let mut seen = HashSet::new();
         let r = scan_tx_wire(&wire, 0, &mut seen);
-        assert!(r.is_ok(), "100-byte coinbase scriptSig must pass, got: {r:?}");
+        assert!(
+            r.is_ok(),
+            "100-byte coinbase scriptSig must pass, got: {r:?}"
+        );
     }
 
     #[test]
@@ -733,10 +724,7 @@ mod tests {
         let mut seen = HashSet::new();
         let r = scan_tx_wire(&wire, 1, &mut seen);
         assert!(
-            matches!(
-                r,
-                Err(ValidationError::EmptyOutputs { tx_index: 1 })
-            ),
+            matches!(r, Err(ValidationError::EmptyOutputs { tx_index: 1 })),
             "zero outputs must fail, got: {r:?}"
         );
     }
@@ -748,10 +736,7 @@ mod tests {
         let mut seen = HashSet::new();
         let r = scan_tx_wire(&wire, 0, &mut seen);
         assert!(
-            matches!(
-                r,
-                Err(ValidationError::EmptyOutputs { tx_index: 0 })
-            ),
+            matches!(r, Err(ValidationError::EmptyOutputs { tx_index: 0 })),
             "coinbase with zero outputs must fail, got: {r:?}"
         );
     }
@@ -840,10 +825,7 @@ mod tests {
         let mut seen = HashSet::new();
         let r = scan_tx_wire(&wire, 1, &mut seen);
         assert!(
-            matches!(
-                r,
-                Err(ValidationError::EmptyInputs { tx_index: 1 })
-            ),
+            matches!(r, Err(ValidationError::EmptyInputs { tx_index: 1 })),
             "zero inputs must fail with EmptyInputs, got: {r:?}"
         );
     }
@@ -893,10 +875,7 @@ mod tests {
         let mut seen = HashSet::new();
         let r = scan_tx_wire(&wire, 1, &mut seen);
         assert!(
-            matches!(
-                r,
-                Err(ValidationError::DuplicateInput { tx_index: 1 })
-            ),
+            matches!(r, Err(ValidationError::DuplicateInput { tx_index: 1 })),
             "duplicate inputs must fail with DuplicateInput, got: {r:?}"
         );
     }

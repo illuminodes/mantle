@@ -208,7 +208,10 @@ fn p2sh_sigops_come_from_the_redeem_script() {
     let script_sig = [0x00, 0x03, 0x52, 0x53, 0xae];
     assert_eq!(SigopCost::p2sh(&script_sig, &p2sh_spk), 3);
     assert_eq!(SigopCost::p2sh(&script_sig, &[0x51]), 0);
-    assert_eq!(SigopCost::p2sh(&[0xac, 0x03, 0x52, 0x53, 0xae], &p2sh_spk), 0);
+    assert_eq!(
+        SigopCost::p2sh(&[0xac, 0x03, 0x52, 0x53, 0xae], &p2sh_spk),
+        0
+    );
 }
 
 #[test]
@@ -235,14 +238,20 @@ fn time_locks_use_median_time_past_from_bip113() {
         BlockTime::new(block_time),
         BlockTime::new(mtp),
     );
-    assert!(before.is_final(&tx), "pre-BIP113 time locks compare against the block time");
+    assert!(
+        before.is_final(&tx),
+        "pre-BIP113 time locks compare against the block time"
+    );
 
     let after = TxFinality::new(
         TxFinality::BIP113_HEIGHT,
         BlockTime::new(block_time),
         BlockTime::new(mtp),
     );
-    assert!(!after.is_final(&tx), "post-BIP113 time locks compare against median time past");
+    assert!(
+        !after.is_final(&tx),
+        "post-BIP113 time locks compare against median time past"
+    );
 }
 
 #[test]
@@ -253,7 +262,10 @@ fn context_validation_rejects_a_non_final_transaction() {
     let block = Fixture::block(
         tip.hash,
         1_300_000_000 + 12 * 600,
-        vec![Fixture::coinbase(height), Fixture::spend(201, Sequence::new(0))],
+        vec![
+            Fixture::coinbase(height),
+            Fixture::spend(201, Sequence::new(0)),
+        ],
     );
     assert_eq!(
         validate_block_context_with_clock(&block, &view, &FixedClock(u64::MAX / 2), false),
@@ -264,7 +276,10 @@ fn context_validation_rejects_a_non_final_transaction() {
 #[test]
 fn mainnet_block_481828_witness_commitment_verifies() {
     let block = Fixture::mainnet_481828();
-    assert_eq!(WitnessCommitment::check(&block, BlockHeight::new(481_828)), Ok(()));
+    assert_eq!(
+        WitnessCommitment::check(&block, BlockHeight::new(481_828)),
+        Ok(())
+    );
 }
 
 #[test]

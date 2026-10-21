@@ -613,7 +613,10 @@ mod tests {
 
         let mut count = 0;
         for input in TxView::inputs(&tx_ref) {
-            assert_eq!(input.previous_output().txid, Hash256::from_bytes([0x42; 32]));
+            assert_eq!(
+                input.previous_output().txid,
+                Hash256::from_bytes([0x42; 32])
+            );
             assert_eq!(input.previous_output().vout, 7);
             assert_eq!(input.sequence(), Sequence::new(0xffff_fffe));
             // Witness should be populated from the cursor.

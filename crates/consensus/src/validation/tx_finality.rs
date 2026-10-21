@@ -18,7 +18,11 @@ impl TxFinality {
     /// Mainnet height at which BIP113 (with BIP68 and BIP112) became active.
     pub(super) const BIP113_HEIGHT: BlockHeight = BlockHeight::new(419_328);
 
-    pub(super) fn new(height: BlockHeight, block_time: BlockTime, median_time_past: BlockTime) -> Self {
+    pub(super) fn new(
+        height: BlockHeight,
+        block_time: BlockTime,
+        median_time_past: BlockTime,
+    ) -> Self {
         let cutoff_time = if height >= Self::BIP113_HEIGHT {
             median_time_past
         } else {
@@ -43,7 +47,9 @@ impl TxFinality {
         if lock.to_u32() < limit {
             return true;
         }
-        tx.inputs.iter().all(|input| input.sequence == Sequence::MAX)
+        tx.inputs
+            .iter()
+            .all(|input| input.sequence == Sequence::MAX)
     }
 
     /// # Errors

@@ -23,7 +23,11 @@ impl EcdsaKey {
     }
 
     fn pubkey(&self) -> Vec<u8> {
-        self.0.verifying_key().to_sec1_point(true).as_bytes().to_vec()
+        self.0
+            .verifying_key()
+            .to_sec1_point(true)
+            .as_bytes()
+            .to_vec()
     }
 
     fn p2pkh_spk(&self) -> Vec<u8> {
@@ -246,7 +250,10 @@ fn connect_block_counts_p2sh_redeem_script_sigops() {
     tx.inputs[1].script_sig = sig_b.into();
     let r = SigopHeavy::connect(&chain, tx);
     assert!(
-        matches!(r, Err(ValidationError::SigopsLimitExceeded { cost: 83_200 })),
+        matches!(
+            r,
+            Err(ValidationError::SigopsLimitExceeded { cost: 83_200 })
+        ),
         "two 520-byte CHECKMULTISIG redeem scripts must exceed the budget, got {r:?}"
     );
 }
@@ -259,7 +266,10 @@ fn connect_block_counts_witness_script_sigops() {
     tx.inputs[0].witness = Witness::from_slice(&[&script]);
     let r = SigopHeavy::connect(&chain, tx);
     assert!(
-        matches!(r, Err(ValidationError::SigopsLimitExceeded { cost: 100_000 })),
+        matches!(
+            r,
+            Err(ValidationError::SigopsLimitExceeded { cost: 100_000 })
+        ),
         "a 5,000-byte CHECKMULTISIG witness script must exceed the budget, got {r:?}"
     );
 }
@@ -273,7 +283,13 @@ fn connect_block_rejects_two_transactions_spending_one_output() {
     second.version = TxVersion::new(1);
     let r = chain.connect(&Chain::block(vec![first, second]), None);
     assert!(
-        matches!(r, Err(ValidationError::MissingInput { tx_index: 2, input_index: 0 })),
+        matches!(
+            r,
+            Err(ValidationError::MissingInput {
+                tx_index: 2,
+                input_index: 0
+            })
+        ),
         "a second spend of the same output must be rejected, got {r:?}"
     );
 }
@@ -284,7 +300,13 @@ fn connect_block_resolves_a_spend_of_an_earlier_output_in_the_block() {
     let funded = chain.fund(0x41, 50_000, &[0x51]);
     let parent = Spend::tx(&[funded], 45_000);
     let parent_txid = parent.txid().expect("txid");
-    let child = Spend::tx(&[OutPoint { txid: parent_txid, vout: 0 }], 40_000);
+    let child = Spend::tx(
+        &[OutPoint {
+            txid: parent_txid,
+            vout: 0,
+        }],
+        40_000,
+    );
     assert_eq!(
         chain.connect(&Chain::block(vec![parent, child]), None),
         Ok(Satoshi::new(10_000))
@@ -297,10 +319,22 @@ fn connect_block_rejects_a_spend_of_a_later_output_in_the_block() {
     let funded = chain.fund(0x51, 50_000, &[0x51]);
     let parent = Spend::tx(&[funded], 45_000);
     let parent_txid = parent.txid().expect("txid");
-    let child = Spend::tx(&[OutPoint { txid: parent_txid, vout: 0 }], 40_000);
+    let child = Spend::tx(
+        &[OutPoint {
+            txid: parent_txid,
+            vout: 0,
+        }],
+        40_000,
+    );
     let r = chain.connect(&Chain::block(vec![child, parent]), None);
     assert!(
-        matches!(r, Err(ValidationError::MissingInput { tx_index: 1, input_index: 0 })),
+        matches!(
+            r,
+            Err(ValidationError::MissingInput {
+                tx_index: 1,
+                input_index: 0
+            })
+        ),
         "spending an output created later in the block must fail, got {r:?}"
     );
 }
@@ -391,7 +425,10 @@ fn connect_block_verifies_multi_input_taproot_key_path() {
 
     assert_eq!(chain.connect(&block, None), Ok(Satoshi::new(5_000)));
     let mut exec = ScriptExecutionCache::new(64);
-    assert_eq!(chain.connect(&block, Some(&mut exec)), Ok(Satoshi::new(5_000)));
+    assert_eq!(
+        chain.connect(&block, Some(&mut exec)),
+        Ok(Satoshi::new(5_000))
+    );
 }
 
 #[test]

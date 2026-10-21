@@ -87,7 +87,10 @@ impl HistoricalSpend {
 
 #[test]
 fn the_fixtures_are_the_blocks_core_lists_as_script_flag_exceptions() {
-    for spend in [HistoricalSpend::BIP16_EXCEPTION, HistoricalSpend::TAPROOT_EXCEPTION] {
+    for spend in [
+        HistoricalSpend::BIP16_EXCEPTION,
+        HistoricalSpend::TAPROOT_EXCEPTION,
+    ] {
         assert_eq!(spend.header_hash().to_display_hex(), spend.block_hash);
     }
 }
@@ -96,7 +99,10 @@ fn the_fixtures_are_the_blocks_core_lists_as_script_flag_exceptions() {
 fn the_bip16_exception_spend_is_valid_with_the_flags_of_its_height() {
     let spend = HistoricalSpend::BIP16_EXCEPTION;
     assert!(!spend.flags_at_its_height().contains(ScriptFlags::P2SH));
-    assert_eq!(spend.verify_first_input(spend.flags_at_its_height()), Ok(()));
+    assert_eq!(
+        spend.verify_first_input(spend.flags_at_its_height()),
+        Ok(())
+    );
 }
 
 #[test]
@@ -110,14 +116,20 @@ fn the_bip16_exception_spend_fails_once_p2sh_is_enforced() {
 fn the_taproot_exception_spend_is_valid_with_the_flags_of_its_height() {
     let spend = HistoricalSpend::TAPROOT_EXCEPTION;
     assert!(!spend.flags_at_its_height().contains(ScriptFlags::TAPROOT));
-    assert_eq!(spend.verify_first_input(spend.flags_at_its_height()), Ok(()));
+    assert_eq!(
+        spend.verify_first_input(spend.flags_at_its_height()),
+        Ok(())
+    );
 }
 
 #[test]
 fn a_tapscript_checksig_signs_the_key_version_byte() {
     let spend = HistoricalSpend::TAPSCRIPT_INSCRIPTION;
     assert!(spend.flags_at_its_height().contains(ScriptFlags::TAPROOT));
-    assert_eq!(spend.verify_first_input(spend.flags_at_its_height()), Ok(()));
+    assert_eq!(
+        spend.verify_first_input(spend.flags_at_its_height()),
+        Ok(())
+    );
 }
 
 #[test]
@@ -130,5 +142,8 @@ fn checkmultisig_deletes_every_signature_from_the_script_code_before_hashing() {
 fn the_taproot_exception_spend_fails_once_taproot_is_enforced() {
     let spend = HistoricalSpend::TAPROOT_EXCEPTION;
     let r = spend.verify_first_input(spend.flags_at_its_height() | ScriptFlags::TAPROOT);
-    assert!(r.is_err(), "a v1 program with an empty witness must fail, got {r:?}");
+    assert!(
+        r.is_err(),
+        "a v1 program with an empty witness must fail, got {r:?}"
+    );
 }

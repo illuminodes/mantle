@@ -3,6 +3,8 @@ fuzz/target/
 fuzz/corpus/
 fuzz/artifacts/
 fuzz/*.log
+fuzz/bitcoinfuzz/mantle_lib/target/
+replay/failed-blocks/
 dhat-heap.json
 *.nsec
 *.svg

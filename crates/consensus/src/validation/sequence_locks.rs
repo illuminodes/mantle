@@ -1,4 +1,6 @@
-use mantle::primitives::{BlockHeader, BlockHeight, BlockTime, BlockVersion, CompactBits, Hash256, Nonce};
+use mantle::primitives::{
+    BlockHeader, BlockHeight, BlockTime, BlockVersion, CompactBits, Hash256, Nonce,
+};
 
 use super::block_coins::SpentCoin;
 use crate::chain_view::ChainView;
@@ -72,7 +74,9 @@ impl<'v, V: ChainView> SequenceLocks<'v, V> {
     }
 
     fn previous_median_time_past(&self) -> Result<i64, ValidationError> {
-        Ok(i64::from(self.view.median_time_past(self.block_header)?.to_u32()))
+        Ok(i64::from(
+            self.view.median_time_past(self.block_header)?.to_u32(),
+        ))
     }
 
     fn median_time_past_at(&self, height: u32) -> Result<i64, ValidationError> {

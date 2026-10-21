@@ -40,8 +40,14 @@ impl SigopCost {
 
     /// Legacy sigops of one transaction, before scaling.
     pub(super) fn legacy<T: TxView>(tx: &T) -> u64 {
-        let inputs: u64 = tx.inputs().map(|i| Self::count(i.script_sig(), false)).sum();
-        let outputs: u64 = tx.outputs().map(|o| Self::count(o.script_pubkey(), false)).sum();
+        let inputs: u64 = tx
+            .inputs()
+            .map(|i| Self::count(i.script_sig(), false))
+            .sum();
+        let outputs: u64 = tx
+            .outputs()
+            .map(|o| Self::count(o.script_pubkey(), false))
+            .sum();
         inputs + outputs
     }
 

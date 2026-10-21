@@ -1,13 +1,13 @@
 use mantle::primitives::{BlockHeight, Hash256, OutPoint, Satoshi};
 
-use crate::chain_view::{ChainView, ConnectResult, ConnectScratch, NewCoin};
-use crate::error::ValidationError;
 use super::bip30::Bip30;
 use super::block_coins::SpentCoin;
+use super::script_checks::ScriptChecks;
 use super::sequence_locks::SequenceLocks;
 use super::sigop_cost::SigopCost;
-use super::script_checks::ScriptChecks;
 use super::tx_script_context::Prevout;
+use crate::chain_view::{ChainView, ConnectResult, ConnectScratch, NewCoin};
+use crate::error::ValidationError;
 use crate::script::ScriptFlags;
 use crate::tx_view::{BlockView, InputView, OutputView, TxView};
 
@@ -140,7 +140,9 @@ where
                     txid,
                     vout: vout as u32,
                 };
-                connect_scratch.in_block.record_created(outpoint, created.len());
+                connect_scratch
+                    .in_block
+                    .record_created(outpoint, created.len());
                 created.push(NewCoin {
                     outpoint,
                     value: output.value(),
@@ -160,8 +162,10 @@ where
         view.get_coins_into(outpoints_scratch, &mut coins_scratch)?;
 
         spent_coins.clear();
-        for (input_index, (outpoint, from_view)) in
-            outpoints_scratch.iter().zip(coins_scratch.iter()).enumerate()
+        for (input_index, (outpoint, from_view)) in outpoints_scratch
+            .iter()
+            .zip(coins_scratch.iter())
+            .enumerate()
         {
             let missing = ValidationError::MissingInput {
                 tx_index,
@@ -237,7 +241,9 @@ where
                 txid,
                 vout: vout as u32,
             };
-            connect_scratch.in_block.record_created(outpoint, created.len());
+            connect_scratch
+                .in_block
+                .record_created(outpoint, created.len());
             created.push(NewCoin {
                 outpoint,
                 value: output.value(),

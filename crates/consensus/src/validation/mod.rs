@@ -18,16 +18,16 @@ pub use bip30::Bip30;
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use connect::{BlockHeightExt, connect_block};
 pub use header_context::{HeaderContext, HeaderContextExt};
-pub use sigop_cost::SigopCost;
-pub use script_checks::{InlineScripts, ScriptChecks, SkippedScripts};
-pub use tx_script_context::{Prevout, TxScriptContext};
 pub use pow::{HeaderValidationExt, RetargetExt};
-pub use witness_commitment::WitnessCommitment;
+pub use script_checks::{InlineScripts, ScriptChecks, SkippedScripts};
+pub use sigop_cost::SigopCost;
 pub use structure::{
     BIP34_HEIGHT, MAX_BLOCK_TRANSACTIONS, MAX_BLOCK_WEIGHT, MAX_COINBASE_SCRIPTSIG_LEN, MAX_MONEY,
     MIN_COINBASE_SCRIPTSIG_LEN, WITNESS_SCALE_FACTOR, validate_block_structure,
     validate_block_structure_reusing, validate_block_wire,
 };
+pub use tx_script_context::{Prevout, TxScriptContext};
+pub use witness_commitment::WitnessCommitment;
 
 // ── Shared constant ───────────────────────────────────────────────────────────
 
@@ -98,9 +98,9 @@ mod tests;
 #[cfg(test)]
 mod tests_bip30;
 #[cfg(test)]
-mod tests_lax_der;
-#[cfg(test)]
 mod tests_block_rules;
+#[cfg(test)]
+mod tests_lax_der;
 #[cfg(test)]
 mod tests_script_cache;
 #[cfg(test)]
